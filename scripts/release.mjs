@@ -43,7 +43,8 @@ if (!current) fail("could not find version in [workspace.package] of Cargo.toml"
 if (current === version) fail(`version is already ${version}`);
 writeFileSync(cargoPath, cargo.replace(section, `$1${version}$3`));
 
-// JSON manifests: keep formatting stable (2-space indent, trailing newline).
+// JSON manifests: replace only the top-level version string so the rest of
+// the file keeps its formatting, then re-parse to make sure the edit was right.
 const jsonFiles = [
   "apps/desktop/src-tauri/tauri.conf.json",
   "package.json",
@@ -51,9 +52,13 @@ const jsonFiles = [
 ];
 for (const file of jsonFiles) {
   const path = join(root, file);
-  const data = JSON.parse(readFileSync(path, "utf8"));
-  data.version = version;
-  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
+  const text = readFileSync(path, "utf8");
+  const old = JSON.parse(text).version;
+  if (typeof old !== "string") fail(`${file} has no top-level "version" string`);
+  const escaped = old.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const updated = text.replace(new RegExp(`("version"\\s*:\\s*")${escaped}(")`), `$1${version}$2`);
+  if (JSON.parse(updated).version !== version) fail(`could not update the version in ${file}`);
+  writeFileSync(path, updated);
 }
 
 try {
