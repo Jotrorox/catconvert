@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "externalBin": [
+      "binaries/catconvert-ffmpeg",
+      "binaries/catconvert-ffprobe",
+      "binaries/catconvert-cjxl",
+      "binaries/catconvert-djxl",
+      "binaries/catconvert-jxlinfo"
+    ],
+    "resources": {
+      "binaries/THIRD-PARTY-LICENSES.txt": "THIRD-PARTY-LICENSES.txt"
+    }
+  }
+}

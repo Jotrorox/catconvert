@@ -39,9 +39,14 @@ jobs:
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
+  # ffmpeg, ffprobe and libjxl's tools for the app bundles (cached between releases).
+  media-tools:
+    name: Media tools
+    uses: ./.github/workflows/media-tools.yml
+
   desktop:
     name: Desktop (${{ matrix.name }})
-    needs: create-release
+    needs: [create-release, media-tools]
     # Signing secrets live in the `release` environment, which only `v*` tags may use.
     environment: release
     permissions:
@@ -54,14 +59,17 @@ jobs:
             os: macos-latest
             rust-targets: aarch64-apple-darwin x86_64-apple-darwin
             args: --target universal-apple-darwin
+            media-tools: universal-apple-darwin
           - name: Windows x64
             os: windows-latest
             rust-targets: ""
             args: ""
+            media-tools: x86_64-pc-windows-msvc
           - name: Linux x64
             os: ubuntu-22.04
             rust-targets: ""
             args: --bundles appimage,deb
+            media-tools: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,6 +83,17 @@ jobs:
 
       - name: Install front-end dependencies
         run: mise run setup
+
+      - name: Download bundled media tools
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: media-tools-${{ matrix.media-tools }}
+          path: apps/desktop/src-tauri/binaries
+
+      # Artifacts don't keep file modes, and Tauri copies sidecars as they are.
+      - name: Make the media tools executable
+        shell: bash
+        run: chmod +x apps/desktop/src-tauri/binaries/catconvert-*
 
       # Signing is optional: secrets are only exported when all required ones
       # exist, so forks and fresh repos still produce unsigned builds.
@@ -169,7 +188,7 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           tagName: ${{ github.ref_name }}
           releaseDraft: true
-          args: ${{ matrix.args }} ${{ env.TAURI_SIGNING_ARGS }} ${{ env.TAURI_UPDATER_ARGS }}
+          args: ${{ matrix.args }} --config src-tauri/tauri.media-tools.conf.json ${{ env.TAURI_SIGNING_ARGS }} ${{ env.TAURI_UPDATER_ARGS }}
 
       # Tauri notarizes and staples the .app, but not the .dmg around it.
       # Notarize and staple the disk image too, then replace the uploaded copy.
@@ -216,6 +235,31 @@ jobs:
 
           gh release upload "$TAG" "$dmg" --clobber
           echo "Uploaded notarized $name"
+
+  # GPL: the complete source of the bundled ffmpeg build ships with every release.
+  media-tools-source:
+    name: Media tools source
+    needs: [create-release, media-tools]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download source archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: media-tools-source
+          path: dist
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          asset="catconvert-${TAG}-media-tools-source.tar.xz"
+          mv dist/catconvert-media-tools-source.tar.xz "$asset"
+          gh release upload "$TAG" "$asset" --clobber
 
   cli:
     name: CLI (${{ matrix.target }})

@@ -31,6 +31,32 @@ mise run check   # what CI runs: fmt-check, clippy -D warnings, biome, tsc, test
 - Add tests next to the code: Rust unit tests in the same file, Vitest tests as
   `*.test.ts(x)` beside the component.
 
+## Bundled media tools
+
+Release builds ship `ffmpeg`, `ffprobe` and libjxl's `cjxl`, `djxl` and
+`jxlinfo` inside the app as Tauri sidecars, named `catconvert-ffmpeg` and so on.
+`scripts/media-tools/build.sh` builds them statically from the sources pinned in
+`scripts/media-tools/sources.lock`. The app looks for tools in this order:
+`CATCONVERT_FFMPEG` (and `CATCONVERT_LIBJXL`), then the bundled copies, then
+`PATH` and Homebrew.
+
+- `mise run dev` and `mise run build` don't include them and use your installed
+  ffmpeg.
+- `mise run media-tools` builds them for this machine into
+  `apps/desktop/src-tauri/binaries` (gitignored). It takes a while and needs
+  cmake, ninja, nasm and pkg-config (`brew install cmake ninja nasm pkgconf`).
+  Then `mise run build-bundled` builds the app with them inside.
+- To update a component, change its version, URL and SHA-256 in `sources.lock`
+  together and open a PR. `.github/workflows/media-tools.yml` builds all three
+  platforms when that file changes, and fails if a binary links a non-system
+  library, an encoder the app needs is missing, or the tools outgrow their size
+  budget.
+
+Licensing: ffmpeg with x264 is GPL-2.0-or-later. CatConvert stays BSD-3-Clause
+because it only runs these tools as separate processes. Don't link ffmpeg's
+libraries into the app. Every release must carry the matching source archive,
+which the release workflow attaches automatically.
+
 ## Commit messages
 
 We use [Conventional Commits](https://www.conventionalcommits.org):

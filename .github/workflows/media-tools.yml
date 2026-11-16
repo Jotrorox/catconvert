@@ -1,0 +1,99 @@
+name: Media tools
+
+# Builds the ffmpeg/ffprobe and libjxl binaries the desktop app bundles, from
+# the pinned sources in scripts/media-tools, plus the archive of their
+# corresponding source. The release workflow calls this; it also runs when the
+# script or lock file changes. Builds are cached by the hash of both files, so
+# a release without changes there reuses the previous binaries.
+
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - scripts/media-tools/**
+      - .github/workflows/media-tools.yml
+  push:
+    branches: [main]
+    paths:
+      - scripts/media-tools/**
+      - .github/workflows/media-tools.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: universal-apple-darwin
+            os: macos-latest
+          # The oldest supported runner, so the binaries also run on older glibc.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Cross-compiled with mingw-w64, which needs a recent GCC for libjxl.
+          - target: x86_64-pc-windows-msvc
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore built tools
+        id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist-media-tools
+          key: media-tools-${{ matrix.target }}-${{ hashFiles('scripts/media-tools/build.sh', 'scripts/media-tools/sources.lock') }}
+
+      - name: Install build tools (macOS)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
+        run: brew install nasm ninja pkgconf
+
+      - name: Install build tools (Linux)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm ninja-build pkg-config
+          if [ "$TARGET" = x86_64-pc-windows-msvc ]; then
+            sudo apt-get install -y --no-install-recommends mingw-w64
+          fi
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: scripts/media-tools/build.sh "$TARGET" dist-media-tools
+
+      # Artifacts drop the executable bit; the release job restores it.
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: media-tools-${{ matrix.target }}
+          path: dist-media-tools/
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    name: Corresponding source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pack sources
+        run: scripts/media-tools/build.sh sources dist-media-tools-source/catconvert-media-tools-source.tar.xz
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: media-tools-source
+          path: dist-media-tools-source/
+          if-no-files-found: error
+          retention-days: 7

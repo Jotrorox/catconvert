@@ -1,0 +1,29 @@
+# Pinned sources of the media tools bundled with the desktop app.
+# Read by build.sh. The ffmpeg/ffprobe builds are GPL-2.0-or-later because
+# they include x264; everything else is under permissive or LGPL licenses.
+#
+# Columns: name  version  license  url  sha256  license-files
+#   license is an SPDX id; several are joined with commas (all apply).
+#   url "git+<repo>@<commit>" is fetched with git and checked by commit id
+#   (sha256 "-"); everything else is a tarball checked by its SHA-256.
+#   license-files are comma-separated paths inside the source tree; build.sh
+#   copies them into THIRD-PARTY-LICENSES.txt.
+#
+# To update a component, change its version, url and sha256 together, then run
+# `scripts/media-tools/build.sh <target>` once to confirm it still builds.
+
+zlib           1.3.2    Zlib                      https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz                                    bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16  LICENSE
+libpng         1.6.59   libpng-2.0                https://download.sourceforge.net/libpng/libpng-1.6.59.tar.xz                                                 d80dd2a38a37f803cb9b6ac7b14bd6e74ddc3b654780a8380bdf93523fdb4389  LICENSE
+giflib         6.1.3    MIT                       https://downloads.sourceforge.net/project/giflib/giflib-6.x/giflib-6.1.3.tar.gz                              b65b66b99f0424b93525f987386f22fc5efb9da2bfc92ad4a532249aaffbab0e  COPYING
+libjpeg-turbo  3.2.1    IJG,BSD-3-Clause,Zlib     https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.1/libjpeg-turbo-3.2.1.tar.gz            c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f  LICENSE.md,README.ijg
+lcms2          2.20     MIT                       https://github.com/mm2/Little-CMS/releases/download/lcms2.20/lcms2-2.20.tar.gz                               18ff5504fa9cc8a2b1f3591180d90ead16c8a2ea78e530523b46eab70e1ca6b9  LICENSE
+brotli         1.2.1    MIT                       https://github.com/google/brotli/archive/refs/tags/v1.2.1.tar.gz                                             98d35d11a78dc453aebb7d10c3748f3f73ff78c8267c0dc697b8631f67bf7e8f  LICENSE
+highway        1.4.0    Apache-2.0                https://github.com/google/highway/archive/refs/tags/1.4.0.tar.gz                                             e72241ac9524bb653ae52ced768b508045d4438726a303f10181a38f764a453c  LICENSE
+libjxl         0.13.0   BSD-3-Clause              https://github.com/libjxl/libjxl/archive/refs/tags/v0.13.0.tar.gz                                            24d18c9af2d1f5a17730b3f8d3f70a5c16e5ac303f5d9d5fe9dc00cf7ca82af2  LICENSE,PATENTS
+x264           0.165-b35605a  GPL-2.0-or-later    git+https://code.videolan.org/videolan/x264.git@b35605ace3ddf7c1a5d67a2eb553f034aef41d55                    -                                                                 COPYING
+libvpx         1.17.0   BSD-3-Clause              https://github.com/webmproject/libvpx/archive/refs/tags/v1.17.0.tar.gz                                       1020f184046187baa2985dbde38e0691f49c44088bca7a1842b0236c6081dc0a  LICENSE,PATENTS
+opus           1.6.1    BSD-3-Clause              https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz                                                   6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1  COPYING
+lame           4.0      LGPL-2.0-or-later         https://downloads.sourceforge.net/project/lame/lame/4.0/lame-4.0.tar.gz                                      3df5124d5ad3a98312ffd7ba6a9b36230e4f8a3e66d3ce0f425e336c32d216eb  COPYING
+libwebp        1.6.0    BSD-3-Clause              https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz                  e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564  COPYING,PATENTS
+svt-av1        4.3.0    BSD-3-Clause-Clear        git+https://gitlab.com/AOMediaCodec/SVT-AV1.git@e3d63405f9ba8219913a7276c2c47d10e5d022fe                     -                                                                 LICENSE.md,PATENTS.md
+ffmpeg         9.0.2    GPL-2.0-or-later          https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz                                                              8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e  COPYING.GPLv2,LICENSE.md

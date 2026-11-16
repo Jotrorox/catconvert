@@ -2391,6 +2391,21 @@ button.format-chip:not(:disabled):active {
   flex: none;
 }
 
+.licenses {
+  max-height: 360px;
+  margin: 14px 0 0;
+  padding: 14px 16px;
+  overflow: auto;
+  border-radius: 14px;
+  background: var(--sunken);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Responsive                                                                */
 /* ------------------------------------------------------------------------ */

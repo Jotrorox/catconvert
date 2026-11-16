@@ -6,8 +6,12 @@
 //!
 //! Anything that starts ffmpeg runs on the blocking thread pool, never on the
 //! main thread, so the window stays responsive.
+//!
+//! Release builds ship ffmpeg, ffprobe and libjxl's tools as Tauri sidecars
+//! (see `tauri.media-tools.conf.json`); without them the app falls back to an
+//! installed ffmpeg.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use catconvert_core::{
@@ -15,10 +19,14 @@ use catconvert_core::{
 };
 use serde::Serialize;
 use tauri::ipc::Response;
+use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Event name for [`catconvert_core::JobProgress`] payloads.
 const JOB_PROGRESS_EVENT: &str = "job-progress";
+
+/// Bundled resource listing the licenses of the sidecar tools.
+const LICENSES_RESOURCE: &str = "THIRD-PARTY-LICENSES.txt";
 
 /// The conversion backend, or why there is none.
 enum Backend {
@@ -43,8 +51,18 @@ impl AppState {
     }
 }
 
+/// Where `bundle.externalBin` puts the sidecars: next to the executable
+/// (`Contents/MacOS` on macOS, the install folder on Windows, `usr/bin` in the
+/// Linux packages). Development builds have none there.
+fn sidecar_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)
+}
+
 fn start_backend(app: &AppHandle) -> Backend {
-    match Ffmpeg::locate() {
+    match Ffmpeg::locate_with(sidecar_dir().as_deref()) {
         Ok(ffmpeg) => {
             let app = app.clone();
             Backend::Ready(Arc::new(Queue::new(ffmpeg, move |event| {
@@ -82,6 +100,8 @@ struct FormatSupport {
 #[serde(rename_all = "camelCase")]
 struct FfmpegStatus {
     found: bool,
+    /// The ffmpeg shipped with the app, not an installed one.
+    bundled: bool,
     version: Option<String>,
     path: Option<PathBuf>,
     error: Option<String>,
@@ -102,6 +122,7 @@ fn status_of(state: &AppState) -> FfmpegStatus {
         .collect();
     FfmpegStatus {
         found: ffmpeg.is_some(),
+        bundled: ffmpeg.as_ref().is_some_and(Ffmpeg::is_bundled),
         version: ffmpeg.as_ref().map(|f| f.version().to_owned()),
         path: ffmpeg.as_ref().map(|f| f.ffmpeg_path().to_path_buf()),
         error: state.queue().err(),
@@ -130,6 +151,19 @@ async fn relocate_ffmpeg(
         .map_err(|err| err.to_string())?;
     *state.backend.write().unwrap_or_else(|e| e.into_inner()) = backend;
     Ok(status_of(&state))
+}
+
+/// License texts of the bundled tools, or `None` in builds without them.
+#[tauri::command]
+async fn third_party_licenses(app: AppHandle) -> Option<String> {
+    let path = app
+        .path()
+        .resolve(LICENSES_RESOURCE, BaseDirectory::Resource)
+        .ok()?;
+    tauri::async_runtime::spawn_blocking(move || std::fs::read_to_string(path).ok())
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Probe a file: ffprobe details when ffmpeg is available, size and
@@ -246,6 +280,7 @@ pub fn run() {
             cancel_job,
             relaunch,
             missing_files,
+            third_party_licenses,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
