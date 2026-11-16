@@ -1,8 +1,19 @@
-import { type Component, createSignal, For, Show } from "solid-js";
+import { type Component, createSignal, For, Match, Show, Switch } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
+import { formatBytes } from "../lib/format";
 import { FORMAT_GROUPS, label } from "../lib/formats";
-import { isAvailable, refreshFfmpeg, state, toast } from "../lib/store";
+import {
+  activeCount,
+  checkForUpdates,
+  installUpdate,
+  isAvailable,
+  refreshFfmpeg,
+  restartApp,
+  state,
+  toast,
+  type UpdateState,
+} from "../lib/store";
 
 const INSTALL = [
   { os: "macOS", command: "brew install ffmpeg" },
@@ -120,6 +131,146 @@ export const SettingsScreen: Component = () => {
           taken we add a number, so nothing is ever overwritten.
         </p>
       </section>
+
+      <UpdatesCard />
     </div>
+  );
+};
+
+type Status<S extends UpdateState["status"]> = Extract<UpdateState, { status: S }>;
+
+function downloadText(progress: Status<"downloading">["progress"]): string {
+  const done = formatBytes(progress.downloaded);
+  return progress.total ? `${done} of ${formatBytes(progress.total)}` : done;
+}
+
+function downloadPct(progress: Status<"downloading">["progress"]): number | null {
+  if (!progress.total) return null;
+  return Math.min(100, Math.round((progress.downloaded / progress.total) * 100));
+}
+
+const UpdatesCard: Component = () => {
+  const busy = () => activeCount() > 0;
+  const update = () => state.update;
+  const is = <S extends UpdateState["status"]>(status: S) => {
+    const current = update();
+    return current.status === status ? (current as Status<S>) : false;
+  };
+
+  const notes = (info: { notes: string | null }) => (
+    <Show when={info.notes}>{(text) => <p class="update-notes">{text()}</p>}</Show>
+  );
+  const WaitNote = () => (
+    <Show when={busy()}>
+      <p class="item-meta">Waits until your conversions are done.</p>
+    </Show>
+  );
+
+  return (
+    <section class="card update-card" aria-labelledby="updates-title">
+      <h2 class="section-title" id="updates-title">
+        Updates
+      </h2>
+      <Show when={state.appVersion}>
+        {(version) => <p class="item-meta">You have CatConvert {version()}.</p>}
+      </Show>
+      <div class="update-body">
+        <Switch>
+          <Match when={is("available")}>
+            {(s) => (
+              <>
+                <p class="label-strong">CatConvert {s().info.version} is out</p>
+                {notes(s().info)}
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  disabled={busy()}
+                  onClick={() => void installUpdate()}
+                >
+                  <Icon name="sparkle" size={16} />
+                  Download and install
+                </button>
+                <WaitNote />
+              </>
+            )}
+          </Match>
+          <Match when={is("downloading")}>
+            {(s) => (
+              <>
+                <p class="label-strong">Fetching CatConvert {s().info.version}…</p>
+                <div
+                  class="progress update-progress"
+                  role="progressbar"
+                  aria-label="Downloading the update"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow={downloadPct(s().progress) ?? undefined}
+                >
+                  <div
+                    class="progress-fill"
+                    style={{ width: `${Math.max(downloadPct(s().progress) ?? 100, 4)}%` }}
+                  />
+                </div>
+                <p class="item-meta">{downloadText(s().progress)}</p>
+              </>
+            )}
+          </Match>
+          <Match when={is("ready")}>
+            {(s) => (
+              <>
+                <p class="label-strong">CatConvert {s().info.version} is installed</p>
+                <p class="item-meta">Restart to start using it.</p>
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  disabled={busy()}
+                  onClick={() => void restartApp()}
+                >
+                  <Icon name="refresh" size={16} />
+                  Restart now
+                </button>
+                <WaitNote />
+              </>
+            )}
+          </Match>
+          <Match when={is("error")}>
+            {(s) => (
+              <>
+                <p class="label-strong">
+                  <Icon name="alert" size={16} class="update-error-icon" />
+                  {s().info ? "The update didn't install" : "Couldn't check for updates"}
+                </p>
+                <p class="item-meta">{s().message}</p>
+                <button
+                  type="button"
+                  class="btn btn-outline"
+                  disabled={s().info !== null && busy()}
+                  onClick={() => void (s().info ? installUpdate() : checkForUpdates())}
+                >
+                  <Icon name="refresh" size={16} />
+                  Try again
+                </button>
+              </>
+            )}
+          </Match>
+          <Match when={true}>
+            <p class="item-meta">
+              {is("current")
+                ? "You're up to date."
+                : "CatConvert looks for a new version each time it opens."}
+            </p>
+            <button
+              type="button"
+              class="btn btn-outline"
+              disabled={update().status === "checking"}
+              onClick={() => void checkForUpdates()}
+            >
+              <Icon name="refresh" size={16} />
+              {update().status === "checking" ? "Checking…" : "Check for updates"}
+            </button>
+          </Match>
+        </Switch>
+      </div>
+    </section>
   );
 };
