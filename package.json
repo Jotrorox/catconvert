@@ -1,0 +1,24 @@
+{
+  "name": "catconvert",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Offline photo, video and audio converter",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "engines": {
+    "node": ">=26.13.1"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @catconvert/desktop tauri dev",
+    "build": "pnpm --filter @catconvert/desktop tauri build",
+    "tauri": "pnpm --filter @catconvert/desktop tauri",
+    "typecheck": "pnpm --filter @catconvert/desktop typecheck",
+    "test": "pnpm --filter @catconvert/desktop test",
+    "fmt": "biome format --write .",
+    "fmt:check": "biome format .",
+    "lint": "biome check ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.8"
+  }
+}
