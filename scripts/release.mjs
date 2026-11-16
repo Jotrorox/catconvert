@@ -22,7 +22,9 @@ function fail(message) {
 }
 
 function run(cmd, args, opts = {}) {
-  return execFileSync(cmd, args, { cwd: root, encoding: "utf8", stdio: "pipe", ...opts }).trim();
+  // With stdio "inherit" there is no captured output (null).
+  const out = execFileSync(cmd, args, { cwd: root, encoding: "utf8", stdio: "pipe", ...opts });
+  return (out ?? "").trim();
 }
 
 const version = (process.argv[2] ?? "").replace(/^v/, "");
@@ -54,12 +56,17 @@ for (const file of jsonFiles) {
   writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
 }
 
-// Refresh workspace entries in Cargo.lock without touching dependencies.
-run("cargo", ["update", "--workspace", "--offline"], { stdio: "inherit" });
+try {
+  // Refresh workspace entries in Cargo.lock without touching dependencies.
+  run("cargo", ["update", "--workspace", "--offline"], { stdio: "inherit" });
 
-run("git", ["add", "Cargo.toml", "Cargo.lock", ...jsonFiles]);
-run("git", ["commit", "-m", `chore(release): ${tag}`], { stdio: "inherit" });
-run("git", ["tag", "-a", tag, "-m", `CatConvert ${tag}`]);
+  run("git", ["add", "Cargo.toml", "Cargo.lock", ...jsonFiles]);
+  run("git", ["commit", "-m", `chore(release): ${tag}`], { stdio: "inherit" });
+  run("git", ["tag", "-a", tag, "-m", `CatConvert ${tag}`]);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
+  fail("aborted; undo partial changes with `git reset --hard HEAD` if nothing was committed");
+}
 
 console.log(`\nBumped ${current} -> ${version} and tagged ${tag}.`);
 console.log("Push when ready:\n  git push origin main --follow-tags");
