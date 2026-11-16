@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/desktop/src-tauri"]
+
+[workspace.package]
+# Bumped together with tauri.conf.json and package.json by `mise run release <version>`.
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "BSD-3-Clause"
+authors = ["Johannes Mueller"]
+publish = false
+
+[workspace.dependencies]
+catconvert-core = { path = "crates/core" }
+
+# Tauri and UniFFI are pinned exactly: the Tauri crate must stay in lockstep with
+# @tauri-apps/cli and @tauri-apps/api, and uniffi with the future uniffi-bindgen.
+tauri = { version = "=2.12.6", features = [] }
+tauri-build = { version = "=2.7.5", features = [] }
+uniffi = "=0.32.2"
+
+# Everything else is locked by Cargo.lock.
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
