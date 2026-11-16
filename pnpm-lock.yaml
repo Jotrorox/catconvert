@@ -14,6 +14,12 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@fontsource-variable/grandstander':
+        specifier: 5.3.0
+        version: 5.3.0
+      '@fontsource/mali':
+        specifier: 5.3.0
+        version: 5.3.0
       '@tauri-apps/api':
         specifier: 2.12.5
         version: 2.12.5
@@ -228,6 +234,12 @@ packages:
     peerDependenciesMeta:
       '@noble/hashes':
         optional: true
+
+  '@fontsource-variable/grandstander@5.3.0':
+    resolution: {integrity: sha512-vD2bm4My0+kgUxIZ6J+CSKMonbbxxMF0dWq4uQYJP2ZNyHC+ss1XZPu/WCRB72K15+gaLs97UfR6UWU6a2GmvA==}
+
+  '@fontsource/mali@5.3.0':
+    resolution: {integrity: sha512-/H7zdnFcBUdLh7mPUCLWfCoQVgtvnVKrlHjknq90kltPvUcu0nC9ybne4z2rzTghV9ez9N7nRDvRZesODB/YbQ==}
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -1360,6 +1372,10 @@ snapshots:
     optional: true
 
   '@exodus/bytes@1.16.0': {}
+
+  '@fontsource-variable/grandstander@5.3.0': {}
+
+  '@fontsource/mali@5.3.0': {}
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:

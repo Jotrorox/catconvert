@@ -1,100 +1,81 @@
-import { createSignal, onCleanup, onMount } from "solid-js";
-import { createStore, produce } from "solid-js/store";
-import { DropZone } from "./components/DropZone";
-import { FileList } from "./components/FileList";
-import { onFileDrop, onJobProgress, probeFile, startJob, type UnlistenFn } from "./lib/api";
-import { DEFAULT_TARGET, type FileEntry } from "./lib/files";
+import { createSignal, Match, Show, Switch } from "solid-js";
+import { Sidebar, type Tab, TabBar } from "./components/Navigation";
+import { createMediaQuery } from "./lib/media";
+import { QUEUE_COUNT, type TargetFormat } from "./lib/mock";
+import { ConvertFile } from "./screens/ConvertFile";
+import { ConvertHome } from "./screens/ConvertHome";
+import { Placeholder } from "./screens/Placeholder";
+import { QueueScreen } from "./screens/QueueScreen";
 import "./styles.css";
 
+type Screen = Tab | "file";
+
+/**
+ * UI mockup of the CatConvert design. Screens render static sample data from
+ * `lib/mock.ts`; nothing talks to the Tauri backend yet.
+ */
 export default function App() {
-  const [files, setFiles] = createStore<FileEntry[]>([]);
-  const [hovering, setHovering] = createSignal(false);
+  const compact = createMediaQuery("(max-width: 720px)");
+  const [screen, setScreen] = createSignal<Screen>("convert");
+  const [format, setFormat] = createSignal<TargetFormat>("MP4");
 
-  const update = (path: string, fn: (entry: FileEntry) => void) =>
-    setFiles(
-      (entry) => entry.path === path,
-      produce((entry) => fn(entry)),
-    );
-
-  const addPaths = (paths: string[]) => {
-    for (const path of paths) {
-      if (files.some((entry) => entry.path === path)) continue;
-      setFiles(files.length, { path, status: "probing" });
-      probeFile(path)
-        .then((info) =>
-          update(path, (entry) => {
-            entry.status = "ready";
-            entry.info = info;
-          }),
-        )
-        .catch((error: unknown) =>
-          update(path, (entry) => {
-            entry.status = "error";
-            entry.error = String(error);
-          }),
-        );
-    }
+  const activeTab = (): Tab => {
+    const current = screen();
+    return current === "file" ? "convert" : current;
   };
+  const showTabBar = () => compact() && screen() !== "file";
 
-  const convertable = () =>
-    files.filter(
-      (entry) =>
-        entry.info &&
-        DEFAULT_TARGET[entry.info.kind] !== null &&
-        (!entry.job || entry.job.stage === "done"),
-    );
-
-  const convertAll = async () => {
-    for (const entry of convertable()) {
-      const info = entry.info;
-      const target = info ? DEFAULT_TARGET[info.kind] : null;
-      if (!target) continue;
-      const id = await startJob(entry.path, target);
-      update(entry.path, (e) => {
-        e.job = { id, stage: "queued", progress: 0 };
-      });
-    }
+  const openFile = (target: TargetFormat = "MP4") => {
+    setFormat(target);
+    setScreen("file");
   };
-
-  onMount(() => {
-    const unlisten: Promise<UnlistenFn>[] = [
-      onFileDrop({ onHover: setHovering, onDrop: addPaths }),
-      onJobProgress((event) =>
-        setFiles(
-          (entry) => entry.job?.id === event.jobId,
-          "job",
-          (job) => job && { ...job, stage: event.stage, progress: event.progress },
-        ),
-      ),
-    ];
-    onCleanup(() => {
-      for (const p of unlisten) void p.then((fn) => fn());
-    });
-  });
 
   return (
-    <main class="app">
-      <header class="app-header">
-        <h1>CatConvert</h1>
-        <div class="actions">
-          <button type="button" disabled={files.length === 0} onClick={() => setFiles([])}>
-            Clear
-          </button>
-          <button
-            type="button"
-            class="primary"
-            disabled={convertable().length === 0}
-            onClick={() => void convertAll()}
-          >
-            Convert
-          </button>
-        </div>
-      </header>
-      <DropZone hovering={hovering()} />
-      <FileList
-        files={files}
-        onRemove={(path) => setFiles((list) => list.filter((entry) => entry.path !== path))}
-      />
-    </main>
+    <div class="shell" classList={{ compact: compact() }}>
+      <Show when={!compact()}>
+        <Sidebar active={activeTab()} queueCount={QUEUE_COUNT} onNavigate={setScreen} />
+      </Show>
+      <main class="content" classList={{ "with-tabbar": showTabBar() }}>
+        <Switch>
+          <Match when={screen() === "convert"}>
+            <ConvertHome
+              compact={compact()}
+              onOpenFile={openFile}
+              onOpenSettings={() => setScreen("settings")}
+            />
+          </Match>
+          <Match when={screen() === "file"}>
+            <ConvertFile
+              compact={compact()}
+              format={format()}
+              onFormatChange={setFormat}
+              onBack={() => setScreen("convert")}
+              onStart={() => setScreen("queue")}
+            />
+          </Match>
+          <Match when={screen() === "queue"}>
+            <QueueScreen compact={compact()} />
+          </Match>
+          <Match when={screen() === "recipes"}>
+            <Placeholder
+              title="Recipes"
+              message="Saved presets will live here. For now, try a quick recipe on Convert."
+            />
+          </Match>
+          <Match when={screen() === "history"}>
+            <Placeholder title="History" message="Everything you've converted will show up here." />
+          </Match>
+          <Match when={screen() === "settings"}>
+            <Placeholder
+              title="Settings"
+              message="Output folder, ffmpeg path and defaults are coming soon."
+            />
+          </Match>
+        </Switch>
+      </main>
+      <Show when={showTabBar()}>
+        <TabBar active={activeTab()} onNavigate={setScreen} />
+      </Show>
+    </div>
   );
 }

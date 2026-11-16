@@ -7,8 +7,11 @@ CatConvert is a desktop app for macOS, Windows and Linux built with
 front end and a Rust core library. iOS and Android shells come later, through
 Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 
-> **Status: scaffolding.** The wiring works end to end, but probing only reads
-> file size and extension and "Convert" emits fake progress. No FFmpeg/libvips yet.
+> **Status: scaffolding.** The front end is a static UI mockup of the design
+> (Convert, file settings and Queue screens, desktop and phone layouts) driven by
+> sample data in `apps/desktop/src/lib/mock.ts`; it does not call the backend yet.
+> The Rust side only probes file size and extension and emits fake job progress.
+> No FFmpeg/libvips yet.
 
 ## Quick start
 
@@ -21,8 +24,8 @@ mise install     # install pinned tools
 mise run dev     # install JS deps and launch the desktop app
 ```
 
-Drop files onto the window to see their probed info, then press **Convert** to
-watch the stubbed progress.
+Click through the mockup screens; narrow the window below 720px to see the phone
+layout.
 
 On Linux, install Tauri's system packages first; see
 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
