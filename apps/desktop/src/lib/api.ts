@@ -117,6 +117,8 @@ export type JobTicket = {
 
 export type FfmpegStatus = {
   found: boolean;
+  /** The ffmpeg shipped inside the app rather than an installed one. */
+  bundled: boolean;
   version: string | null;
   path: string | null;
   error: string | null;
@@ -153,6 +155,7 @@ type Commands = {
   cancel_job: { args: { id: JobId }; result: boolean };
   relaunch: { args: Record<string, never>; result: null };
   missing_files: { args: { paths: string[] }; result: string[] };
+  third_party_licenses: { args: Record<string, never>; result: string | null };
 };
 
 type Events = {
@@ -188,6 +191,7 @@ export async function ffmpegStatus(): Promise<FfmpegStatus> {
   if (!inTauri) {
     return {
       found: false,
+      bundled: false,
       version: null,
       path: null,
       error: "Open CatConvert as an app to convert files.",
@@ -236,6 +240,12 @@ export function startJob(path: string, options: ConvertOptions): Promise<JobTick
 
 export function cancelJob(id: JobId): Promise<boolean> {
   return command("cancel_job", { id });
+}
+
+/** License texts of the bundled ffmpeg and libjxl tools; `null` in builds without them. */
+export async function thirdPartyLicenses(): Promise<string | null> {
+  if (!inTauri) return null;
+  return command("third_party_licenses", {});
 }
 
 export function onJobProgress(handler: (event: JobProgress) => void): Promise<UnlistenFn> {

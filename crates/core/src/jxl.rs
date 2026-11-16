@@ -29,17 +29,20 @@ pub struct JxlTools {
 }
 
 impl JxlTools {
-    /// Look in [`LIBJXL_ENV`], then `dirs` in order. Each tool is taken from
-    /// the first directory that has it.
-    pub(crate) fn locate(dirs: impl IntoIterator<Item = PathBuf>) -> Self {
-        let dirs: Vec<PathBuf> = std::env::var_os(LIBJXL_ENV)
-            .map(PathBuf::from)
+    /// Look in [`LIBJXL_ENV`], then for the app's own copies in `bundled`
+    /// (named with [`crate::BUNDLED_PREFIX`]), then `dirs` in order. Each tool
+    /// is taken from the first place that has it.
+    pub(crate) fn locate(bundled: Option<&Path>, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        let places: Vec<(PathBuf, &str)> = std::env::var_os(LIBJXL_ENV)
+            .map(|dir| (PathBuf::from(dir), ""))
             .into_iter()
-            .chain(dirs)
+            .chain(bundled.map(|dir| (dir.to_path_buf(), crate::BUNDLED_PREFIX)))
+            .chain(dirs.into_iter().map(|dir| (dir, "")))
             .collect();
         let find = |name: &str| {
-            dirs.iter()
-                .find_map(|dir| crate::ffmpeg::executable(dir, name))
+            places.iter().find_map(|(dir, prefix)| {
+                crate::ffmpeg::executable(dir, &format!("{prefix}{name}"))
+            })
         };
         let cjxl = find("cjxl");
         let version = cjxl.as_deref().and_then(|cjxl| {
@@ -346,5 +349,29 @@ mod tests {
             Some("0.13.0")
         );
         assert_eq!(parse_version("weird"), None);
+    }
+
+    #[test]
+    fn bundled_tools_come_before_installed_ones() {
+        if std::env::var_os(LIBJXL_ENV).is_some() {
+            return; // The override would win, as it should.
+        }
+        let bundled = tempfile::tempdir().expect("temp dir");
+        let installed = tempfile::tempdir().expect("temp dir");
+        let touch = |dir: &Path, name: &str| {
+            let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            File::create(&path).expect("create");
+            path
+        };
+        let cjxl = touch(bundled.path(), "catconvert-cjxl");
+        touch(bundled.path(), "djxl"); // unprefixed: not one of ours
+        touch(installed.path(), "cjxl");
+        let djxl = touch(installed.path(), "djxl");
+        let jxlinfo = touch(installed.path(), "jxlinfo");
+
+        let tools = JxlTools::locate(Some(bundled.path()), [installed.path().to_path_buf()]);
+        assert_eq!(tools.cjxl, Some(cjxl));
+        assert_eq!(tools.djxl, Some(djxl));
+        assert_eq!(tools.jxlinfo, Some(jxlinfo));
     }
 }

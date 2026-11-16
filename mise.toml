@@ -37,6 +37,17 @@ depends = ["setup"]
 dir = "{{config_root}}/apps/desktop"
 run = "pnpm tauri build"
 
+[tasks.media-tools]
+description = "Build the ffmpeg/libjxl tools the app bundles (slow; default target: this machine)"
+usage = 'arg "[target]" help="Rust target triple, e.g. universal-apple-darwin"'
+run = 'scripts/media-tools/build.sh "${usage_target:-$(rustc -vV | sed -n "s/^host: //p")}"'
+
+[tasks.build-bundled]
+description = "Build the desktop bundle with the tools from `mise run media-tools` inside"
+depends = ["setup"]
+dir = "{{config_root}}/apps/desktop"
+run = "pnpm tauri build --config src-tauri/tauri.media-tools.conf.json"
+
 [tasks.cli]
 description = "Run the catconvert CLI, e.g. `mise run cli -- probe photo.jpg`"
 dir = "{{cwd}}"

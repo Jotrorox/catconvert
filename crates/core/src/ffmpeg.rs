@@ -21,6 +21,11 @@ pub const FFMPEG_ENV: &str = "CATCONVERT_FFMPEG";
 /// Environment variable pointing at an ffprobe binary. Defaults to the
 /// `ffprobe` next to the chosen ffmpeg.
 pub const FFPROBE_ENV: &str = "CATCONVERT_FFPROBE";
+/// File-name prefix of the tools an app ships next to its executable:
+/// `catconvert-ffmpeg`, `catconvert-ffprobe`, `catconvert-cjxl`, … The prefix
+/// keeps a Linux package that installs them into `/usr/bin` from clashing with
+/// the distribution's own ffmpeg.
+pub const BUNDLED_PREFIX: &str = "catconvert-";
 
 /// A usable ffmpeg + ffprobe pair, plus whichever libjxl tools are installed.
 ///
@@ -29,6 +34,7 @@ pub const FFPROBE_ENV: &str = "CATCONVERT_FFPROBE";
 pub struct Ffmpeg {
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
+    bundled: bool,
     version: String,
     encoders: Arc<HashSet<String>>,
     decoders: Arc<HashSet<String>>,
@@ -68,12 +74,28 @@ impl Ffmpeg {
     /// [`Error::FfmpegNotFound`] if no directory holds both binaries, or the
     /// error from [`Ffmpeg::at`] if the binaries found do not run.
     pub fn locate() -> Result<Self> {
+        Self::locate_with(None)
+    }
+
+    /// Like [`Ffmpeg::locate`], but an app that ships its own tools passes the
+    /// directory holding them (named with [`BUNDLED_PREFIX`]). They come after
+    /// the environment variables and before `PATH`, and the bundled libjxl
+    /// tools are preferred over installed ones the same way.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Ffmpeg::locate`].
+    pub fn locate_with(bundled: Option<&Path>) -> Result<Self> {
         if let Some(ffmpeg) = std::env::var_os(FFMPEG_ENV).map(PathBuf::from) {
             let ffprobe = std::env::var_os(FFPROBE_ENV)
                 .map(PathBuf::from)
                 .or_else(|| sibling(&ffmpeg, "ffprobe"))
                 .ok_or(Error::FfmpegNotFound)?;
-            return Self::at(ffmpeg, ffprobe);
+            return Self::open(ffmpeg, ffprobe, bundled, false);
+        }
+
+        if let Some((ffmpeg, ffprobe)) = bundled.and_then(bundled_pair) {
+            return Self::open(ffmpeg, ffprobe, bundled, true);
         }
 
         search_dirs()
@@ -84,7 +106,7 @@ impl Ffmpeg {
                 Some((ffmpeg, ffprobe))
             })
             .map_or(Err(Error::FfmpegNotFound), |(ffmpeg, ffprobe)| {
-                Self::at(ffmpeg, ffprobe)
+                Self::open(ffmpeg, ffprobe, bundled, false)
             })
     }
 
@@ -97,9 +119,16 @@ impl Ffmpeg {
     /// [`Error::Spawn`] if ffmpeg cannot be started, [`Error::Ffmpeg`] if it
     /// exits with an error.
     pub fn at(ffmpeg: impl Into<PathBuf>, ffprobe: impl Into<PathBuf>) -> Result<Self> {
-        let ffmpeg = ffmpeg.into();
-        let ffprobe = ffprobe.into();
+        Self::open(ffmpeg.into(), ffprobe.into(), None, false)
+    }
 
+    /// [`Ffmpeg::at`], also looking for libjxl's tools in `bundled`.
+    fn open(
+        ffmpeg: PathBuf,
+        ffprobe: PathBuf,
+        bundled: Option<&Path>,
+        is_bundled: bool,
+    ) -> Result<Self> {
         let version_out = capture(base_command(&ffmpeg).arg("-version"), &ffmpeg)?;
         let version = parse_version(&String::from_utf8_lossy(&version_out));
 
@@ -115,6 +144,7 @@ impl Ffmpeg {
         let decoders = parse_codecs(&String::from_utf8_lossy(&decoders_out));
 
         let jxl = JxlTools::locate(
+            bundled,
             ffmpeg
                 .parent()
                 .map(Path::to_path_buf)
@@ -125,6 +155,7 @@ impl Ffmpeg {
         Ok(Self {
             ffmpeg,
             ffprobe,
+            bundled: is_bundled,
             version,
             encoders: Arc::new(encoders),
             decoders: Arc::new(decoders),
@@ -156,6 +187,12 @@ impl Ffmpeg {
     #[must_use]
     pub fn ffmpeg_path(&self) -> &Path {
         &self.ffmpeg
+    }
+
+    /// Whether this is the ffmpeg the app ships (see [`Ffmpeg::locate_with`]).
+    #[must_use]
+    pub fn is_bundled(&self) -> bool {
+        self.bundled
     }
 
     /// Path of the ffprobe binary in use.
@@ -299,14 +336,19 @@ impl Ffmpeg {
     /// [`Error::Ffmpeg`] if decoding fails or there is no frame at `at_secs`.
     pub fn frame(&self, input: &Path, at_secs: f64, max_height: u32) -> Result<Vec<u8>> {
         let input = &self.readable(input)?;
+        // ffmpeg can't seek in animated JPEG XL; decode up to the frame instead.
+        let seek_input = !jxl::is_jxl_file(input);
+        let at = (at_secs > 0.0).then(|| format_secs(at_secs));
         let mut cmd = base_command(&self.ffmpeg);
         cmd.args(["-hide_banner", "-nostdin", "-v", "error"]);
-        if at_secs > 0.0 {
-            cmd.arg("-ss").arg(format_secs(at_secs));
+        if let Some(at) = at.as_deref().filter(|_| seek_input) {
+            cmd.args(["-ss", at]);
         }
-        cmd.arg("-i")
-            .arg(input)
-            .args(["-frames:v", "1", "-an", "-sn"])
+        cmd.arg("-i").arg(input);
+        if let Some(at) = at.as_deref().filter(|_| !seek_input) {
+            cmd.args(["-ss", at]);
+        }
+        cmd.args(["-frames:v", "1", "-an", "-sn"])
             .arg("-vf")
             .arg(format!("scale=-2:'min(ih,{})'", even(max_height)))
             .args(["-c:v", "mjpeg", "-q:v", "4", "-f", "image2pipe", "pipe:1"]);
@@ -694,6 +736,13 @@ pub(crate) fn executable(dir: &Path, name: &str) -> Option<PathBuf> {
 
 fn sibling(binary: &Path, name: &str) -> Option<PathBuf> {
     executable(binary.parent()?, name)
+}
+
+/// The bundled ffmpeg and ffprobe in `dir`, if both are there.
+fn bundled_pair(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let ffmpeg = executable(dir, &format!("{BUNDLED_PREFIX}ffmpeg"))?;
+    let ffprobe = executable(dir, &format!("{BUNDLED_PREFIX}ffprobe"))?;
+    Some((ffmpeg, ffprobe))
 }
 
 /// Every directory on `PATH`, then common install locations.
@@ -1095,5 +1144,27 @@ mod tests {
         assert_eq!(format_secs(0.0), "0");
         assert_eq!(format_secs(1.23456), "1.235");
         assert_eq!(format_secs(-4.0), "0");
+    }
+
+    #[test]
+    fn bundled_tools_need_the_prefix_and_both_binaries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let touch = |name: &str| {
+            let path = dir
+                .path()
+                .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            std::fs::write(&path, b"").expect("write");
+            path
+        };
+        // Unprefixed names are a system install, not the app's copy.
+        touch("ffmpeg");
+        touch("ffprobe");
+        assert_eq!(bundled_pair(dir.path()), None);
+
+        let ffmpeg = touch("catconvert-ffmpeg");
+        assert_eq!(bundled_pair(dir.path()), None, "ffprobe is missing");
+
+        let ffprobe = touch("catconvert-ffprobe");
+        assert_eq!(bundled_pair(dir.path()), Some((ffmpeg, ffprobe)));
     }
 }

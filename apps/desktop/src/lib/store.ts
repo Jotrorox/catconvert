@@ -214,6 +214,7 @@ export async function refreshFfmpeg(relocate = false) {
   } catch (error) {
     const status: FfmpegStatus = {
       found: false,
+      bundled: false,
       version: null,
       path: null,
       error: String(error),

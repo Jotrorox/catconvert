@@ -1,7 +1,7 @@
 import { type Component, createSignal, For, Match, Show, Switch } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
-import type { OutputFormat } from "../lib/api";
+import { type OutputFormat, thirdPartyLicenses } from "../lib/api";
 import { formatBytes } from "../lib/format";
 import { FORMAT_GROUPS, type FormatGroup, label, QUALITY_STEPS, qualityStep } from "../lib/formats";
 import {
@@ -121,12 +121,22 @@ export const SettingsScreen: Component = () => {
     });
   };
 
+  // undefined: not loaded yet, null: this build ships no third-party tools.
+  const [licenses, setLicenses] = createSignal<string | null | undefined>();
+  const [showLicenses, setShowLicenses] = createSignal(false);
+  const toggleLicenses = async () => {
+    if (licenses() === undefined) {
+      setLicenses(await thirdPartyLicenses().catch(() => null));
+    }
+    setShowLicenses(!showLicenses());
+  };
+
   return (
     <div class="page">
       <header class="page-header">
         <div>
           <h1 class="display page-title">Settings</h1>
-          <p class="subtitle">CatConvert uses the ffmpeg on your computer. Nothing leaves it.</p>
+          <p class="subtitle">Everything is converted on your computer. Nothing leaves it.</p>
         </div>
       </header>
 
@@ -155,7 +165,12 @@ export const SettingsScreen: Component = () => {
             }
           >
             <h2 class="label-strong">ffmpeg {state.ffmpeg?.version}</h2>
-            <p class="item-meta mono path">{state.ffmpeg?.path}</p>
+            <Show
+              when={state.ffmpeg?.bundled}
+              fallback={<p class="item-meta mono path">{state.ffmpeg?.path}</p>}
+            >
+              <p class="item-meta">Built into CatConvert</p>
+            </Show>
             <p class="item-meta">
               <Show
                 when={state.ffmpeg?.libjxl}
@@ -224,6 +239,34 @@ export const SettingsScreen: Component = () => {
       </section>
 
       <UpdatesCard />
+
+      <section class="card">
+        <h2 class="section-title">Open-source licenses</h2>
+        <p class="item-meta">
+          CatConvert comes with ffmpeg (GPL-2.0-or-later, built with x264) and libjxl's tools, which
+          it runs as separate programs. Every release on GitHub includes their complete source code.
+        </p>
+        <button
+          type="button"
+          class="btn btn-outline settings-note"
+          aria-expanded={showLicenses()}
+          onClick={() => void toggleLicenses()}
+        >
+          {showLicenses() ? "Hide licenses" : "Show licenses"}
+        </button>
+        <Show when={showLicenses()}>
+          <Show
+            when={licenses()}
+            fallback={
+              <p class="item-meta settings-note">
+                This build doesn't include ffmpeg; it uses the one installed on your computer.
+              </p>
+            }
+          >
+            {(text) => <pre class="licenses mono">{text()}</pre>}
+          </Show>
+        </Show>
+      </section>
     </div>
   );
 };

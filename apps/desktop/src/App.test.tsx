@@ -16,6 +16,7 @@ vi.mock("./lib/api", () => ({
   startJob: vi.fn(),
   cancelJob: vi.fn(async () => true),
   pickFiles: vi.fn(async () => []),
+  thirdPartyLicenses: vi.fn(async () => "ffmpeg 9.0.2 (GPL-2.0-or-later)"),
   revealInFolder: vi.fn(async () => {}),
   missingFiles: vi.fn(async () => []),
   onJobProgress: vi.fn(),
@@ -36,6 +37,7 @@ const ALL: OutputFormat[] = [
 function status(found = true): FfmpegStatus {
   return {
     found,
+    bundled: false,
     version: found ? "7.1" : null,
     path: found ? "/opt/homebrew/bin/ffmpeg" : null,
     error: found ? null : "ffmpeg was not found",
@@ -148,6 +150,16 @@ describe("CatConvert", () => {
     openPaths([VIDEO.path]);
     await screen.findByRole("heading", { name: "clip.mov" });
     expect(screen.getByRole("button", { name: /Start converting/ })).toBeDisabled();
+  });
+
+  it("shows the bundled ffmpeg and its licenses in Settings", async () => {
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({ ...status(), bundled: true });
+    render(() => <App />);
+    navigate("settings");
+    expect(await screen.findByText("Built into CatConvert")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show licenses" }));
+    expect(await screen.findByText("ffmpeg 9.0.2 (GPL-2.0-or-later)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide licenses" })).toBeInTheDocument();
   });
 
   it("edits a video and queues it with the chosen settings", async () => {

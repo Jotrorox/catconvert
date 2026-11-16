@@ -444,6 +444,7 @@ pub fn plan(
         });
         source.path = decoded.clone();
         source.extension = Some(ext.into());
+        source.video_codec = Some(ext.into());
         scratch.push(decoded);
     }
 
@@ -532,13 +533,19 @@ fn ffmpeg_step(
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |items: &[&str]| args.extend(items.iter().map(OsString::from));
 
-    // Input and trim. Seeking before `-i` is fast and frame-accurate when re-encoding.
+    // Input and trim. Seeking before `-i` is fast and frame-accurate when
+    // re-encoding, except that ffmpeg's animated JPEG XL demuxer can't seek
+    // (the decoder then fails); those short clips are decoded from the start.
     let timed_input = input.kind != MediaKind::Image;
-    if timed_input && start > 0.0 {
+    let seek_input = !is_jxl(input);
+    if timed_input && start > 0.0 && seek_input {
         push(&["-ss", &format_secs(start)]);
     }
     push(&["-i"]);
     args.push(input.path.clone().into_os_string());
+    if timed_input && start > 0.0 && !seek_input {
+        args.extend(["-ss".into(), format_secs(start).into()]);
+    }
     let duration_secs = if timed_input && out_kind != MediaKind::Image {
         let end = end.or(input.duration_secs);
         if let Some(end) = end.filter(|_| options.trim_end.is_some()) {
@@ -1590,6 +1597,10 @@ mod tests {
             cmd.contains("ffmpeg -ss 1 -i /clips/.loop.gif.decoded.apng"),
             "{cmd}"
         );
+
+        // ffmpeg's own decoder can't seek in it, so the trim comes after -i.
+        let cmd = command_with(&anim, &gif, "/clips/loop.gif", FFMPEG_JXL);
+        assert!(cmd.starts_with("ffmpeg -i /clips/loop.jxl -ss 1 "), "{cmd}");
 
         let none = plan_err(&photo, &edited, JxlSupport::default());
         assert!(none.contains("djxl"), "{none}");

@@ -7,14 +7,17 @@ CatConvert is a desktop app for macOS, Windows and Linux built with
 front end and a Rust core library. iOS and Android shells come later, through
 Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 
-> **Status: early.** Conversion runs through the `ffmpeg`/`ffprobe` installed on
-> your machine (found on `PATH`, in Homebrew's folders, or via `CATCONVERT_FFMPEG`).
+> **Status: early.** Conversion runs through `ffmpeg`/`ffprobe`. Release builds
+> ship their own (with libjxl's tools), so there is nothing to install. Without
+> them, as in development, CatConvert uses an installed ffmpeg (found on `PATH`,
+> in Homebrew's folders, or via `CATCONVERT_FFMPEG`, which always wins).
 > You can drop files, trim, resize, rotate, mirror, change frame rate, quality and
 > format, drop the sound, and watch a serial queue with live progress. Results are
 > saved next to the original and never overwrite anything.
 >
-> JPEG XL is fully supported, still and animated, when libjxl's tools are installed
-> (`brew install jpeg-xl`; found like ffmpeg, or via `CATCONVERT_LIBJXL`). You get
+> JPEG XL is fully supported, still and animated, with libjxl's tools (bundled in
+> releases; otherwise `brew install jpeg-xl`, found like ffmpeg or via
+> `CATCONVERT_LIBJXL`). You get
 > lossless or lossy encoding, an effort setting and progressive files. Unedited JPEGs
 > are repacked losslessly and can later be restored bit for bit. Videos and GIFs
 > become animated JXL, and JXL files (animated too) open like any other file. An
@@ -31,8 +34,10 @@ mise install     # install pinned tools
 mise run dev     # install JS deps and launch the desktop app
 ```
 
-Install ffmpeg first (`brew install ffmpeg`, `winget install ffmpeg` or your
-distro's package), then drop a video on the kitty. Narrow the window below 720px
+Development builds use your installed ffmpeg, so install it first (`brew install
+ffmpeg`, `winget install ffmpeg` or your distro's package), then drop a video on
+the kitty. To build the app with its own ffmpeg inside, see
+[Bundled media tools](CONTRIBUTING.md#bundled-media-tools). Narrow the window below 720px
 to see the phone layout.
 
 On Linux, install Tauri's system packages first; see
@@ -99,7 +104,10 @@ mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print 
 - **Release** (`.github/workflows/release.yml`): pushing a `v*` tag builds a
   universal macOS `.dmg`, Windows `.msi`/`.exe`, Linux `.AppImage`/`.deb` and
   the `catconvert` CLI for each OS, and attaches everything to a **draft**
-  GitHub Release.
+  GitHub Release. The desktop bundles include ffmpeg and libjxl's tools, built
+  by `.github/workflows/media-tools.yml`, and the release gets their complete
+  source as `catconvert-<tag>-media-tools-source.tar.xz`. The CLI uses an
+  installed ffmpeg.
 
 ```sh
 mise run release 0.2.0
@@ -158,4 +166,7 @@ Alternatively, native shells can use `catconvert-ffi` through UniFFI.
 
 ## License
 
-[BSD-3-Clause](LICENSE)
+CatConvert is [BSD-3-Clause](LICENSE). The desktop app bundles ffmpeg and
+ffprobe built with x264, which are GPL-2.0-or-later, and libjxl's tools; they run
+as separate programs. Their licenses are listed in the app (Settings →
+Open-source licenses), and each release includes their source code.
