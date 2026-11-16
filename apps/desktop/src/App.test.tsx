@@ -1,35 +1,245 @@
-import { fireEvent, render, screen } from "@solidjs/testing-library";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+import type { FfmpegStatus, MediaInfo, OutputFormat } from "./lib/api";
+import * as api from "./lib/api";
+import { applyProgress, openPaths, resetStore, state } from "./lib/store";
 
-describe("App mockup", () => {
-  it("starts on the Convert screen", () => {
+vi.mock("./lib/api", () => ({
+  inTauri: false,
+  ffmpegStatus: vi.fn(),
+  relocateFfmpeg: vi.fn(),
+  probeFile: vi.fn(),
+  previewFrame: vi.fn(async () => "blob:frame"),
+  waveform: vi.fn(async () => "blob:wave"),
+  previewCommand: vi.fn(async () => "ffmpeg -i clip.mov clip.mp4"),
+  startJob: vi.fn(),
+  cancelJob: vi.fn(async () => true),
+  pickFiles: vi.fn(async () => []),
+  revealInFolder: vi.fn(async () => {}),
+  onJobProgress: vi.fn(),
+  onFileDrop: vi.fn(),
+}));
+
+const ALL: OutputFormat[] = [
+  ...["mp4", "webm", "mov", "mkv", "gif"],
+  ...["mp3", "m4a", "wav", "flac", "ogg"],
+  ...["png", "jpg", "webp", "avif"],
+] as OutputFormat[];
+
+function status(found = true): FfmpegStatus {
+  return {
+    found,
+    version: found ? "7.1" : null,
+    path: found ? "/opt/homebrew/bin/ffmpeg" : null,
+    error: found ? null : "ffmpeg was not found",
+    formats: ALL.map((format) => ({ format, available: found && format !== "webp" })),
+  };
+}
+
+const VIDEO: MediaInfo = {
+  path: "/clips/clip.mov",
+  fileName: "clip.mov",
+  extension: "mov",
+  sizeBytes: 48_000_000,
+  kind: "video",
+  durationSecs: 42,
+  width: 1920,
+  height: 1080,
+  fps: 30,
+  videoCodec: "h264",
+  audioCodec: "aac",
+};
+
+const SONG: MediaInfo = {
+  ...VIDEO,
+  path: "/music/purr.wav",
+  fileName: "purr.wav",
+  extension: "wav",
+  kind: "audio",
+  width: null,
+  height: null,
+  fps: null,
+  videoCodec: null,
+  audioCodec: "pcm_s16le",
+};
+
+beforeEach(() => {
+  resetStore();
+  vi.clearAllMocks();
+  vi.mocked(api.ffmpegStatus).mockResolvedValue(status());
+  vi.mocked(api.probeFile).mockImplementation(async (path) =>
+    path.endsWith(".wav") ? SONG : { ...VIDEO, path, fileName: path.split("/").pop() ?? path },
+  );
+  vi.mocked(api.startJob).mockImplementation(async (path, options) => ({
+    id: 7,
+    output: path.replace(/\.\w+$/, `.${options.format}`),
+    input: VIDEO,
+    command: "ffmpeg …",
+  }));
+});
+
+async function openVideo() {
+  render(() => <App />);
+  await screen.findByText("ffmpeg 7.1");
+  openPaths([VIDEO.path]);
+  return screen.findByRole("heading", { name: "clip.mov" });
+}
+
+describe("CatConvert", () => {
+  it("starts on Convert and reports the ffmpeg it found", async () => {
     render(() => <App />);
     expect(screen.getByRole("heading", { name: "Drop files on the kitty" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Convert" })).toHaveAttribute("aria-current", "page");
+    expect(await screen.findByText("ffmpeg 7.1")).toBeInTheDocument();
+    expect(screen.getByText(/Nothing yet/)).toBeInTheDocument();
   });
 
-  it("opens file settings from a recipe with its format selected", () => {
+  it("warns when ffmpeg is missing and blocks converting", async () => {
+    vi.mocked(api.ffmpegStatus).mockResolvedValue(status(false));
     render(() => <App />);
+    expect(await screen.findByText("ffmpeg is missing.")).toBeInTheDocument();
+    openPaths([VIDEO.path]);
+    await screen.findByRole("heading", { name: "clip.mov" });
+    expect(screen.getByRole("button", { name: /Start converting/ })).toBeDisabled();
+  });
+
+  it("edits a video and queues it with the chosen settings", async () => {
+    await openVideo();
+    expect(screen.getByText(/1920×1080 · 0:42 · H264/)).toBeInTheDocument();
+    // Video input offers video and sound formats, not pictures; MP4 is the default.
+    expect(screen.getByRole("button", { name: "MP4" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("button", { name: "PNG" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "WEBM" }));
+    expect(screen.getByRole("button", { name: "WEBM" })).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByRole("switch", { name: "Keep sound" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rotate 90°" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), { target: { value: "720" } });
+
+    const start = screen.getByRole("slider", { name: "Trim start" });
+    fireEvent.keyDown(start, { key: "ArrowRight", shiftKey: true });
+    fireEvent.keyDown(start, { key: "ArrowRight", shiftKey: true });
+
+    const changes = within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "Keeps 40 s",
+      "720p",
+      "Turned 90°",
+      "No sound",
+    ]);
+    expect(screen.getByText("clip.webm")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(VIDEO.path, {
+      format: "webm",
+      trimStart: 2,
+      trimEnd: null,
+      maxSize: 720,
+      fps: null,
+      rotate: 90,
+      flip: false,
+      quality: 60,
+      keepAudio: false,
+    });
+
+    applyProgress({
+      jobId: 7,
+      stage: "running",
+      progress: 0.42,
+      speed: 2,
+      outputBytes: null,
+      error: null,
+    });
+    expect(await screen.findByRole("progressbar")).toHaveAttribute("aria-valuenow", "42");
+    expect(screen.getByText("2.0×")).toBeInTheDocument();
+
+    applyProgress({
+      jobId: 7,
+      stage: "done",
+      progress: 1,
+      speed: null,
+      outputBytes: 3_000_000,
+      error: null,
+    });
+    const done = await screen.findByRole("button", { name: /Show in folder/ });
+    fireEvent.click(done);
+    expect(api.revealInFolder).toHaveBeenCalledWith("/clips/clip.webm");
+    expect(screen.getByText("All done. Purrfect.")).toBeInTheDocument();
+    expect(state.history[0]?.outputBytes).toBe(3_000_000);
+  });
+
+  it("handles progress events that arrive before startJob resolves", async () => {
+    vi.mocked(api.startJob).mockImplementation(async (path, options) => {
+      applyProgress({
+        jobId: 9,
+        stage: "running",
+        progress: 0.5,
+        speed: null,
+        outputBytes: null,
+        error: null,
+      });
+      return { id: 9, output: `${path}.${options.format}`, input: VIDEO, command: "" };
+    });
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    expect(await screen.findByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
+  });
+
+  it("shows failures with a way to retry", async () => {
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    applyProgress({
+      jobId: 7,
+      stage: "failed",
+      progress: 0.1,
+      speed: null,
+      outputBytes: null,
+      error: "Invalid data found",
+    });
+    expect(await screen.findByText("Invalid data found")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Retry/ }));
+    await waitFor(() => expect(api.startJob).toHaveBeenCalledTimes(2));
+  });
+
+  it("walks through several dropped files one after another", async () => {
+    render(() => <App />);
+    await screen.findByText("ffmpeg 7.1");
+    openPaths(["/clips/a.mov", "/clips/b.mov"]);
+    await screen.findByRole("heading", { name: "a.mov" });
+    expect(screen.getByText("Up next")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Convert & next/ }));
+    expect(await screen.findByRole("heading", { name: "b.mov" })).toBeInTheDocument();
+    expect(screen.getByText("a.mov is in the queue")).toBeInTheDocument();
+  });
+
+  it("applies a recipe to picked files", async () => {
+    vi.mocked(api.pickFiles).mockResolvedValue([VIDEO.path]);
+    render(() => <App />);
+    await screen.findByText("ffmpeg 7.1");
     fireEvent.click(screen.getByRole("button", { name: /Make a GIF/ }));
-
-    expect(screen.getByRole("heading", { name: "garden_zoomies.mov" })).toBeInTheDocument();
+    await screen.findByRole("heading", { name: "clip.mov" });
     expect(screen.getByRole("button", { name: "GIF" })).toHaveAttribute("aria-pressed", "true");
-
-    const audio = screen.getByRole("switch", { name: "Keep audio" });
-    fireEvent.click(audio);
-    expect(audio).toHaveAttribute("aria-checked", "false");
-
-    fireEvent.click(screen.getByRole("button", { name: "Back" }));
-    expect(screen.getByRole("heading", { name: "Drop files on the kitty" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Size" })).toHaveValue("480");
+    expect(screen.queryByRole("switch", { name: "Keep sound" })).not.toBeInTheDocument();
   });
 
-  it("shows the queue with the active job's progress", () => {
+  it("offers only sound formats and no picture tools for audio", async () => {
     render(() => <App />);
-    fireEvent.click(screen.getByRole("button", { name: /Queue/ }));
-
-    expect(screen.getByRole("heading", { name: "Queue" })).toBeInTheDocument();
-    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "64");
-    expect(screen.getByText("birthday_cake_pounce.mkv")).toBeInTheDocument();
+    await screen.findByText("ffmpeg 7.1");
+    openPaths([SONG.path]);
+    await screen.findByRole("heading", { name: "purr.wav" });
+    const formats = screen.getByRole("group", { name: "Turn it into" });
+    expect(
+      within(formats)
+        .getAllByRole("button")
+        .map((b) => b.textContent),
+    ).toEqual(["MP3", "M4A", "WAV", "FLAC", "OGG"]);
+    expect(screen.getByRole("button", { name: "MP3" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("button", { name: "Rotate 90°" })).not.toBeInTheDocument();
+    expect(screen.getByRole("slider", { name: "Trim end" })).toBeInTheDocument();
   });
 });

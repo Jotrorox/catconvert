@@ -7,11 +7,11 @@ CatConvert is a desktop app for macOS, Windows and Linux built with
 front end and a Rust core library. iOS and Android shells come later, through
 Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 
-> **Status: scaffolding.** The front end is a static UI mockup of the design
-> (Convert, file settings and Queue screens, desktop and phone layouts) driven by
-> sample data in `apps/desktop/src/lib/mock.ts`; it does not call the backend yet.
-> The Rust side only probes file size and extension and emits fake job progress.
-> No FFmpeg/libvips yet.
+> **Status: early.** Conversion runs through the `ffmpeg`/`ffprobe` installed on
+> your machine (found on `PATH`, in Homebrew's folders, or via `CATCONVERT_FFMPEG`).
+> You can drop files, trim, resize, rotate, mirror, change frame rate, quality and
+> format, drop the sound, and watch a serial queue with live progress. Results are
+> saved next to the original and never overwrite anything.
 
 ## Quick start
 
@@ -24,8 +24,9 @@ mise install     # install pinned tools
 mise run dev     # install JS deps and launch the desktop app
 ```
 
-Click through the mockup screens; narrow the window below 720px to see the phone
-layout.
+Install ffmpeg first (`brew install ffmpeg`, `winget install ffmpeg` or your
+distro's package), then drop a video on the kitty. Narrow the window below 720px
+to see the phone layout.
 
 On Linux, install Tauri's system packages first; see
 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
@@ -64,7 +65,7 @@ Run from anywhere in the repo with `mise run <task>` (`mise tasks` lists them).
 | `setup`     | `pnpm install` (frozen lockfile in CI)                                  |
 | `dev`       | Run the desktop app in dev mode (hot reload)                            |
 | `build`     | Production desktop bundle for the current OS (`target/release/bundle/`) |
-| `cli`       | Run the CLI: `mise run cli -- probe photo.jpg`                          |
+| `cli`       | Run the CLI: `mise run cli -- convert clip.mov --to gif`                |
 | `fmt`       | `cargo fmt` + `biome format`                                            |
 | `fmt-check` | Formatting check without writing                                        |
 | `lint`      | `cargo clippy -D warnings`, `biome check`, `tsc --noEmit`, `actionlint` |
@@ -75,17 +76,10 @@ Run from anywhere in the repo with `mise run <task>` (`mise tasks` lists them).
 ## CLI
 
 ```sh
-mise run cli -- probe README.md
-```
-
-```json
-{
-  "path": "README.md",
-  "fileName": "README.md",
-  "extension": "md",
-  "sizeBytes": 4242,
-  "kind": "unknown"
-}
+mise run cli -- probe clip.mov                       # duration, size, codecs as JSON
+mise run cli -- convert clip.mov --to gif --start 1 --end 4 --size 480
+mise run cli -- convert clip.mov --to mp3            # pull the audio
+mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print the ffmpeg command
 ```
 
 ## CI and releases

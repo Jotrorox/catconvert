@@ -2,25 +2,42 @@ import { type Component, For, Show } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
 import { Brand } from "../components/Navigation";
-import {
-  LATEST,
-  RECENT,
-  RECIPES,
-  type RecentItem,
-  SUPPORTED_CHIPS,
-  type TargetFormat,
-} from "../lib/mock";
+import { RecipeGrid } from "../components/RecipeGrid";
+import { baseName, formatBytes, formatWhen } from "../lib/format";
+import { label } from "../lib/formats";
+import { chooseFiles, type HistoryItem, navigate, reveal, state } from "../lib/store";
 
 type Props = {
   compact: boolean;
-  onOpenFile: (format?: TargetFormat) => void;
-  onOpenSettings: () => void;
+  /** Files are being dragged over the window. */
+  dropHover: boolean;
 };
 
-const RecentIcon: Component<{ item: RecentItem }> = (props) => (
-  <span class="tile" data-tone={props.item.kind === "video" ? "pink" : "yellow"}>
-    <Icon name={props.item.kind === "video" ? "video" : "music"} size={18} />
-  </span>
+const KIND_ICON = { video: "video", audio: "music", image: "image", unknown: "paw" } as const;
+const KIND_TONE = { video: "pink", audio: "yellow", image: "lavender", unknown: "green" } as const;
+
+export const RecentRow: Component<{ item: HistoryItem }> = (props) => (
+  <li class="recent-item">
+    <span class="tile" data-tone={KIND_TONE[props.item.kind]}>
+      <Icon name={KIND_ICON[props.item.kind]} size={18} />
+    </span>
+    <div class="item-main">
+      <span class="item-name">{props.item.name}</span>
+      <span class="item-meta">
+        {label(props.item.format)} · {formatBytes(props.item.inputBytes)} →{" "}
+        {formatBytes(props.item.outputBytes)} · {formatWhen(props.item.finishedAt)}
+      </span>
+    </div>
+    <button
+      type="button"
+      class="icon-btn plain"
+      aria-label={`Show ${baseName(props.item.output)} in folder`}
+      title="Show in folder"
+      onClick={() => void reveal(props.item.output)}
+    >
+      <Icon name="folder" size={18} />
+    </button>
+  </li>
 );
 
 export const ConvertHome: Component<Props> = (props) => (
@@ -33,10 +50,6 @@ export const ConvertHome: Component<Props> = (props) => (
             <h1 class="display page-title">Convert</h1>
             <p class="subtitle">Drop a file and we'll knead it into shape.</p>
           </div>
-          <button type="button" class="btn btn-outline">
-            <Icon name="plus" size={18} />
-            Add folder
-          </button>
         </header>
       }
     >
@@ -46,7 +59,7 @@ export const ConvertHome: Component<Props> = (props) => (
           type="button"
           class="icon-btn round"
           aria-label="Settings"
-          onClick={() => props.onOpenSettings()}
+          onClick={() => navigate("settings")}
         >
           <Icon name="sliders" size={22} />
         </button>
@@ -54,86 +67,53 @@ export const ConvertHome: Component<Props> = (props) => (
       <h1 class="display hero-title">What shall we knead today?</h1>
     </Show>
 
-    <section class="dropzone" aria-label="Drop zone">
+    <Show when={state.ffmpeg && !state.ffmpeg.found}>
+      <button type="button" class="banner" onClick={() => navigate("settings")}>
+        <Icon name="alert" size={20} />
+        <span>
+          <strong>ffmpeg is missing.</strong> The kitty needs it to convert anything.
+        </span>
+        <span class="banner-cta">
+          How to fix <Icon name="arrow-right" size={16} />
+        </span>
+      </button>
+    </Show>
+
+    <section class="dropzone" classList={{ hover: props.dropHover }} aria-label="Drop zone">
       <CatPeek class="dropzone-cat" whiskers={!props.compact} />
-      <Show
-        when={props.compact}
-        fallback={
-          <>
-            <h2 class="display dropzone-title">Drop files on the kitty</h2>
-            <p class="dropzone-hint">Video, audio or images — one file or a whole litter.</p>
-          </>
-        }
-      >
-        <h2 class="dropzone-title compact">Tap to pick files</h2>
-        <p class="dropzone-hint">From Photos, Files or a share sheet</p>
-      </Show>
-      <button type="button" class="btn btn-primary" onClick={() => props.onOpenFile()}>
+      <h2 class="display dropzone-title">
+        {props.dropHover ? "Let go, I've got it!" : "Drop files on the kitty"}
+      </h2>
+      <p class="dropzone-hint">Video, audio or images — one file or a whole litter.</p>
+      <button type="button" class="btn btn-primary" onClick={() => void chooseFiles()}>
         Choose files
       </button>
-      <Show when={!props.compact}>
-        <ul class="chips" aria-label="Supported formats">
-          <For each={SUPPORTED_CHIPS}>{(chip) => <li class="chip">{chip}</li>}</For>
-        </ul>
-      </Show>
     </section>
 
     <section>
       <h2 class="section-title">Quick recipes</h2>
-      <div class="recipes">
-        <For each={RECIPES}>
-          {(recipe) => (
-            <button
-              type="button"
-              class="recipe"
-              data-tone={recipe.tone}
-              onClick={() => props.onOpenFile(recipe.format)}
-            >
-              <span class="recipe-title">{recipe.title}</span>
-              <span class="recipe-detail">
-                {props.compact ? recipe.shortDetail : recipe.detail}
-              </span>
-              <span class="recipe-route">{recipe.route}</span>
-            </button>
-          )}
-        </For>
-      </div>
+      <RecipeGrid />
     </section>
 
-    <Show
-      when={props.compact}
-      fallback={
-        <section class="card recent">
-          <h2 class="section-title">Recently purred</h2>
-          <ul class="recent-list">
-            <For each={RECENT}>
-              {(item) => (
-                <li class="recent-item">
-                  <RecentIcon item={item} />
-                  <div class="item-main">
-                    <span class="item-name">{item.name}</span>
-                    <span class="item-meta">
-                      {item.route} · {item.from} → {item.to}
-                    </span>
-                  </div>
-                  <span class="item-meta">{item.when}</span>
-                </li>
-              )}
-            </For>
-          </ul>
-        </section>
-      }
-    >
-      <button type="button" class="card recent-item recent-compact">
-        <RecentIcon item={LATEST} />
-        <span class="item-main">
-          <span class="item-name">{LATEST.name}</span>
-          <span class="item-meta">
-            {LATEST.from} → {LATEST.to} · {LATEST.when}
-          </span>
-        </span>
-        <Icon name="chevron-right" size={22} class="muted-icon" />
-      </button>
-    </Show>
+    <section class="card recent">
+      <div class="row-between">
+        <h2 class="section-title">Recently purred</h2>
+        <Show when={state.history.length > 3}>
+          <button type="button" class="link-btn" onClick={() => navigate("history")}>
+            See all
+          </button>
+        </Show>
+      </div>
+      <Show
+        when={state.history.length > 0}
+        fallback={
+          <p class="item-meta empty-note">Nothing yet. Your first conversion lands here.</p>
+        }
+      >
+        <ul class="recent-list">
+          <For each={state.history.slice(0, 3)}>{(item) => <RecentRow item={item} />}</For>
+        </ul>
+      </Show>
+    </section>
   </div>
 );

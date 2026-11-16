@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-/// Broad media category, guessed from the file extension for now.
+/// Broad media category: guessed from the extension by [`probe`], refined from
+/// the actual streams by [`crate::Ffmpeg::probe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
@@ -28,8 +29,11 @@ impl MediaKind {
     }
 }
 
-/// Basic information about a media file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Information about a media file.
+///
+/// [`probe`] fills only the filesystem fields; [`crate::Ffmpeg::probe`] also
+/// fills the stream fields (duration, dimensions, codecs) from ffprobe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaInfo {
     /// Path as given by the caller.
@@ -40,14 +44,40 @@ pub struct MediaInfo {
     pub extension: Option<String>,
     /// File size in bytes.
     pub size_bytes: u64,
-    /// Category guessed from the extension.
+    /// Media category.
     pub kind: MediaKind,
+    /// Playback length in seconds; `None` for still images or when unknown.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+    /// Display width in pixels, with rotation metadata already applied.
+    #[serde(default)]
+    pub width: Option<u32>,
+    /// Display height in pixels, with rotation metadata already applied.
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// Average frame rate of the video stream.
+    #[serde(default)]
+    pub fps: Option<f64>,
+    /// Codec name of the primary video stream, e.g. `"h264"`.
+    #[serde(default)]
+    pub video_codec: Option<String>,
+    /// Codec name of the primary audio stream, e.g. `"aac"`.
+    #[serde(default)]
+    pub audio_codec: Option<String>,
+}
+
+impl MediaInfo {
+    /// Whether the file has an audio stream (only known after an ffprobe probe).
+    #[must_use]
+    pub fn has_audio(&self) -> bool {
+        self.audio_codec.is_some()
+    }
 }
 
 /// Inspect a file and return its [`MediaInfo`].
 ///
-/// Placeholder implementation: reads only filesystem metadata (size) and the
-/// extension. It does not open or decode the file.
+/// Reads only filesystem metadata (size) and the extension; it does not open
+/// or decode the file. Use [`crate::Ffmpeg::probe`] for stream details.
 ///
 /// # Errors
 ///
@@ -82,6 +112,12 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         extension,
         size_bytes: metadata.len(),
         kind,
+        duration_secs: None,
+        width: None,
+        height: None,
+        fps: None,
+        video_codec: None,
+        audio_codec: None,
     })
 }
 

@@ -1,0 +1,583 @@
+import {
+  type Component,
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  Index,
+  on,
+  onCleanup,
+  Show,
+} from "solid-js";
+import { CatPeek } from "../components/Cat";
+import { Icon } from "../components/Icon";
+import { TrimBar } from "../components/TrimBar";
+import { type ConvertOptions, type MediaInfo, previewCommand } from "../lib/api";
+import { baseName, formatBytes, formatClock, formatSpan, parseClock } from "../lib/format";
+import {
+  formatKind,
+  fpsChoices,
+  groupsFor,
+  LOSSLESS,
+  label,
+  shortSide,
+  sizeChoices,
+  sizeLabel,
+} from "../lib/formats";
+import { createFilmstrip, createFrame, createWaveform } from "../lib/preview";
+import {
+  closeEditor,
+  convertDraft,
+  type Draft,
+  isAvailable,
+  skipDraft,
+  state,
+  updateOptions,
+} from "../lib/store";
+
+const QUALITY_STEPS = ["Tiny file", "Balanced", "Crisp"] as const;
+const FILMSTRIP_FRAMES = 10;
+
+function describe(info: MediaInfo): string {
+  const parts: string[] = [];
+  if (info.width && info.height) parts.push(`${info.width}×${info.height}`);
+  if (info.durationSecs) parts.push(formatClock(info.durationSecs));
+  if (info.videoCodec && info.kind === "video") parts.push(info.videoCodec.toUpperCase());
+  else if (info.audioCodec && info.kind === "audio") parts.push(info.audioCodec.toUpperCase());
+  parts.push(formatBytes(info.sizeBytes));
+  return parts.join(" · ");
+}
+
+function outputName(info: MediaInfo, options: ConvertOptions): string {
+  const name = info.fileName;
+  const dot = name.lastIndexOf(".");
+  return `${dot > 0 ? name.slice(0, dot) : name}.${options.format}`;
+}
+
+/** Waiting screen while a file is being probed. */
+const Sniffing: Component<{ path: string }> = (props) => (
+  <div class="page sniffing">
+    <CatPeek class="sniff-cat" />
+    <p class="display sniff-title">Sniffing {baseName(props.path)}…</p>
+  </div>
+);
+
+export const Editor: Component<{ compact: boolean }> = (props) => (
+  <Show
+    when={state.draft}
+    keyed
+    fallback={
+      <Show when={state.opening} fallback={<EmptyEditor />}>
+        {(path) => <Sniffing path={path()} />}
+      </Show>
+    }
+  >
+    {(draft) => <DraftEditor draft={draft} compact={props.compact} />}
+  </Show>
+);
+
+const EmptyEditor: Component = () => (
+  <div class="page sniffing">
+    <CatPeek sleepy class="sniff-cat" />
+    <p class="display sniff-title">No file open</p>
+    <button type="button" class="btn btn-outline" onClick={() => closeEditor()}>
+      Back to Convert
+    </button>
+  </div>
+);
+
+const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
+  // `draft` is a store proxy, so these stay reactive to option changes.
+  const info = () => props.draft.info;
+  const options = () => props.draft.options;
+  const outKind = () => formatKind(options().format);
+  const duration = () => info().durationSecs;
+  const timed = () => info().kind !== "image" && outKind() !== "image" && (duration() ?? 0) > 0;
+  const visual = () => info().kind !== "audio" && outKind() !== "audio";
+  const hasPicture = () => info().kind !== "audio";
+
+  const trimStart = () => options().trimStart ?? 0;
+  const trimEnd = () => options().trimEnd ?? duration() ?? 0;
+  const trimmed = () => options().trimStart !== null || options().trimEnd !== null;
+
+  // Preview -----------------------------------------------------------------
+
+  const [scrub, setScrub] = createSignal(
+    info().kind === "video" ? Math.min(1, (duration() ?? 0) * 0.15) : 0,
+  );
+  const picturePath = () => (hasPicture() ? info().path : null);
+  const frame = createFrame(picturePath, scrub, 540);
+  const filmstrip = createFilmstrip(
+    () => (info().kind === "video" ? info().path : null),
+    duration,
+    FILMSTRIP_FRAMES,
+    90,
+  );
+  const wave = createWaveform(() => (info().kind === "audio" ? info().path : null), "#c93b63");
+
+  const quarterTurn = () => options().rotate % 180 === 90;
+
+  // Rotation is shown as a continuous spin rather than snapping back from 270 to 0.
+  const [spin, setSpin] = createSignal(options().rotate as number);
+  const rotate = () => {
+    setSpin((s) => s + 90);
+    updateOptions({ rotate: ((options().rotate + 90) % 360) as ConvertOptions["rotate"] });
+  };
+
+  // Command preview ---------------------------------------------------------
+
+  const [command, setCommand] = createSignal("");
+  const [showCommand, setShowCommand] = createSignal(false);
+  let commandTimer: ReturnType<typeof setTimeout> | undefined;
+  createEffect(
+    on(
+      () => JSON.stringify(options()),
+      () => {
+        clearTimeout(commandTimer);
+        if (!showCommand()) return;
+        const snapshot = { ...options() };
+        commandTimer = setTimeout(() => {
+          previewCommand(info(), snapshot).then(setCommand, (error) => setCommand(`# ${error}`));
+        }, 150);
+      },
+    ),
+  );
+  createEffect(
+    on(showCommand, (open) => {
+      if (open)
+        previewCommand(info(), { ...options() }).then(setCommand, (e) => setCommand(`# ${e}`));
+    }),
+  );
+  onCleanup(() => clearTimeout(commandTimer));
+
+  // Trim text fields ----------------------------------------------------------
+
+  const setTrim = (start: number, end: number) => {
+    const d = duration() ?? 0;
+    updateOptions({
+      trimStart: start <= 0.05 ? null : Math.round(start * 100) / 100,
+      trimEnd: end >= d - 0.05 ? null : Math.round(end * 100) / 100,
+    });
+  };
+
+  const commitTime = (which: "start" | "end", input: HTMLInputElement) => {
+    const parsed = parseClock(input.value);
+    const d = duration() ?? 0;
+    if (parsed === null) {
+      input.value = formatClock(which === "start" ? trimStart() : trimEnd(), true);
+      return;
+    }
+    if (which === "start") setTrim(Math.min(parsed, trimEnd() - 0.1), trimEnd());
+    else setTrim(trimStart(), Math.min(d, Math.max(parsed, trimStart() + 0.1)));
+    setScrub(which === "start" ? trimStart() : trimEnd());
+    input.value = formatClock(which === "start" ? trimStart() : trimEnd(), true);
+  };
+
+  // Settings ------------------------------------------------------------------
+
+  const qualityStep = () =>
+    QUALITY_STEPS[options().quality < 34 ? 0 : options().quality > 66 ? 2 : 1];
+  const sizes = createMemo(() => sizeChoices(info()));
+  const rates = createMemo(() => fpsChoices(info()));
+  const isGif = () => options().format === "gif";
+  const canKeepAudio = () => info().audioCodec !== null && outKind() === "video" && !isGif();
+  const ready = () => state.ffmpeg?.found === true && isAvailable(options().format);
+
+  const summary = createMemo(() => {
+    const o = options();
+    const items: {
+      icon: "scissors" | "image" | "rotate" | "flip" | "music" | "clock";
+      text: string;
+    }[] = [];
+    if (timed() && trimmed()) {
+      items.push({ icon: "scissors", text: `Keeps ${formatSpan(trimEnd() - trimStart())}` });
+    }
+    if (visual()) {
+      const autoGif = isGif() && o.maxSize === null && (shortSide(info()) ?? 0) > 480;
+      if (o.maxSize !== null || autoGif) {
+        items.push({ icon: "image", text: sizeLabel(o.maxSize ?? 480, outKind()) });
+      }
+      if (o.rotate) items.push({ icon: "rotate", text: `Turned ${o.rotate}°` });
+      if (o.flip) items.push({ icon: "flip", text: "Mirrored" });
+      if (outKind() === "video" && o.fps !== null)
+        items.push({ icon: "clock", text: `${o.fps} fps` });
+    }
+    if (canKeepAudio() && !o.keepAudio) items.push({ icon: "music", text: "No sound" });
+    return items;
+  });
+
+  const convertLabel = () => (state.inbox.length > 0 ? "Convert & next" : "Start converting");
+
+  const convertButton = (cls: string) => (
+    <button
+      type="button"
+      class={`btn btn-primary ${cls}`}
+      disabled={!ready()}
+      onClick={() => void convertDraft()}
+    >
+      <Icon name="paw" size={18} />
+      {convertLabel()}
+    </button>
+  );
+
+  return (
+    <div class="page editor">
+      <header class="file-header">
+        <button
+          type="button"
+          class="icon-btn square"
+          aria-label="Back"
+          onClick={() => closeEditor()}
+        >
+          <Icon name="chevron-left" size={22} />
+        </button>
+        <div class="file-heading">
+          <h1 class="display file-title" title={info().fileName}>
+            {info().fileName}
+          </h1>
+          <p class="item-meta">{describe(info())}</p>
+        </div>
+        <Show when={!props.compact}>{convertButton("btn-lg")}</Show>
+      </header>
+
+      <Show when={state.inbox.length > 0}>
+        <div class="inbox">
+          <span class="inbox-label">Up next</span>
+          <ul class="inbox-list">
+            <For each={state.inbox.slice(0, 3)}>
+              {(path) => <li class="inbox-chip">{baseName(path)}</li>}
+            </For>
+            <Show when={state.inbox.length > 3}>
+              <li class="inbox-chip more">+{state.inbox.length - 3}</li>
+            </Show>
+          </ul>
+          <button type="button" class="link-btn" onClick={() => skipDraft()}>
+            <Icon name="skip" size={14} /> Skip this one
+          </button>
+        </div>
+      </Show>
+
+      <div class="file-grid">
+        <div class="stack">
+          <div
+            class="preview"
+            data-kind={info().kind}
+            classList={{ "out-audio": outKind() === "audio" && info().kind !== "audio" }}
+          >
+            <Show
+              when={hasPicture()}
+              fallback={
+                <div class="audio-art">
+                  <CatPeek class="audio-cat" />
+                  <span class="note n1">♪</span>
+                  <span class="note n2">♫</span>
+                  <span class="note n3">♪</span>
+                </div>
+              }
+            >
+              <Show when={frame()} fallback={<div class="preview-skeleton" />}>
+                {(src) => (
+                  <img
+                    class="preview-img"
+                    classList={{ quarter: quarterTurn() }}
+                    src={src()}
+                    alt={`Preview of ${info().fileName}`}
+                    style={{
+                      transform: `rotate(${spin()}deg) scaleX(${options().flip ? -1 : 1})`,
+                    }}
+                    draggable={false}
+                  />
+                )}
+              </Show>
+            </Show>
+            <Show when={info().kind === "video"}>
+              <span class="preview-badge mono">{formatClock(scrub(), true)}</span>
+            </Show>
+            <Show when={outKind() === "audio" && info().kind === "video"}>
+              <span class="preview-badge right">
+                <Icon name="music" size={14} /> Sound only
+              </span>
+            </Show>
+            <Show when={visual()}>
+              <div class="preview-tools">
+                <button
+                  type="button"
+                  class="tool-btn"
+                  aria-label="Rotate 90°"
+                  title="Rotate 90°"
+                  onClick={rotate}
+                >
+                  <Icon name="rotate" size={20} />
+                </button>
+                <button
+                  type="button"
+                  class="tool-btn"
+                  aria-label="Mirror"
+                  title="Mirror"
+                  aria-pressed={options().flip}
+                  onClick={() => updateOptions({ flip: !options().flip })}
+                >
+                  <Icon name="flip" size={20} />
+                </button>
+              </div>
+            </Show>
+          </div>
+
+          <Show when={timed()}>
+            <section class="card trim">
+              <div class="row-between">
+                <h2 class="label-strong">
+                  <Icon name="scissors" size={16} /> Trim
+                </h2>
+                <span class="item-meta">
+                  <Show when={trimmed()} fallback="Drag the handles to cut">
+                    Keeping {formatClock(trimStart(), true)} – {formatClock(trimEnd(), true)} ·{" "}
+                    {formatSpan(trimEnd() - trimStart())}
+                  </Show>
+                </span>
+              </div>
+              <TrimBar
+                duration={duration() ?? 0}
+                start={trimStart()}
+                end={trimEnd()}
+                playhead={info().kind === "video" ? scrub() : null}
+                onChange={setTrim}
+                onScrub={setScrub}
+              >
+                <Show
+                  when={info().kind === "video"}
+                  fallback={
+                    <Show when={wave()}>
+                      {(src) => <img class="trim-wave" src={src()} alt="" draggable={false} />}
+                    </Show>
+                  }
+                >
+                  <div class="filmstrip">
+                    <Index each={filmstrip()}>
+                      {(src) => (
+                        <span class="film-frame">
+                          <Show when={src()}>
+                            {(s) => <img src={s()} alt="" draggable={false} />}
+                          </Show>
+                        </span>
+                      )}
+                    </Index>
+                  </div>
+                </Show>
+              </TrimBar>
+              <div class="trim-fields">
+                <label class="field">
+                  <span class="field-label">Start</span>
+                  <input
+                    class="input mono"
+                    value={formatClock(trimStart(), true)}
+                    spellcheck={false}
+                    onChange={(e) => commitTime("start", e.currentTarget)}
+                    onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                  />
+                </label>
+                <label class="field">
+                  <span class="field-label">End</span>
+                  <input
+                    class="input mono"
+                    value={formatClock(trimEnd(), true)}
+                    spellcheck={false}
+                    onChange={(e) => commitTime("end", e.currentTarget)}
+                    onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                  />
+                </label>
+                <button
+                  type="button"
+                  class="btn btn-outline reset-trim"
+                  disabled={!trimmed()}
+                  onClick={() => updateOptions({ trimStart: null, trimEnd: null })}
+                >
+                  Keep it all
+                </button>
+              </div>
+            </section>
+          </Show>
+        </div>
+
+        <section class="card settings">
+          <fieldset class="field">
+            <legend class="field-label">Turn it into</legend>
+            <div class="format-groups">
+              <For each={groupsFor(info().kind)}>
+                {(group) => (
+                  <div class="format-group" data-tone={group.tone}>
+                    <span class="format-group-label">{group.label}</span>
+                    <div class="format-chips">
+                      <For each={group.formats}>
+                        {(format) => (
+                          <button
+                            type="button"
+                            class="format-chip"
+                            aria-pressed={options().format === format}
+                            disabled={!isAvailable(format)}
+                            title={
+                              isAvailable(format)
+                                ? undefined
+                                : `Your ffmpeg can't write ${label(format)}`
+                            }
+                            onClick={() => updateOptions({ format })}
+                          >
+                            {label(format)}
+                          </button>
+                        )}
+                      </For>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </div>
+          </fieldset>
+
+          <Show
+            when={!LOSSLESS.has(options().format)}
+            fallback={
+              <p class="lossless-note">
+                <Icon name="sparkle" size={16} /> Lossless: every pixel and sample stays put.
+              </p>
+            }
+          >
+            <div class="field">
+              <label class="field-label" for="quality">
+                Quality
+              </label>
+              <input
+                id="quality"
+                class="range"
+                type="range"
+                min="0"
+                max="100"
+                value={options().quality}
+                style={{ "--pct": `${options().quality}%` }}
+                onInput={(event) => updateOptions({ quality: event.currentTarget.valueAsNumber })}
+              />
+              <div class="range-scale">
+                <For each={QUALITY_STEPS}>
+                  {(step) => <span classList={{ active: qualityStep() === step }}>{step}</span>}
+                </For>
+              </div>
+            </div>
+          </Show>
+
+          <Show when={visual() || (outKind() === "video" && info().kind === "video")}>
+            <div class="two-col">
+              <Show when={visual() && info().width !== null}>
+                <label class="field">
+                  <span class="field-label">Size</span>
+                  <select
+                    class="select"
+                    onChange={(e) => {
+                      const v = e.currentTarget.value;
+                      updateOptions({ maxSize: v === "" ? null : Number(v) });
+                    }}
+                  >
+                    <option value="" selected={options().maxSize === null}>
+                      {isGif() && (shortSide(info()) ?? 0) > 480
+                        ? "Auto (480p)"
+                        : `Original (${sizeLabel(shortSide(info()) ?? 0, info().kind)})`}
+                    </option>
+                    <For each={sizes()}>
+                      {(size) => (
+                        <option value={size} selected={options().maxSize === size}>
+                          {sizeLabel(size, outKind())}
+                        </option>
+                      )}
+                    </For>
+                  </select>
+                </label>
+              </Show>
+              <Show when={outKind() === "video" && info().kind === "video"}>
+                <label class="field">
+                  <span class="field-label">Frame rate</span>
+                  <select
+                    class="select"
+                    onChange={(e) => {
+                      const v = e.currentTarget.value;
+                      updateOptions({ fps: v === "" ? null : Number(v) });
+                    }}
+                  >
+                    <option value="" selected={options().fps === null}>
+                      {isGif() && (info().fps ?? 30) > 15
+                        ? "Auto (15)"
+                        : `Keep${info().fps ? ` (${Math.round(info().fps ?? 0)})` : ""}`}
+                    </option>
+                    <For each={rates()}>
+                      {(fps) => (
+                        <option value={fps} selected={options().fps === fps}>
+                          {fps} fps
+                        </option>
+                      )}
+                    </For>
+                  </select>
+                </label>
+              </Show>
+            </div>
+          </Show>
+
+          <Show when={canKeepAudio()}>
+            <div class="toggle-row">
+              <div>
+                <span class="toggle-title" id="keep-audio">
+                  Keep sound
+                </span>
+                <span class="item-meta">{info().audioCodec?.toUpperCase()} track</span>
+              </div>
+              <button
+                type="button"
+                class="switch"
+                role="switch"
+                aria-checked={options().keepAudio}
+                aria-labelledby="keep-audio"
+                onClick={() => updateOptions({ keepAudio: !options().keepAudio })}
+              />
+            </div>
+          </Show>
+
+          <div class="outcome">
+            <div class="outcome-name">
+              <Icon name="arrow-right" size={18} />
+              <span class="item-name">{outputName(info(), options())}</span>
+            </div>
+            <Show
+              when={summary().length > 0}
+              fallback={<p class="item-meta">Same picture and length, fresh format.</p>}
+            >
+              <ul class="outcome-chips" aria-label="Changes">
+                <For each={summary()}>
+                  {(item) => (
+                    <li class="outcome-chip">
+                      <Icon name={item.icon} size={14} />
+                      {item.text}
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+            <p class="item-meta">Saved next to the original.</p>
+          </div>
+
+          <details
+            class="command"
+            open={showCommand()}
+            onToggle={(e) => setShowCommand(e.currentTarget.open)}
+          >
+            <summary>
+              <Icon name="terminal" size={16} /> Show ffmpeg command
+            </summary>
+            <pre class="command-text">
+              <code>{command() || "…"}</code>
+            </pre>
+          </details>
+        </section>
+      </div>
+
+      <Show when={props.compact}>
+        <div class="sticky-cta">{convertButton("btn-block")}</div>
+      </Show>
+    </div>
+  );
+};

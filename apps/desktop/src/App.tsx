@@ -1,81 +1,85 @@
-import { createSignal, Match, Show, Switch } from "solid-js";
+import { createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js";
+import { CatPeek } from "./components/Cat";
 import { Sidebar, type Tab, TabBar } from "./components/Navigation";
+import { Toasts } from "./components/Toasts";
+import { inTauri, onFileDrop, onJobProgress, type UnlistenFn } from "./lib/api";
 import { createMediaQuery } from "./lib/media";
-import { QUEUE_COUNT, type TargetFormat } from "./lib/mock";
-import { ConvertFile } from "./screens/ConvertFile";
+import { overlayTitleBar } from "./lib/platform";
+import { activeCount, applyProgress, navigate, openPaths, refreshFfmpeg, state } from "./lib/store";
 import { ConvertHome } from "./screens/ConvertHome";
-import { Placeholder } from "./screens/Placeholder";
+import { Editor } from "./screens/Editor";
+import { HistoryScreen } from "./screens/HistoryScreen";
 import { QueueScreen } from "./screens/QueueScreen";
+import { RecipesScreen } from "./screens/RecipesScreen";
+import { SettingsScreen } from "./screens/SettingsScreen";
 import "./styles.css";
 
-type Screen = Tab | "file";
-
-/**
- * UI mockup of the CatConvert design. Screens render static sample data from
- * `lib/mock.ts`; nothing talks to the Tauri backend yet.
- */
 export default function App() {
   const compact = createMediaQuery("(max-width: 720px)");
-  const [screen, setScreen] = createSignal<Screen>("convert");
-  const [format, setFormat] = createSignal<TargetFormat>("MP4");
+  const [dropHover, setDropHover] = createSignal(false);
 
-  const activeTab = (): Tab => {
-    const current = screen();
-    return current === "file" ? "convert" : current;
-  };
-  const showTabBar = () => compact() && screen() !== "file";
+  const activeTab = (): Tab => (state.screen === "edit" ? "convert" : state.screen);
+  const showTabBar = () => compact() && state.screen !== "edit";
 
-  const openFile = (target: TargetFormat = "MP4") => {
-    setFormat(target);
-    setScreen("file");
-  };
+  onMount(() => {
+    void refreshFfmpeg();
+    if (!inTauri) return;
+    const unlisten: Promise<UnlistenFn>[] = [
+      onJobProgress(applyProgress),
+      onFileDrop({ onHover: setDropHover, onDrop: openPaths }),
+    ];
+    onCleanup(() => {
+      for (const p of unlisten) void p.then((stop) => stop());
+    });
+  });
 
   return (
     <div class="shell" classList={{ compact: compact() }}>
+      <Show when={overlayTitleBar}>
+        <div class="titlebar" data-tauri-drag-region />
+      </Show>
       <Show when={!compact()}>
-        <Sidebar active={activeTab()} queueCount={QUEUE_COUNT} onNavigate={setScreen} />
+        <Sidebar
+          active={activeTab()}
+          queueCount={activeCount()}
+          ffmpeg={state.ffmpeg}
+          onNavigate={navigate}
+        />
       </Show>
       <main class="content" classList={{ "with-tabbar": showTabBar() }}>
         <Switch>
-          <Match when={screen() === "convert"}>
-            <ConvertHome
-              compact={compact()}
-              onOpenFile={openFile}
-              onOpenSettings={() => setScreen("settings")}
-            />
+          <Match when={state.screen === "convert"}>
+            <ConvertHome compact={compact()} dropHover={dropHover()} />
           </Match>
-          <Match when={screen() === "file"}>
-            <ConvertFile
-              compact={compact()}
-              format={format()}
-              onFormatChange={setFormat}
-              onBack={() => setScreen("convert")}
-              onStart={() => setScreen("queue")}
-            />
+          <Match when={state.screen === "edit"}>
+            <Editor compact={compact()} />
           </Match>
-          <Match when={screen() === "queue"}>
+          <Match when={state.screen === "queue"}>
             <QueueScreen compact={compact()} />
           </Match>
-          <Match when={screen() === "recipes"}>
-            <Placeholder
-              title="Recipes"
-              message="Saved presets will live here. For now, try a quick recipe on Convert."
-            />
+          <Match when={state.screen === "recipes"}>
+            <RecipesScreen />
           </Match>
-          <Match when={screen() === "history"}>
-            <Placeholder title="History" message="Everything you've converted will show up here." />
+          <Match when={state.screen === "history"}>
+            <HistoryScreen />
           </Match>
-          <Match when={screen() === "settings"}>
-            <Placeholder
-              title="Settings"
-              message="Output folder, ffmpeg path and defaults are coming soon."
-            />
+          <Match when={state.screen === "settings"}>
+            <SettingsScreen />
           </Match>
         </Switch>
       </main>
       <Show when={showTabBar()}>
-        <TabBar active={activeTab()} onNavigate={setScreen} />
+        <TabBar active={activeTab()} queueCount={activeCount()} onNavigate={navigate} />
       </Show>
+      <Show when={dropHover() && state.screen !== "convert"}>
+        <div class="drop-overlay" aria-hidden="true">
+          <div class="drop-overlay-card">
+            <CatPeek class="drop-overlay-cat" />
+            <p class="display">Drop to add</p>
+          </div>
+        </div>
+      </Show>
+      <Toasts />
     </div>
   );
 }

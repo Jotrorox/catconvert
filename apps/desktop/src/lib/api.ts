@@ -8,6 +8,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
 export type { UnlistenFn };
 
@@ -23,17 +25,74 @@ export type MediaInfo = {
   extension: string | null;
   sizeBytes: number;
   kind: MediaKind;
+  durationSecs: number | null;
+  /** Display size, rotation metadata already applied. */
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+  videoCodec: string | null;
+  audioCodec: string | null;
+};
+
+export type OutputFormat =
+  | "mp4"
+  | "webm"
+  | "mov"
+  | "mkv"
+  | "gif"
+  | "mp3"
+  | "m4a"
+  | "wav"
+  | "flac"
+  | "ogg"
+  | "png"
+  | "jpg"
+  | "webp"
+  | "avif";
+
+export type Rotation = 0 | 90 | 180 | 270;
+
+export type ConvertOptions = {
+  format: OutputFormat;
+  trimStart: number | null;
+  trimEnd: number | null;
+  /** Short side in pixels; never upscales. */
+  maxSize: number | null;
+  fps: number | null;
+  rotate: Rotation;
+  flip: boolean;
+  /** 0 = smallest file, 100 = best quality. */
+  quality: number;
+  keepAudio: boolean;
 };
 
 export type JobId = number;
 
-export type JobStage = "queued" | "running" | "done";
+export type JobStage = "queued" | "running" | "done" | "failed" | "cancelled";
 
 export type JobProgress = {
   jobId: JobId;
   stage: JobStage;
   /** Completion between 0 and 1. */
   progress: number;
+  speed: number | null;
+  outputBytes: number | null;
+  error: string | null;
+};
+
+export type JobTicket = {
+  id: JobId;
+  output: string;
+  input: MediaInfo;
+  command: string;
+};
+
+export type FfmpegStatus = {
+  found: boolean;
+  version: string | null;
+  path: string | null;
+  error: string | null;
+  formats: { format: OutputFormat; available: boolean }[];
 };
 
 // ---------------------------------------------------------------------------
@@ -41,8 +100,17 @@ export type JobProgress = {
 // ---------------------------------------------------------------------------
 
 type Commands = {
+  ffmpeg_status: { args: Record<string, never>; result: FfmpegStatus };
+  relocate_ffmpeg: { args: Record<string, never>; result: FfmpegStatus };
   probe_file: { args: { path: string }; result: MediaInfo };
-  start_job: { args: { path: string; targetFormat: string }; result: JobId };
+  preview_frame: { args: { path: string; at: number; height: number }; result: ArrayBuffer };
+  waveform: {
+    args: { path: string; width: number; height: number; color: string };
+    result: ArrayBuffer;
+  };
+  preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
+  start_job: { args: { path: string; options: ConvertOptions }; result: JobTicket };
+  cancel_job: { args: { id: JobId }; result: boolean };
 };
 
 type Events = {
@@ -63,22 +131,96 @@ function subscribe<K extends keyof Events>(
   return listen<Events[K]>(name, (event) => handler(event.payload));
 }
 
+/** Whether we run inside the Tauri shell (false in a plain browser or jsdom). */
+export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+function blobUrl(bytes: ArrayBuffer, type: string): string {
+  return URL.createObjectURL(new Blob([bytes], { type }));
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+export async function ffmpegStatus(): Promise<FfmpegStatus> {
+  if (!inTauri) {
+    return {
+      found: false,
+      version: null,
+      path: null,
+      error: "Open CatConvert as an app to convert files.",
+      formats: [],
+    };
+  }
+  return command("ffmpeg_status", {});
+}
+
+/** Search for ffmpeg again, e.g. after the user installed it. */
+export function relocateFfmpeg(): Promise<FfmpegStatus> {
+  return command("relocate_ffmpeg", {});
+}
 
 /** Probe a file. Rejects with the backend's error message (a string). */
 export function probeFile(path: string): Promise<MediaInfo> {
   return command("probe_file", { path });
 }
 
-/** Start a (stubbed) conversion job; progress arrives via {@link onJobProgress}. */
-export function startJob(path: string, targetFormat: string): Promise<JobId> {
-  return command("start_job", { path, targetFormat });
+/** One JPEG frame as an object URL. Revoke it with `URL.revokeObjectURL` when done. */
+export async function previewFrame(path: string, at: number, height: number): Promise<string> {
+  return blobUrl(await command("preview_frame", { path, at, height }), "image/jpeg");
+}
+
+/** The audio waveform as a PNG object URL. */
+export async function waveform(
+  path: string,
+  width: number,
+  height: number,
+  color: string,
+): Promise<string> {
+  return blobUrl(await command("waveform", { path, width, height, color }), "image/png");
+}
+
+/** The ffmpeg command a conversion would run. */
+export function previewCommand(info: MediaInfo, options: ConvertOptions): Promise<string> {
+  return command("preview_command", { info, options });
+}
+
+/** Queue a conversion; progress arrives via {@link onJobProgress}. */
+export function startJob(path: string, options: ConvertOptions): Promise<JobTicket> {
+  return command("start_job", { path, options });
+}
+
+export function cancelJob(id: JobId): Promise<boolean> {
+  return command("cancel_job", { id });
 }
 
 export function onJobProgress(handler: (event: JobProgress) => void): Promise<UnlistenFn> {
   return subscribe("job-progress", handler);
+}
+
+/** Native multi-file picker. Resolves to the chosen paths (empty if cancelled). */
+export async function pickFiles(): Promise<string[]> {
+  const picked = await open({
+    multiple: true,
+    directory: false,
+    filters: [
+      {
+        name: "Media",
+        extensions: [
+          ...["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpg", "mpeg", "gif"],
+          ...["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "aiff", "wma"],
+          ...["jpg", "jpeg", "png", "webp", "avif", "heic", "heif", "tif", "tiff", "bmp"],
+        ],
+      },
+    ],
+  });
+  if (picked === null) return [];
+  return Array.isArray(picked) ? picked : [picked];
+}
+
+/** Show a file in Finder / Explorer / the file manager. */
+export function revealInFolder(path: string): Promise<void> {
+  return revealItemInDir(path);
 }
 
 export type FileDropHandlers = {

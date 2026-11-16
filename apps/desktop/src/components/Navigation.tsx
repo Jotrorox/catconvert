@@ -1,4 +1,5 @@
 import { type Component, For, Show } from "solid-js";
+import type { FfmpegStatus } from "../lib/api";
 import { CatLogo } from "./Cat";
 import { Icon, type IconName } from "./Icon";
 
@@ -14,6 +15,7 @@ const TABS: readonly { id: Tab; label: string; icon: IconName }[] = [
 type Props = {
   active: Tab;
   queueCount: number;
+  ffmpeg: FfmpegStatus | null;
   onNavigate: (tab: Tab) => void;
 };
 
@@ -48,13 +50,40 @@ export const Sidebar: Component<Props> = (props) => (
       </For>
     </nav>
     <div class="sidebar-footer">
-      <div class="status-card">
+      <button
+        type="button"
+        class="status-card"
+        data-state={props.ffmpeg === null ? "checking" : props.ffmpeg.found ? "ready" : "missing"}
+        onClick={() => props.onNavigate("settings")}
+      >
         <span class="status-dot" />
-        <div>
-          <strong>ffmpeg found</strong>
-          <span>Ready to convert</span>
-        </div>
-      </div>
+        <span class="status-text">
+          <Show
+            when={props.ffmpeg}
+            fallback={
+              <>
+                <strong>Sniffing for ffmpeg…</strong>
+                <span>One moment</span>
+              </>
+            }
+          >
+            {(status) => (
+              <Show
+                when={status().found}
+                fallback={
+                  <>
+                    <strong>ffmpeg missing</strong>
+                    <span>Tap to fix</span>
+                  </>
+                }
+              >
+                <strong>ffmpeg {status().version}</strong>
+                <span>Ready to convert</span>
+              </Show>
+            )}
+          </Show>
+        </span>
+      </button>
       <button
         type="button"
         class="nav-item"
@@ -68,7 +97,7 @@ export const Sidebar: Component<Props> = (props) => (
   </aside>
 );
 
-export const TabBar: Component<Omit<Props, "queueCount">> = (props) => (
+export const TabBar: Component<Omit<Props, "ffmpeg">> = (props) => (
   <nav class="tabbar" aria-label="Main">
     <For each={TABS}>
       {(tab) => (
@@ -78,7 +107,12 @@ export const TabBar: Component<Omit<Props, "queueCount">> = (props) => (
           aria-current={props.active === tab.id ? "page" : undefined}
           onClick={() => props.onNavigate(tab.id)}
         >
-          <Icon name={tab.icon} size={26} />
+          <span class="tab-icon">
+            <Icon name={tab.icon} size={26} />
+            <Show when={tab.id === "queue" && props.queueCount > 0}>
+              <span class="tab-badge">{props.queueCount}</span>
+            </Show>
+          </span>
           {tab.label}
         </button>
       )}
