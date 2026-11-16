@@ -90,6 +90,8 @@ export type ConvertOptions = {
   quality: number;
   keepAudio: boolean;
   jxl: JxlOptions;
+  /** Carry over dates, location and other tags where the format can hold them. */
+  keepMetadata: boolean;
 };
 
 export type JobId = number;
@@ -150,6 +152,7 @@ type Commands = {
   start_job: { args: { path: string; options: ConvertOptions }; result: JobTicket };
   cancel_job: { args: { id: JobId }; result: boolean };
   relaunch: { args: Record<string, never>; result: null };
+  missing_files: { args: { paths: string[] }; result: string[] };
 };
 
 type Events = {
@@ -237,6 +240,12 @@ export function cancelJob(id: JobId): Promise<boolean> {
 
 export function onJobProgress(handler: (event: JobProgress) => void): Promise<UnlistenFn> {
   return subscribe("job-progress", handler);
+}
+
+/** The paths that no longer point at a file (moved or deleted). */
+export async function missingFiles(paths: string[]): Promise<string[]> {
+  if (!inTauri || paths.length === 0) return [];
+  return command("missing_files", { paths });
 }
 
 /** Native multi-file picker. Resolves to the chosen paths (empty if cancelled). */

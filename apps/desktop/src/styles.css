@@ -749,6 +749,11 @@ code {
   color: var(--accent-strong);
 }
 
+.link-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 /* Banner */
 
 .banner {
@@ -992,6 +997,44 @@ code {
   gap: 12px;
 }
 
+.recipe-slot {
+  position: relative;
+  display: grid;
+}
+
+.recipe-remove {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgb(255 255 255 / 0.7);
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.recipe-slot:hover .recipe-remove,
+.recipe-remove:focus-visible {
+  opacity: 1;
+}
+
+.recipe-remove:hover {
+  background: var(--surface);
+  color: var(--ink);
+}
+
+@media (hover: none) {
+  .recipe-remove {
+    opacity: 1;
+  }
+}
+
 .recipe {
   display: flex;
   flex-direction: column;
@@ -1013,7 +1056,7 @@ code {
   box-shadow: var(--shadow-lift);
 }
 
-.recipe:nth-child(even):hover {
+.recipe-slot:nth-child(even) .recipe:hover {
   transform: translateY(-3px) rotate(0.8deg);
 }
 
@@ -1081,6 +1124,25 @@ code {
 
 .recent-item + .recent-item {
   border-top: 1px solid var(--line);
+}
+
+.recent-item.missing :where(.tile, .item-name) {
+  opacity: 0.5;
+}
+
+.recent-item.missing :where(.item-name) {
+  text-decoration: line-through;
+  text-decoration-color: var(--muted);
+}
+
+.recent-item .icon-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.recent-item .icon-btn:disabled:hover {
+  background: none;
+  color: var(--muted);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1160,6 +1222,14 @@ code {
 .inbox .link-btn {
   color: var(--lavender-ink);
   white-space: nowrap;
+}
+
+.inbox-actions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px 16px;
 }
 
 .file-grid {
@@ -2284,6 +2354,41 @@ button.format-chip:not(:disabled):active {
 
 .update-error-icon {
   color: var(--accent);
+}
+
+.defaults {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.defaults .section-title {
+  margin-bottom: -10px;
+}
+
+.three-col {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+/* Saving a recipe from the editor */
+
+.save-recipe {
+  align-self: flex-start;
+}
+
+.recipe-form {
+  display: flex;
+  gap: 8px;
+}
+
+.recipe-form .input {
+  flex: 1;
+}
+
+.recipe-form .btn {
+  flex: none;
 }
 
 /* ------------------------------------------------------------------------ */

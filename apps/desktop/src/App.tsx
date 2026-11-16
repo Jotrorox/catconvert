@@ -9,6 +9,7 @@ import {
   activeCount,
   applyProgress,
   checkForUpdates,
+  checkHistory,
   loadAppVersion,
   navigate,
   openPaths,
@@ -35,6 +36,10 @@ export default function App() {
     if (!inTauri) return;
     void loadAppVersion();
     void checkForUpdates({ quiet: true });
+    // Files may have been moved or deleted while the window was in the background.
+    const recheck = () => void checkHistory();
+    window.addEventListener("focus", recheck);
+    onCleanup(() => window.removeEventListener("focus", recheck));
     const unlisten: Promise<UnlistenFn>[] = [
       onJobProgress(applyProgress),
       onFileDrop({ onHover: setDropHover, onDrop: openPaths }),

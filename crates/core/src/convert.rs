@@ -181,6 +181,9 @@ pub struct ConvertOptions {
     pub keep_audio: bool,
     /// JPEG XL settings, ignored for other formats.
     pub jxl: JxlOptions,
+    /// Carry over dates, location, titles and other tags where the output
+    /// format can hold them. Off strips them.
+    pub keep_metadata: bool,
 }
 
 impl Default for ConvertOptions {
@@ -196,6 +199,7 @@ impl Default for ConvertOptions {
             quality: 60,
             keep_audio: true,
             jxl: JxlOptions::default(),
+            keep_metadata: true,
         }
     }
 }
@@ -369,7 +373,9 @@ pub fn plan(
         ));
     }
     let trim = trim_range(input, options)?;
-    let untouched = is_untouched(input, options);
+    // cjxl and djxl carry metadata over and can't drop it, so stripping
+    // means going through ffmpeg.
+    let untouched = is_untouched(input, options) && options.keep_metadata;
     let jxl_in = is_jxl(input);
     let animated = format.animates(input.kind);
 
@@ -698,6 +704,9 @@ fn ffmpeg_step(
         }
     }
 
+    if !options.keep_metadata {
+        args.extend(["-map_metadata", "-1", "-map_chapters", "-1"].map(OsString::from));
+    }
     args.push(out.as_os_str().to_owned());
     let weight = if matches!(sink, Sink::Frames { .. }) {
         0.4
@@ -1370,6 +1379,43 @@ mod tests {
         assert_eq!(
             cmd,
             "cjxl /clips/photo.jpg /clips/photo.jxl --lossless_jpeg=0 -d 1.5 -e 7 --quiet"
+        );
+    }
+
+    #[test]
+    fn stripping_metadata_goes_through_ffmpeg() {
+        let strip = ConvertOptions {
+            format: OutputFormat::Mp4,
+            keep_metadata: false,
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("garden.mov"), &strip, "/clips/garden.mp4");
+        assert!(
+            cmd.ends_with("-map_metadata -1 -map_chapters -1 /clips/garden.mp4"),
+            "{cmd}"
+        );
+
+        // cjxl would carry the EXIF over, so an unedited JPEG is decoded instead.
+        let options = jxl(ConvertOptions {
+            jxl: JxlOptions {
+                lossless: true,
+                ..JxlOptions::default()
+            },
+            keep_metadata: false,
+            ..ConvertOptions::default()
+        });
+        let plan = plan(
+            &image("photo.jpg", 4000, 3000),
+            &options,
+            Path::new("/clips/photo.jxl"),
+            LIBJXL,
+        )
+        .expect("plan");
+        assert_eq!(tools(&plan), [Tool::Ffmpeg, Tool::Cjxl]);
+        assert!(
+            plan.command_line().contains("-map_metadata -1"),
+            "{}",
+            plan.command_line()
         );
     }
 

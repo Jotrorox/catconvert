@@ -70,6 +70,9 @@ enum Command {
         /// JPEG XL: progressive decoding.
         #[arg(long)]
         progressive: bool,
+        /// Drop dates, location, titles and other tags.
+        #[arg(long)]
+        strip_metadata: bool,
         /// Print the command(s) instead of running them.
         #[arg(long)]
         dry_run: bool,
@@ -191,6 +194,7 @@ fn main() -> ExitCode {
             lossless,
             effort,
             progressive,
+            strip_metadata,
             dry_run,
         } => {
             let options = ConvertOptions {
@@ -208,6 +212,7 @@ fn main() -> ExitCode {
                     effort,
                     progressive,
                 },
+                keep_metadata: !strip_metadata,
             };
             match convert(&file, &options, dry_run) {
                 Ok(()) => ExitCode::SUCCESS,
