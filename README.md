@@ -115,7 +115,8 @@ tags), e.g. `gh secret set APPLE_ID --env release`:
 | `WINDOWS_CERTIFICATE_PASSWORD` | Password of that `.pfx`                                  |
 
 macOS signing needs the first three; notarization additionally needs the Apple
-ID trio. See [Tauri: macOS code signing](https://v2.tauri.app/distribute/sign/macos/)
+ID trio. With notarization enabled, both the app and the `.dmg` are notarized
+and stapled. See [Tauri: macOS code signing](https://v2.tauri.app/distribute/sign/macos/)
 and [Windows code signing](https://v2.tauri.app/distribute/sign/windows/).
 
 ## Mobile (later)

@@ -144,6 +144,52 @@ jobs:
           releaseDraft: true
           args: ${{ matrix.args }} ${{ env.TAURI_SIGNING_ARGS }}
 
+      # Tauri notarizes and staples the .app, but not the .dmg around it.
+      # Notarize and staple the disk image too, then replace the uploaded copy.
+      # APPLE_ID etc. are only set when the signing step enabled notarization.
+      - name: Notarize and staple the DMG
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one DMG, found ${#dmgs[@]}: ${dmgs[*]:-none}"
+            exit 1
+          fi
+          dmg="${dmgs[0]}"
+          name="$(basename "$dmg")"
+
+          if ! gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "$name"; then
+            echo "::error::$name is not attached to release $TAG; refusing to upload a differently named copy"
+            exit 1
+          fi
+
+          echo "Submitting $name for notarization..."
+          result="$(xcrun notarytool submit "$dmg" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 2h --output-format json)"
+          echo "$result"
+          status="$(jq -r '.status' <<< "$result")"
+          if [ "$status" != "Accepted" ]; then
+            id="$(jq -r '.id' <<< "$result")"
+            xcrun notarytool log "$id" \
+              --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::Notarization of $name finished with status: $status"
+            exit 1
+          fi
+
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl -a -t open --context context:primary-signature -vv "$dmg"
+
+          gh release upload "$TAG" "$dmg" --clobber
+          echo "Uploaded notarized $name"
+
   cli:
     name: CLI (${{ matrix.target }})
     needs: create-release
