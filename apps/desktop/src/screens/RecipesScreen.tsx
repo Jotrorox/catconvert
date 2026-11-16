@@ -1,5 +1,7 @@
-import type { Component } from "solid-js";
+import { type Component, Show } from "solid-js";
 import { RecipeGrid } from "../components/RecipeGrid";
+import { RECIPES } from "../lib/formats";
+import { state } from "../lib/store";
 
 export const RecipesScreen: Component = () => (
   <div class="page">
@@ -9,6 +11,19 @@ export const RecipesScreen: Component = () => (
         <p class="subtitle">Pick a recipe, then the files. Everything stays tweakable.</p>
       </div>
     </header>
-    <RecipeGrid large />
+    <RecipeGrid large recipes={RECIPES} />
+    <section>
+      <h2 class="section-title">Your recipes</h2>
+      <Show
+        when={state.recipes.length > 0}
+        fallback={
+          <p class="item-meta empty-note">
+            Dial in a file in the editor, then choose “Save these settings as a recipe”.
+          </p>
+        }
+      >
+        <RecipeGrid large recipes={state.recipes} />
+      </Show>
+    </section>
   </div>
 );

@@ -208,6 +208,20 @@ fn relaunch(app: AppHandle) {
     app.restart();
 }
 
+/// The paths among `paths` that no longer point at a file (moved or deleted),
+/// so History can say so instead of failing to reveal them.
+#[tauri::command]
+async fn missing_files(paths: Vec<String>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .filter(|path| !std::path::Path::new(path).is_file())
+            .collect()
+    })
+    .await
+    .map_err(|err| err.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -231,6 +245,7 @@ pub fn run() {
             start_job,
             cancel_job,
             relaunch,
+            missing_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

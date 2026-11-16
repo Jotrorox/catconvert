@@ -17,6 +17,7 @@ vi.mock("./lib/api", () => ({
   cancelJob: vi.fn(async () => true),
   pickFiles: vi.fn(async () => []),
   revealInFolder: vi.fn(async () => {}),
+  missingFiles: vi.fn(async () => []),
   onJobProgress: vi.fn(),
   onFileDrop: vi.fn(),
   appVersion: vi.fn(async () => "0.1.2"),
@@ -103,6 +104,7 @@ const SONG: MediaInfo = {
 };
 
 beforeEach(() => {
+  localStorage.clear();
   resetStore();
   vi.clearAllMocks();
   vi.mocked(api.ffmpegStatus).mockResolvedValue(status());
@@ -188,6 +190,7 @@ describe("CatConvert", () => {
       quality: 60,
       keepAudio: false,
       jxl: { lossless: false, effort: 7, progressive: false },
+      keepMetadata: true,
     });
 
     applyProgress({
@@ -391,5 +394,125 @@ describe("CatConvert", () => {
     expect(await screen.findByText("Couldn't check for updates")).toBeInTheDocument();
     expect(screen.getByText("Could not fetch a valid release JSON")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Try again/ })).toBeEnabled();
+  });
+
+  it("starts files from the defaults chosen in Settings and remembers them", async () => {
+    render(() => <App />);
+    await screen.findByText("ffmpeg 7.1");
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Videos become" }), {
+      target: { value: "mkv" },
+    });
+    fireEvent.input(screen.getByRole("slider", { name: "Quality" }), { target: { value: "85" } });
+    fireEvent.click(screen.getByRole("switch", { name: "Keep metadata" }));
+    expect(JSON.parse(localStorage.getItem("catconvert.settings.v1") ?? "{}")).toEqual({
+      formats: { video: "mkv", audio: null, image: null },
+      quality: 85,
+      keepMetadata: false,
+    });
+
+    openPaths([VIDEO.path]);
+    await screen.findByRole("heading", { name: "clip.mov" });
+    expect(screen.getByRole("button", { name: "MKV" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("slider", { name: "Quality" })).toHaveValue("85");
+    expect(screen.getByRole("switch", { name: "Keep metadata" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
+  it("strips metadata on request, which rules out the JPEG repack", async () => {
+    render(() => <App />);
+    await screen.findByText("ffmpeg 7.1");
+    openPaths([PHOTO.path]);
+    await screen.findByRole("heading", { name: "cat.jpg" });
+    fireEvent.click(screen.getByRole("button", { name: "JXL" }));
+    expect(screen.getByText(/Repacks the JPEG/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: "Keep metadata" }));
+    expect(screen.getByText(/every pixel and sample stays put/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      PHOTO.path,
+      expect.objectContaining({ format: "jxl", keepMetadata: false }),
+    );
+  });
+
+  it("saves the editor's settings as a recipe and reuses it", async () => {
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "WEBM" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), { target: { value: "720" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save these settings as a recipe/ }));
+    const name = screen.getByRole("textbox", { name: "Recipe name" });
+    expect(name).toHaveValue("My WEBM");
+    fireEvent.input(name, { target: { value: "Small webm" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(screen.getByText("Saved “Small webm” to your recipes")).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("catconvert.recipes.v1") ?? "[]")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Recipes" }));
+    vi.mocked(api.pickFiles).mockResolvedValue(["/clips/other.mov"]);
+    fireEvent.click(screen.getByRole("button", { name: /^Small webm/ }));
+    await screen.findByRole("heading", { name: "other.mov" });
+    expect(screen.getByRole("button", { name: "WEBM" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("combobox", { name: "Size" })).toHaveValue("720");
+
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Recipes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Small webm" }));
+    expect(screen.queryByRole("button", { name: /^Small webm/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    expect(screen.getByRole("button", { name: /^Small webm/ })).toBeInTheDocument();
+  });
+
+  it("converts every waiting file with one set of settings", async () => {
+    render(() => <App />);
+    await screen.findByText("ffmpeg 7.1");
+    openPaths(["/clips/a.mov", "/clips/b.mov", SONG.path]);
+    await screen.findByRole("heading", { name: "a.mov" });
+    fireEvent.click(screen.getByRole("button", { name: "WEBM" }));
+    fireEvent.keyDown(screen.getByRole("slider", { name: "Trim start" }), {
+      key: "ArrowRight",
+      shiftKey: true,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Convert all 3 like this/ }));
+
+    // The song can't become a WEBM, so it comes back to the editor on its own.
+    await screen.findByRole("heading", { name: "purr.wav" });
+    expect(screen.getByText("purr.wav needs its own settings")).toBeInTheDocument();
+    expect(api.startJob).toHaveBeenCalledTimes(2);
+    expect(api.startJob).toHaveBeenNthCalledWith(
+      1,
+      "/clips/a.mov",
+      expect.objectContaining({ format: "webm", trimStart: 1 }),
+    );
+    expect(api.startJob).toHaveBeenNthCalledWith(
+      2,
+      "/clips/b.mov",
+      expect.objectContaining({ format: "webm", trimStart: null }),
+    );
+  });
+
+  it("marks history entries whose files were moved and can forget them", async () => {
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    applyProgress({
+      jobId: 7,
+      stage: "done",
+      progress: 1,
+      speed: null,
+      outputBytes: 9,
+      error: null,
+    });
+    vi.mocked(api.missingFiles).mockResolvedValue(["/clips/clip.mp4"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    expect(await screen.findByText(/Moved or deleted/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Show clip.mp4 in folder/ })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Forget moved (1)" }));
+    expect(screen.getByText("A clean slate")).toBeInTheDocument();
+    expect(state.history).toHaveLength(0);
   });
 });

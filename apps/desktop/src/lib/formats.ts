@@ -88,12 +88,16 @@ export const JXL_EFFORTS = [
 /** Inputs that are already lossless (or a JPEG that cjxl can repack exactly). */
 const LOSSLESS_BY_DEFAULT = new Set(["jpg", "jpeg", "png", "apng", "gif"]);
 
-/** Whether the options leave the picture as it is: no trim, turn, mirror, resize or new rate. */
+/**
+ * Whether the options leave the file as it is: no trim, turn, mirror, resize or
+ * new rate, and metadata kept (libjxl's tools can't drop it, see convert.rs).
+ */
 export function isUntouched(info: MediaInfo, options: ConvertOptions): boolean {
   const untrimmed =
     info.kind === "image" || (options.trimStart === null && options.trimEnd === null);
   return (
     untrimmed &&
+    options.keepMetadata &&
     options.rotate === 0 &&
     !options.flip &&
     (options.maxSize === null || !sizeChoices(info).includes(options.maxSize)) &&
@@ -144,7 +148,33 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     quality: 60,
     keepAudio: true,
     jxl: { lossless: false, effort: 7, progressive: false },
+    keepMetadata: true,
   };
+}
+
+export const QUALITY_STEPS = ["Tiny file", "Balanced", "Crisp"] as const;
+
+export function qualityStep(quality: number): (typeof QUALITY_STEPS)[number] {
+  return QUALITY_STEPS[quality < 34 ? 0 : quality > 66 ? 2 : 1];
+}
+
+/** What freshly opened files start with, set in Settings. */
+export type Defaults = {
+  /** Preferred output per input kind; `null` lets CatConvert pick. */
+  formats: Record<FormatGroup["kind"], OutputFormat | null>;
+  quality: number;
+  keepMetadata: boolean;
+};
+
+export const DEFAULTS: Defaults = {
+  formats: { video: null, audio: null, image: null },
+  quality: 60,
+  keepMetadata: true,
+};
+
+/** Whether the editor offers `format` for an input of `kind`. */
+export function offers(kind: MediaKind, format: OutputFormat): boolean {
+  return groupsFor(kind).some((group) => group.formats.includes(format));
 }
 
 /** Short side of the picture after rotation metadata, if known. */
@@ -172,10 +202,12 @@ export function fpsChoices(info: MediaInfo): number[] {
   return FRAME_RATES.filter((fps) => info.fps === null || fps < info.fps - 0.5);
 }
 
-export type RecipeId = "gif" | "shrink" | "audio" | "web";
+export type RecipeId = string;
 
 export type Recipe = {
   id: RecipeId;
+  /** Saved by the user from the editor (and removable). */
+  custom?: boolean;
   title: string;
   detail: string;
   route: string;
@@ -225,24 +257,106 @@ export const RECIPES: readonly Recipe[] = [
   },
 ];
 
+/**
+ * `options` adapted to another file, or `null` when they don't fit it: a
+ * format the editor wouldn't offer for it, sound from a silent file, or an
+ * encoder that isn't installed. The trim belongs to one file and is dropped.
+ */
+export function fitOptions(
+  info: MediaInfo,
+  options: ConvertOptions,
+  available: (f: OutputFormat) => boolean,
+): ConvertOptions | null {
+  if (!offers(info.kind, options.format) || !available(options.format)) return null;
+  if (formatKind(options.format, info.kind) === "audio" && info.audioCodec === null) return null;
+  const fitted = { ...options, jxl: { ...options.jxl }, trimStart: null, trimEnd: null };
+  // Drop choices that would upscale or speed up this particular file.
+  if (fitted.maxSize !== null && !sizeChoices(info).includes(fitted.maxSize)) {
+    fitted.maxSize = null;
+  }
+  if (fitted.fps !== null && !fpsChoices(info).includes(fitted.fps)) fitted.fps = null;
+  return fitted;
+}
+
+/** The user's default format for this file if it fits, otherwise CatConvert's pick. */
+function preferredFormat(
+  info: MediaInfo,
+  available: (f: OutputFormat) => boolean,
+  defaults: Defaults,
+): OutputFormat {
+  const chosen = info.kind === "unknown" ? null : defaults.formats[info.kind];
+  if (chosen && chosen !== info.extension && available(chosen) && offers(info.kind, chosen)) {
+    return chosen;
+  }
+  return defaultFormat(info, available);
+}
+
 /** Starting options for a freshly opened file, honouring a chosen recipe when it fits. */
 export function initialOptions(
   info: MediaInfo,
   available: (f: OutputFormat) => boolean,
   recipe: Recipe | null,
+  defaults: Defaults = DEFAULTS,
 ): ConvertOptions {
-  const jxl = {
-    ...defaultOptions("jxl").jxl,
-    lossless: LOSSLESS_BY_DEFAULT.has(info.extension ?? ""),
-  };
-  if (recipe?.accepts.includes(info.kind) && available(recipe.options.format)) {
-    const options = { ...defaultOptions(recipe.options.format), jxl, ...recipe.options };
-    // Drop choices that would upscale or speed up this particular file.
-    if (options.maxSize !== null && !sizeChoices(info).includes(options.maxSize)) {
-      options.maxSize = null;
-    }
-    if (options.fps !== null && !fpsChoices(info).includes(options.fps)) options.fps = null;
-    return options;
+  const base = (format: OutputFormat): ConvertOptions => ({
+    ...defaultOptions(format),
+    quality: defaults.quality,
+    keepMetadata: defaults.keepMetadata,
+    jxl: { ...defaultOptions("jxl").jxl, lossless: LOSSLESS_BY_DEFAULT.has(info.extension ?? "") },
+  });
+  if (recipe?.accepts.includes(info.kind)) {
+    const fitted = fitOptions(
+      info,
+      { ...base(recipe.options.format), ...recipe.options },
+      available,
+    );
+    if (fitted) return fitted;
   }
-  return { ...defaultOptions(defaultFormat(info, available)), jxl };
+  return base(preferredFormat(info, available, defaults));
+}
+
+const KIND_WORD = { video: "VIDEO", audio: "SOUND", image: "PICTURE", unknown: "ANY" } as const;
+const KIND_TONE: Record<FormatGroup["kind"], Tone> = {
+  video: "pink",
+  audio: "yellow",
+  image: "lavender",
+};
+
+/** One line describing what a recipe does, e.g. "720p · 30 fps · Balanced". */
+export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
+  const out = formatKind(options.format, info.kind);
+  const parts: string[] = [];
+  if (out !== "audio" && options.maxSize !== null) parts.push(sizeLabel(options.maxSize, out));
+  if (out === "video" && options.fps !== null) parts.push(`${options.fps} fps`);
+  const video = out === "video" && !isAnimatedImage(options.format, info.kind);
+  if (video && !options.keepAudio) parts.push("no sound");
+  parts.push(isLossless(options) ? "lossless" : qualityStep(options.quality).toLowerCase());
+  if (!options.keepMetadata) parts.push("no metadata");
+  const text = parts.join(" · ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/**
+ * A user recipe from the editor's current settings. It keeps the encoding
+ * choices; the trim, turn and mirror belong to the file they were made for.
+ */
+export function recipeFrom(
+  id: RecipeId,
+  title: string,
+  info: MediaInfo,
+  options: ConvertOptions,
+): Recipe {
+  const out = formatKind(options.format, info.kind);
+  const accepts: MediaKind[] = out === "audio" ? ["video", "audio"] : [info.kind];
+  const { trimStart: _start, trimEnd: _end, rotate: _rotate, flip: _flip, ...kept } = options;
+  return {
+    id,
+    title,
+    custom: true,
+    detail: recipeDetail(info, options),
+    route: `${accepts.length > 1 ? "ANY" : KIND_WORD[info.kind]} → ${label(options.format)}`,
+    tone: KIND_TONE[out],
+    options: { ...kept, jxl: { ...kept.jxl } },
+    accepts,
+  };
 }

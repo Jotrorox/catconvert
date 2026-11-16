@@ -117,7 +117,11 @@ export const QueueScreen: Component<{ compact: boolean }> = (props) => {
       <header class="page-header">
         <div>
           <h1 class="display page-title">Queue</h1>
-          <p class="subtitle">{summary()}</p>
+          <p class="subtitle">
+            <Show when={state.batch} fallback={summary()}>
+              {(progress) => `Adding files… ${progress().done} of ${progress().total}`}
+            </Show>
+          </p>
         </div>
         <div class="actions">
           <Show when={finished().length > 0}>

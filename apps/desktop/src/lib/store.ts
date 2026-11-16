@@ -1,6 +1,7 @@
 /**
  * App state: which screen is showing, the file being edited, files waiting
- * their turn, the conversion queue and the history of finished conversions.
+ * their turn, the conversion queue, the history of finished conversions, and
+ * the user's starting settings and saved recipes.
  *
  * All backend calls go through `./api`; components only call the actions
  * exported here.
@@ -19,7 +20,16 @@ import type {
 } from "./api";
 import * as api from "./api";
 import { baseName } from "./format";
-import { initialOptions, RECIPES, type Recipe, type RecipeId } from "./formats";
+import {
+  DEFAULTS,
+  type Defaults,
+  fitOptions,
+  initialOptions,
+  RECIPES,
+  type Recipe,
+  type RecipeId,
+  recipeFrom,
+} from "./formats";
 
 export type Screen = "convert" | "edit" | "queue" | "recipes" | "history" | "settings";
 
@@ -89,28 +99,65 @@ type State = {
   recipe: RecipeId | null;
   jobs: JobEntry[];
   history: HistoryItem[];
+  /** History outputs that are no longer where we wrote them (moved or deleted). */
+  missing: string[];
+  /** Starting settings for freshly opened files. */
+  settings: Defaults;
+  /** Recipes the user saved from the editor. */
+  recipes: Recipe[];
+  /** Waiting files being queued with one set of settings. */
+  batch: { done: number; total: number } | null;
   toasts: Toast[];
 };
 
 const HISTORY_KEY = "catconvert.history.v1";
+const SETTINGS_KEY = "catconvert.settings.v1";
+const RECIPES_KEY = "catconvert.recipes.v1";
 const HISTORY_LIMIT = 50;
 
-function loadHistory(): HistoryItem[] {
+// Storage can be unavailable (private mode, quota). Everything kept here is a
+// convenience, so failures fall back to defaults silently.
+function load(key: string): unknown {
   try {
-    const raw = localStorage.getItem(HISTORY_KEY);
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? (parsed as HistoryItem[]) : [];
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
   } catch {
-    return [];
+    return null;
   }
 }
 
-function saveHistory(items: HistoryItem[]) {
+function save(key: string, value: unknown) {
   try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(items));
+    localStorage.setItem(key, JSON.stringify(value));
   } catch {
-    // Storage can be unavailable (private mode, quota); history is a convenience.
+    // See above.
   }
+}
+
+function loadHistory(): HistoryItem[] {
+  const parsed = load(HISTORY_KEY);
+  return Array.isArray(parsed) ? (parsed as HistoryItem[]) : [];
+}
+
+function saveHistory(items: HistoryItem[]) {
+  save(HISTORY_KEY, items);
+}
+
+function loadSettings(): Defaults {
+  const parsed = load(SETTINGS_KEY) as Partial<Defaults> | null;
+  if (!parsed || typeof parsed !== "object") return structuredClone(DEFAULTS);
+  return {
+    ...DEFAULTS,
+    ...parsed,
+    formats: { ...DEFAULTS.formats, ...parsed.formats },
+  };
+}
+
+function loadRecipes(): Recipe[] {
+  const parsed = load(RECIPES_KEY);
+  return Array.isArray(parsed)
+    ? (parsed as Recipe[]).filter((r) => r && typeof r.id === "string" && r.options?.format)
+    : [];
 }
 
 const [state, setState] = createStore<State>({
@@ -124,6 +171,10 @@ const [state, setState] = createStore<State>({
   recipe: null,
   jobs: [],
   history: loadHistory(),
+  missing: [],
+  settings: loadSettings(),
+  recipes: loadRecipes(),
+  batch: null,
   toasts: [],
 });
 
@@ -275,8 +326,13 @@ export async function chooseFiles(recipe: RecipeId | null = null) {
   }
 }
 
+/** Built-in recipes followed by the user's own. */
+export function allRecipes(): Recipe[] {
+  return [...RECIPES, ...state.recipes];
+}
+
 function currentRecipe(): Recipe | null {
-  return RECIPES.find((r) => r.id === state.recipe) ?? null;
+  return allRecipes().find((r) => r.id === state.recipe) ?? null;
 }
 
 /** Probe the next inbox file and open it in the editor. */
@@ -297,7 +353,7 @@ export async function openNext(): Promise<void> {
     const info = await api.probeFile(path);
     if (info.kind === "unknown") throw new Error("That doesn't look like a photo, video or song.");
     setState({
-      draft: { info, options: initialOptions(info, isAvailable, currentRecipe()) },
+      draft: { info, options: initialOptions(info, isAvailable, currentRecipe(), state.settings) },
       opening: null,
     });
   } catch (error) {
@@ -352,6 +408,54 @@ export async function convertDraft() {
     }
   } catch (error) {
     toast(errorText(error), { tone: "error" });
+  }
+}
+
+/**
+ * Queue the current file, then every waiting file with the same settings
+ * (minus the trim, which belongs to one file). Files the settings don't fit,
+ * such as a song when making MP4s, go back to the editor afterwards.
+ */
+export async function convertAll() {
+  const draft = state.draft;
+  if (!draft) return;
+  const options = { ...draft.options, jxl: { ...draft.options.jxl } };
+  const paths = [...state.inbox];
+  try {
+    addJob(await api.startJob(draft.info.path, options), options);
+  } catch (error) {
+    toast(errorText(error), { tone: "error" });
+    return;
+  }
+  batch(() => {
+    setState({ draft: null, inbox: [], recipe: null, batch: { done: 0, total: paths.length } });
+    navigate("queue");
+  });
+
+  const leftovers: string[] = [];
+  for (const path of paths) {
+    try {
+      const info = await api.probeFile(path);
+      if (info.kind === "unknown")
+        throw new Error("That doesn't look like a photo, video or song.");
+      const fitted = fitOptions(info, options, isAvailable);
+      if (fitted) addJob(await api.startJob(path, fitted), fitted);
+      else leftovers.push(path);
+    } catch (error) {
+      toast(`${baseName(path)}: ${errorText(error)}`, { tone: "error" });
+    }
+    setState("batch", (progress) => progress && { ...progress, done: progress.done + 1 });
+  }
+  setState("batch", null);
+
+  if (leftovers.length > 0) {
+    const n = leftovers.length;
+    toast(
+      n === 1
+        ? `${baseName(leftovers[0] ?? "")} needs its own settings`
+        : `${n} files need their own settings`,
+    );
+    openPaths(leftovers);
   }
 }
 
@@ -473,8 +577,33 @@ export function clearFinished() {
 }
 
 export function clearHistory() {
-  setState("history", []);
-  saveHistory([]);
+  batch(() => {
+    setState({ history: [], missing: [] });
+    saveHistory([]);
+  });
+}
+
+/** Note which history outputs have been moved or deleted since. */
+export async function checkHistory() {
+  try {
+    const missing = await api.missingFiles(state.history.map((item) => item.output));
+    setState("missing", missing);
+  } catch {
+    // Best effort: rows simply stay as they are.
+  }
+}
+
+/** Drop history entries whose files are gone. */
+export function forgetMissing() {
+  const gone = new Set(state.missing);
+  batch(() => {
+    setState("history", (items) => {
+      const next = items.filter((item) => !gone.has(item.output));
+      saveHistory(next);
+      return next;
+    });
+    setState("missing", []);
+  });
 }
 
 export async function reveal(path: string) {
@@ -482,7 +611,54 @@ export async function reveal(path: string) {
     await api.revealInFolder(path);
   } catch (error) {
     toast(`Couldn't show the file: ${errorText(error)}`, { tone: "error" });
+    void checkHistory();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Settings and recipes
+// ---------------------------------------------------------------------------
+
+export function updateSettings(patch: Partial<Defaults>) {
+  setState("settings", (settings) => {
+    const next = { ...settings, ...patch, formats: { ...settings.formats, ...patch.formats } };
+    save(SETTINGS_KEY, next);
+    return next;
+  });
+}
+
+function setRecipes(recipes: Recipe[]) {
+  setState("recipes", recipes);
+  save(RECIPES_KEY, recipes);
+}
+
+/** Save the editor's current settings as a recipe. */
+export function saveRecipe(title: string) {
+  const draft = state.draft;
+  const name = title.trim();
+  if (!draft || !name) return;
+  const id = `custom-${Date.now().toString(36)}-${state.recipes.length}`;
+  setRecipes([...state.recipes, recipeFrom(id, name, draft.info, { ...draft.options })]);
+  toast(`Saved “${name}” to your recipes`, {
+    action: { label: "View", run: () => navigate("recipes") },
+  });
+}
+
+export function removeRecipe(id: RecipeId) {
+  const index = state.recipes.findIndex((r) => r.id === id);
+  const recipe = state.recipes[index];
+  if (!recipe) return;
+  setRecipes(state.recipes.filter((r) => r.id !== id));
+  toast(`Removed “${recipe.title}”`, {
+    action: {
+      label: "Undo",
+      run: () => {
+        const restored = [...state.recipes];
+        restored.splice(Math.min(index, restored.length), 0, recipe);
+        setRecipes(restored);
+      },
+    },
+  });
 }
 
 /** Jobs still waiting or running, for the Queue badge. */
@@ -509,6 +685,10 @@ export function resetStore() {
     recipe: null,
     jobs: [],
     history: [],
+    missing: [],
+    settings: structuredClone(DEFAULTS),
+    recipes: [],
+    batch: null,
     toasts: [],
   });
 }

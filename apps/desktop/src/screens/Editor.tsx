@@ -23,6 +23,8 @@ import {
   isLossless,
   JXL_EFFORTS,
   label,
+  QUALITY_STEPS,
+  qualityStep,
   repacksJpeg,
   restoresJpeg,
   shortSide,
@@ -32,15 +34,16 @@ import {
 import { createFilmstrip, createFrame, createWaveform } from "../lib/preview";
 import {
   closeEditor,
+  convertAll,
   convertDraft,
   type Draft,
   isAvailable,
+  saveRecipe,
   skipDraft,
   state,
   updateOptions,
 } from "../lib/store";
 
-const QUALITY_STEPS = ["Tiny file", "Balanced", "Crisp"] as const;
 const FILMSTRIP_FRAMES = 10;
 
 function describe(info: MediaInfo): string {
@@ -181,8 +184,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
 
   // Settings ------------------------------------------------------------------
 
-  const qualityStep = () =>
-    QUALITY_STEPS[options().quality < 34 ? 0 : options().quality > 66 ? 2 : 1];
+  const step = () => qualityStep(options().quality);
   const sizes = createMemo(() => sizeChoices(info()));
   const rates = createMemo(() => fpsChoices(info()));
   const isJxl = () => options().format === "jxl";
@@ -232,6 +234,16 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     return items;
   });
 
+  // Saving as a recipe ------------------------------------------------------
+
+  const [naming, setNaming] = createSignal(false);
+  let nameInput: HTMLInputElement | undefined;
+  const submitRecipe = (event: SubmitEvent) => {
+    event.preventDefault();
+    saveRecipe(nameInput?.value ?? "");
+    setNaming(false);
+  };
+
   const convertLabel = () => (state.inbox.length > 0 ? "Convert & next" : "Start converting");
 
   const convertButton = (cls: string) => (
@@ -277,9 +289,20 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               <li class="inbox-chip more">+{state.inbox.length - 3}</li>
             </Show>
           </ul>
-          <button type="button" class="link-btn" onClick={() => skipDraft()}>
-            <Icon name="skip" size={14} /> Skip this one
-          </button>
+          <div class="inbox-actions">
+            <button
+              type="button"
+              class="link-btn"
+              disabled={!ready()}
+              title="Queue every waiting file with these settings. The trim stays with this file."
+              onClick={() => void convertAll()}
+            >
+              <Icon name="paw" size={14} /> Convert all {state.inbox.length + 1} like this
+            </button>
+            <button type="button" class="link-btn" onClick={() => skipDraft()}>
+              <Icon name="skip" size={14} /> Skip this one
+            </button>
+          </div>
         </div>
       </Show>
 
@@ -484,7 +507,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               />
               <div class="range-scale">
                 <For each={QUALITY_STEPS}>
-                  {(step) => <span classList={{ active: qualityStep() === step }}>{step}</span>}
+                  {(name) => <span classList={{ active: step() === name }}>{name}</span>}
                 </For>
               </div>
             </div>
@@ -563,6 +586,25 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               />
             </div>
           </Show>
+
+          <div class="toggle-row">
+            <div>
+              <span class="toggle-title" id="keep-metadata">
+                Keep metadata
+              </span>
+              <span class="item-meta">
+                Dates, place and camera details, where the format allows
+              </span>
+            </div>
+            <button
+              type="button"
+              class="switch"
+              role="switch"
+              aria-checked={options().keepMetadata}
+              aria-labelledby="keep-metadata"
+              onClick={() => updateOptions({ keepMetadata: !options().keepMetadata })}
+            />
+          </div>
 
           <Show when={isJxl()}>
             <div class="jxl-settings">
@@ -645,6 +687,42 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
             </Show>
             <p class="item-meta">Saved next to the original.</p>
           </div>
+
+          <Show
+            when={naming()}
+            fallback={
+              <button type="button" class="link-btn save-recipe" onClick={() => setNaming(true)}>
+                <Icon name="star" size={14} /> Save these settings as a recipe
+              </button>
+            }
+          >
+            <form class="recipe-form" onSubmit={submitRecipe}>
+              <input
+                ref={(el) => {
+                  nameInput = el;
+                  queueMicrotask(() => {
+                    el.focus();
+                    el.select();
+                  });
+                }}
+                class="input"
+                aria-label="Recipe name"
+                value={`My ${label(options().format)}`}
+                maxLength={40}
+                spellcheck={false}
+                onKeyDown={(e) => e.key === "Escape" && setNaming(false)}
+              />
+              <button type="submit" class="btn btn-primary">
+                Save
+              </button>
+              <button type="button" class="btn btn-outline" onClick={() => setNaming(false)}>
+                Cancel
+              </button>
+            </form>
+            <p class="item-meta">
+              Keeps the format and settings; trims and turns stay with each file.
+            </p>
+          </Show>
 
           <details
             class="command"

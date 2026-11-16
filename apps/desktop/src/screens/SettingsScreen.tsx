@@ -1,8 +1,9 @@
 import { type Component, createSignal, For, Match, Show, Switch } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
+import type { OutputFormat } from "../lib/api";
 import { formatBytes } from "../lib/format";
-import { FORMAT_GROUPS, label } from "../lib/formats";
+import { FORMAT_GROUPS, type FormatGroup, label, QUALITY_STEPS, qualityStep } from "../lib/formats";
 import {
   activeCount,
   checkForUpdates,
@@ -13,6 +14,7 @@ import {
   state,
   toast,
   type UpdateState,
+  updateSettings,
 } from "../lib/store";
 
 const INSTALL = [
@@ -20,6 +22,93 @@ const INSTALL = [
   { os: "Windows", command: "winget install ffmpeg" },
   { os: "Linux", command: "sudo apt install ffmpeg" },
 ];
+
+const BECOMES: Record<FormatGroup["kind"], string> = {
+  video: "Videos become",
+  audio: "Sound becomes",
+  image: "Pictures become",
+};
+
+/** What freshly opened files start with. */
+const StartingSettings: Component = () => {
+  const settings = () => state.settings;
+  const setFormat = (kind: FormatGroup["kind"], value: string) =>
+    updateSettings({
+      formats: { ...settings().formats, [kind]: value === "" ? null : (value as OutputFormat) },
+    });
+
+  return (
+    <section class="card defaults">
+      <h2 class="section-title">Starting settings</h2>
+      <p class="item-meta">
+        What a freshly opened file starts with. Recipes and the editor can still change anything.
+      </p>
+      <div class="three-col">
+        <For each={FORMAT_GROUPS}>
+          {(group) => (
+            <label class="field">
+              <span class="field-label">{BECOMES[group.kind]}</span>
+              <select class="select" onChange={(e) => setFormat(group.kind, e.currentTarget.value)}>
+                <option value="" selected={settings().formats[group.kind] === null}>
+                  Let the kitty pick
+                </option>
+                <For each={group.formats}>
+                  {(format) => (
+                    <option
+                      value={format}
+                      selected={settings().formats[group.kind] === format}
+                      disabled={state.ffmpeg?.found === true && !isAvailable(format)}
+                    >
+                      {label(format)}
+                    </option>
+                  )}
+                </For>
+              </select>
+            </label>
+          )}
+        </For>
+      </div>
+      <div class="field">
+        <label class="field-label" for="default-quality">
+          Quality
+        </label>
+        <input
+          id="default-quality"
+          class="range"
+          type="range"
+          min="0"
+          max="100"
+          value={settings().quality}
+          style={{ "--pct": `${settings().quality}%` }}
+          onInput={(e) => updateSettings({ quality: e.currentTarget.valueAsNumber })}
+        />
+        <div class="range-scale">
+          <For each={QUALITY_STEPS}>
+            {(name) => (
+              <span classList={{ active: qualityStep(settings().quality) === name }}>{name}</span>
+            )}
+          </For>
+        </div>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <span class="toggle-title" id="default-keep-metadata">
+            Keep metadata
+          </span>
+          <span class="item-meta">Dates, place and camera details, where the format allows</span>
+        </div>
+        <button
+          type="button"
+          class="switch"
+          role="switch"
+          aria-checked={settings().keepMetadata}
+          aria-labelledby="default-keep-metadata"
+          onClick={() => updateSettings({ keepMetadata: !settings().keepMetadata })}
+        />
+      </div>
+    </section>
+  );
+};
 
 export const SettingsScreen: Component = () => {
   const [looking, setLooking] = createSignal(false);
@@ -92,6 +181,8 @@ export const SettingsScreen: Component = () => {
           </button>
         </div>
       </section>
+
+      <StartingSettings />
 
       <Show when={state.ffmpeg?.found}>
         <section class="card">
