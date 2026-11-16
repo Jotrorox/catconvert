@@ -5,11 +5,13 @@
  * command/event contract with `apps/desktop/src-tauri/src/lib.rs` lives in one
  * place. The types mirror the serde output of `catconvert-core` (camelCase).
  */
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 
 export type { UnlistenFn };
 
@@ -147,6 +149,7 @@ type Commands = {
   preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
   start_job: { args: { path: string; options: ConvertOptions }; result: JobTicket };
   cancel_job: { args: { id: JobId }; result: boolean };
+  relaunch: { args: Record<string, never>; result: null };
 };
 
 type Events = {
@@ -259,6 +262,81 @@ export async function pickFiles(): Promise<string[]> {
 /** Show a file in Finder / Explorer / the file manager. */
 export function revealInFolder(path: string): Promise<void> {
   return revealItemInDir(path);
+}
+
+// ---------------------------------------------------------------------------
+// Updates
+// ---------------------------------------------------------------------------
+
+/** A newer release found by {@link checkForUpdate}. */
+export type UpdateInfo = {
+  version: string;
+  currentVersion: string;
+  /** Release date as reported by `latest.json`, if any. */
+  date: string | null;
+  /** Release notes, if any. */
+  notes: string | null;
+};
+
+/** Download progress; `total` is null when the server sends no length. */
+export type DownloadProgress = { downloaded: number; total: number | null };
+
+/** The update last returned by {@link checkForUpdate}, kept for {@link installUpdate}. */
+let pendingUpdate: Update | null = null;
+
+/** The running app's version, or null outside the Tauri shell. */
+export async function appVersion(): Promise<string | null> {
+  return inTauri ? getVersion() : null;
+}
+
+/**
+ * Ask the release server whether a newer version exists. Resolves to null when
+ * the app is up to date (or not running in the Tauri shell).
+ */
+export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  if (!inTauri) return null;
+  const update = await check();
+  const previous = pendingUpdate;
+  pendingUpdate = update;
+  if (previous) void previous.close().catch(() => {});
+  if (!update) return null;
+  return {
+    version: update.version,
+    currentVersion: update.currentVersion,
+    date: update.date ?? null,
+    notes: update.body?.trim() || null,
+  };
+}
+
+/**
+ * Download, verify and install the update found by the last
+ * {@link checkForUpdate}. On Windows the installer closes the app itself;
+ * elsewhere call {@link relaunch} afterwards.
+ */
+export async function installUpdate(onProgress: (progress: DownloadProgress) => void) {
+  const update = pendingUpdate;
+  if (!update) throw new Error("There is no update to install. Check again.");
+  let downloaded = 0;
+  let total: number | null = null;
+  await update.downloadAndInstall((event) => {
+    switch (event.event) {
+      case "Started":
+        total = event.data.contentLength ?? null;
+        break;
+      case "Progress":
+        downloaded += event.data.chunkLength;
+        break;
+      case "Finished":
+        if (total !== null) downloaded = total;
+        break;
+    }
+    onProgress({ downloaded, total });
+  });
+}
+
+/** Restart the app (to finish installing an update). */
+export async function relaunch(): Promise<void> {
+  await command("relaunch", {});
 }
 
 export type FileDropHandlers = {

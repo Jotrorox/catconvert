@@ -21,6 +21,7 @@ tauri-build = { version = "=2.7.5", features = [] }
 # Official plugins, in lockstep with @tauri-apps/plugin-* in apps/desktop/package.json.
 tauri-plugin-dialog = "=2.8.4"
 tauri-plugin-opener = "=2.7.2"
+tauri-plugin-updater = "=2.14.1"
 uniffi = "=0.32.2"
 
 # Everything else is locked by Cargo.lock.

@@ -112,21 +112,42 @@ Without these secrets, releases are built unsigned. Add them as secrets of the
 `release` environment (_Settings → Environments → release_, restricted to `v*`
 tags), e.g. `gh secret set APPLE_ID --env release`:
 
-| Secret                         | Purpose                                                  |
-| ------------------------------ | -------------------------------------------------------- |
-| `APPLE_CERTIFICATE`            | Base64 of the exported "Developer ID Application" `.p12` |
-| `APPLE_CERTIFICATE_PASSWORD`   | Password of that `.p12`                                  |
-| `APPLE_SIGNING_IDENTITY`       | e.g. `Developer ID Application: Your Name (TEAMID)`      |
-| `APPLE_ID`                     | Apple ID email used for notarization                     |
-| `APPLE_PASSWORD`               | App-specific password for that Apple ID                  |
-| `APPLE_TEAM_ID`                | 10-character team ID                                     |
-| `WINDOWS_CERTIFICATE`          | Base64 of a code-signing `.pfx`                          |
-| `WINDOWS_CERTIFICATE_PASSWORD` | Password of that `.pfx`                                  |
+| Secret                               | Purpose                                                  |
+| ------------------------------------ | -------------------------------------------------------- |
+| `APPLE_CERTIFICATE`                  | Base64 of the exported "Developer ID Application" `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD`         | Password of that `.p12`                                  |
+| `APPLE_SIGNING_IDENTITY`             | e.g. `Developer ID Application: Your Name (TEAMID)`      |
+| `APPLE_ID`                           | Apple ID email used for notarization                     |
+| `APPLE_PASSWORD`                     | App-specific password for that Apple ID                  |
+| `APPLE_TEAM_ID`                      | 10-character team ID                                     |
+| `WINDOWS_CERTIFICATE`                | Base64 of a code-signing `.pfx`                          |
+| `WINDOWS_CERTIFICATE_PASSWORD`       | Password of that `.pfx`                                  |
+| `TAURI_SIGNING_PRIVATE_KEY`          | Updater signing key (contents of the `.key` file)        |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password of that key                                     |
 
 macOS signing needs the first three; notarization additionally needs the Apple
 ID trio. With notarization enabled, both the app and the `.dmg` are notarized
 and stapled. See [Tauri: macOS code signing](https://v2.tauri.app/distribute/sign/macos/)
 and [Windows code signing](https://v2.tauri.app/distribute/sign/windows/).
+
+### Auto-updates
+
+The app checks
+`https://github.com/Jotrorox/catconvert/releases/latest/download/latest.json`
+at launch and from _Settings → Updates_, and only installs bundles signed with
+the updater key whose public half is `plugins.updater.pubkey` in
+`apps/desktop/src-tauri/tauri.conf.json`. With `TAURI_SIGNING_PRIVATE_KEY` set,
+the release workflow builds signed updater bundles (`.app.tar.gz`, `.AppImage`,
+the Windows installers) and attaches a `latest.json` covering every platform.
+Installed apps see a release once it is published (drafts and pre-releases are
+not `latest`), and the release assets must be downloadable without signing in,
+so the repository (or wherever the endpoint points) has to be public.
+
+Keep the private key and its password backed up: without them, existing
+installs can never be updated again. To rotate the key, ship one release that
+contains the new public key, signed with the old key, before switching.
+A new pair comes from `pnpm tauri signer generate -w ~/.tauri/catconvert.key`
+(run in `apps/desktop`).
 
 ## Mobile (later)
 

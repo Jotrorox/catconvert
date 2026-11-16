@@ -5,7 +5,16 @@ import { Toasts } from "./components/Toasts";
 import { inTauri, onFileDrop, onJobProgress, type UnlistenFn } from "./lib/api";
 import { createMediaQuery } from "./lib/media";
 import { overlayTitleBar } from "./lib/platform";
-import { activeCount, applyProgress, navigate, openPaths, refreshFfmpeg, state } from "./lib/store";
+import {
+  activeCount,
+  applyProgress,
+  checkForUpdates,
+  loadAppVersion,
+  navigate,
+  openPaths,
+  refreshFfmpeg,
+  state,
+} from "./lib/store";
 import { ConvertHome } from "./screens/ConvertHome";
 import { Editor } from "./screens/Editor";
 import { HistoryScreen } from "./screens/HistoryScreen";
@@ -24,6 +33,8 @@ export default function App() {
   onMount(() => {
     void refreshFfmpeg();
     if (!inTauri) return;
+    void loadAppVersion();
+    void checkForUpdates({ quiet: true });
     const unlisten: Promise<UnlistenFn>[] = [
       onJobProgress(applyProgress),
       onFileDrop({ onHover: setDropHover, onDrop: openPaths }),

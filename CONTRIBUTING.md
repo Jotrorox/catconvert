@@ -59,3 +59,5 @@ Maintainers run `mise run release <version>`, which bumps the version in
 `Cargo.toml`, `tauri.conf.json` and both `package.json` files, commits
 `chore(release): v<version>` and creates the tag. Pushing the tag triggers the
 release workflow, which creates a draft GitHub Release to review and publish.
+Publishing it is what ships the update: installed apps read `latest.json` from
+the latest published release (see "Auto-updates" in the README).

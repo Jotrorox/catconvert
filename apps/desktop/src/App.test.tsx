@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { FfmpegStatus, MediaInfo, OutputFormat } from "./lib/api";
 import * as api from "./lib/api";
-import { applyProgress, openPaths, resetStore, state } from "./lib/store";
+import { applyProgress, navigate, openPaths, resetStore, state } from "./lib/store";
 
 vi.mock("./lib/api", () => ({
   inTauri: false,
@@ -19,6 +19,10 @@ vi.mock("./lib/api", () => ({
   revealInFolder: vi.fn(async () => {}),
   onJobProgress: vi.fn(),
   onFileDrop: vi.fn(),
+  appVersion: vi.fn(async () => "0.1.2"),
+  checkForUpdate: vi.fn(),
+  installUpdate: vi.fn(),
+  relaunch: vi.fn(async () => {}),
   NO_JXL: {},
 }));
 
@@ -342,5 +346,50 @@ describe("CatConvert", () => {
     expect(screen.getByRole("button", { name: "MP3" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.queryByRole("button", { name: "Rotate 90°" })).not.toBeInTheDocument();
     expect(screen.getByRole("slider", { name: "Trim end" })).toBeInTheDocument();
+  });
+
+  it("checks for an update, installs it and restarts", async () => {
+    vi.mocked(api.checkForUpdate).mockResolvedValue({
+      version: "0.2.0",
+      currentVersion: "0.1.2",
+      date: null,
+      notes: "Purrs faster.",
+    });
+    let finish = () => {};
+    vi.mocked(api.installUpdate).mockImplementation(
+      (onProgress) =>
+        new Promise((resolve) => {
+          onProgress({ downloaded: 512 * 1024, total: 2 * 1024 * 1024 });
+          finish = resolve;
+        }),
+    );
+    render(() => <App />);
+    navigate("settings");
+    fireEvent.click(await screen.findByRole("button", { name: /Check for updates/ }));
+    expect(await screen.findByText("CatConvert 0.2.0 is out")).toBeInTheDocument();
+    expect(screen.getByText("Purrs faster.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Download and install/ }));
+    expect(
+      await screen.findByRole("progressbar", { name: "Downloading the update" }),
+    ).toHaveAttribute("aria-valuenow", "25");
+    finish();
+    expect(await screen.findByText("CatConvert 0.2.0 is installed")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Restart now/ }));
+    expect(api.relaunch).toHaveBeenCalledOnce();
+  });
+
+  it("says when CatConvert is up to date, and why a check failed", async () => {
+    vi.mocked(api.checkForUpdate)
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce("could not fetch a valid release JSON");
+    render(() => <App />);
+    navigate("settings");
+    fireEvent.click(await screen.findByRole("button", { name: /Check for updates/ }));
+    expect(await screen.findByText("You're up to date.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Check for updates/ }));
+    expect(await screen.findByText("Couldn't check for updates")).toBeInTheDocument();
+    expect(screen.getByText("Could not fetch a valid release JSON")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Try again/ })).toBeEnabled();
   });
 });

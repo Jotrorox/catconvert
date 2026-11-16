@@ -15,6 +15,7 @@ import type {
   JobStage,
   MediaInfo,
   OutputFormat,
+  UpdateInfo,
 } from "./api";
 import * as api from "./api";
 import { baseName } from "./format";
@@ -61,8 +62,23 @@ export type Toast = {
   action?: { label: string; run: () => void };
 };
 
+/** Where the in-app updater is. */
+export type UpdateState =
+  | { status: "idle" }
+  | { status: "checking" }
+  | { status: "current" }
+  | { status: "available"; info: UpdateInfo }
+  | { status: "downloading"; info: UpdateInfo; progress: api.DownloadProgress }
+  /** Installed; the new version starts after a restart. */
+  | { status: "ready"; info: UpdateInfo }
+  /** `info` is set when the check worked but downloading or installing failed. */
+  | { status: "error"; message: string; info: UpdateInfo | null };
+
 type State = {
   screen: Screen;
+  /** The running app's version (null until known, or outside the Tauri shell). */
+  appVersion: string | null;
+  update: UpdateState;
   ffmpeg: FfmpegStatus | null;
   /** Paths waiting to be opened in the editor, in drop order. */
   inbox: string[];
@@ -99,6 +115,8 @@ function saveHistory(items: HistoryItem[]) {
 
 const [state, setState] = createStore<State>({
   screen: "convert",
+  appVersion: null,
+  update: { status: "idle" },
   ffmpeg: null,
   inbox: [],
   draft: null,
@@ -159,6 +177,78 @@ export async function refreshFfmpeg(relocate = false) {
 
 export function isAvailable(format: OutputFormat): boolean {
   return state.ffmpeg?.formats.find((f) => f.format === format)?.available ?? false;
+}
+
+// ---------------------------------------------------------------------------
+// Updates
+// ---------------------------------------------------------------------------
+
+// `setState({ update })` replaces the union value; `setState("update", ...)`
+// would merge it and leave keys of the previous variant behind.
+function setUpdate(update: UpdateState) {
+  setState({ update });
+}
+
+export async function loadAppVersion() {
+  try {
+    setState("appVersion", await api.appVersion());
+  } catch {
+    // Only used for display.
+  }
+}
+
+/**
+ * Look for a newer release. The quiet check at launch only speaks up when an
+ * update exists: being offline or rate limited is not worth a toast.
+ */
+export async function checkForUpdates({ quiet = false } = {}) {
+  const busy = state.update.status;
+  if (busy === "checking" || busy === "downloading" || busy === "ready") return;
+  setUpdate({ status: "checking" });
+  try {
+    const info = await api.checkForUpdate();
+    if (!info) {
+      setUpdate({ status: "current" });
+      return;
+    }
+    setUpdate({ status: "available", info });
+    if (quiet) {
+      toast(`CatConvert ${info.version} is out`, {
+        action: { label: "Update", run: () => navigate("settings") },
+      });
+    }
+  } catch (error) {
+    setUpdate(
+      quiet ? { status: "idle" } : { status: "error", message: errorText(error), info: null },
+    );
+  }
+}
+
+/** Download and install the update found by the last check. */
+export async function installUpdate() {
+  const current = state.update;
+  const info = current.status === "available" || current.status === "error" ? current.info : null;
+  if (!info) return;
+  if (activeCount() > 0) {
+    toast("Let your conversions finish first", { tone: "error" });
+    return;
+  }
+  setUpdate({ status: "downloading", info, progress: { downloaded: 0, total: null } });
+  try {
+    await api.installUpdate((progress) => setUpdate({ status: "downloading", info, progress }));
+    setUpdate({ status: "ready", info });
+  } catch (error) {
+    setUpdate({ status: "error", message: errorText(error), info });
+  }
+}
+
+/** Restart into the installed update. */
+export async function restartApp() {
+  try {
+    await api.relaunch();
+  } catch (error) {
+    toast(`Couldn't restart: ${errorText(error)}`, { tone: "error" });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +500,8 @@ export function resetStore() {
   early.clear();
   setState({
     screen: "convert",
+    appVersion: null,
+    update: { status: "idle" },
     ffmpeg: null,
     inbox: [],
     draft: null,
