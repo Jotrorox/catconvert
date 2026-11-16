@@ -105,8 +105,9 @@ git push origin main --follow-tags
 
 ### Signing (optional)
 
-Without these secrets, releases are built unsigned. Add them under
-_Settings → Secrets and variables → Actions_:
+Without these secrets, releases are built unsigned. Add them as secrets of the
+`release` environment (_Settings → Environments → release_, restricted to `v*`
+tags), e.g. `gh secret set APPLE_ID --env release`:
 
 | Secret                         | Purpose                                                  |
 | ------------------------------ | -------------------------------------------------------- |
