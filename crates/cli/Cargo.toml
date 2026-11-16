@@ -1,0 +1,21 @@
+[package]
+name = "catconvert-cli"
+description = "Command-line interface for CatConvert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "catconvert"
+path = "src/main.rs"
+
+[dependencies]
+catconvert-core.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
