@@ -1,33 +1,29 @@
 [package]
 name = "catconvert-desktop"
-version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-edition = "2024"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "CatConvert desktop app (Tauri shell over catconvert-core)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
 
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+# The `_lib` suffix keeps the lib name distinct from the bin name, which
+# otherwise collides on Windows (https://github.com/rust-lang/cargo/issues/8519).
+# staticlib/cdylib are needed for Tauri mobile (iOS/Android) later.
 name = "catconvert_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build.workspace = true
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+catconvert-core.workspace = true
+tauri.workspace = true
+serde_json.workspace = true
 
+[lints]
+workspace = true
 
-# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = 3
-panic = "abort"
-strip = true
+# The release profile lives in the workspace root Cargo.toml.
