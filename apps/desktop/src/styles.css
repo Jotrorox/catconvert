@@ -105,7 +105,8 @@ button.primary {
 
 .drop-zone {
   display: grid;
-  place-items: center;
+  place-content: center;
+  justify-items: center;
   gap: 4px;
   min-height: 160px;
   padding: 24px;
