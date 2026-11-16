@@ -1,0 +1,19 @@
+* text=auto eol=lf
+
+# Binary assets
+*.png  binary
+*.ico  binary
+*.icns binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.mp3  binary
+*.mp4  binary
+*.mov  binary
+*.wav  binary
+*.flac binary
+
+# Generated lockfiles: collapse in diffs
+Cargo.lock      linguist-generated=true -diff
+pnpm-lock.yaml  linguist-generated=true -diff
