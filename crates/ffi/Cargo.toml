@@ -1,0 +1,31 @@
+[package]
+name = "catconvert-ffi"
+description = "UniFFI bindings over catconvert-core for native Swift/Kotlin shells"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "catconvert_ffi"
+# lib: Rust consumers/tests, cdylib: Android (JNA) and binding generation,
+# staticlib: iOS/macOS XCFramework.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+catconvert-core.workspace = true
+thiserror.workspace = true
+uniffi.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+# UniFFI's generated scaffolding uses `unsafe extern "C"` functions.
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
