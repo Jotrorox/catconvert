@@ -193,6 +193,8 @@ jobs:
   cli:
     name: CLI (${{ matrix.target }})
     needs: create-release
+    # The macOS binary is signed and notarized with the same secrets as the app.
+    environment: release
     permissions:
       contents: write
     strategy:
@@ -220,8 +222,8 @@ jobs:
           tauri-system-deps: "false"
           cache-key: release-cli
 
-      - name: Build and package
-        id: package
+      - name: Build
+        id: build
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
@@ -250,6 +252,76 @@ jobs:
               ;;
           esac
           cp LICENSE README.md "$stage/"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      # Without a Developer ID signature and notarization, Gatekeeper refuses to
+      # run a downloaded (quarantined) binary. Like the app, this is optional.
+      - name: Sign and notarize the macOS binary (optional)
+        if: runner.os == 'macOS'
+        env:
+          BIN: dist-cli/${{ steps.build.outputs.name }}/catconvert
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::notice::Apple signing secrets not set: shipping an ad-hoc signed CLI binary."
+            exit 0
+          fi
+
+          keychain="$RUNNER_TEMP/cli-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          p12="$RUNNER_TEMP/cli-signing.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$p12"
+          security import "$p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          # shellcheck disable=SC2046 # keep the existing keychains in the search list
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+          codesign --force --timestamp --options runtime \
+            --identifier dev.jotrorox.catconvert.cli \
+            --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict -vv "$BIN"
+
+          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            echo "::notice::APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID not set: CLI signed but not notarized."
+            exit 0
+          fi
+
+          # A bare Mach-O cannot be stapled; Gatekeeper fetches the ticket online.
+          zip="$RUNNER_TEMP/catconvert-notarize.zip"
+          ditto -c -k --keepParent "$BIN" "$zip"
+          echo "Submitting the CLI binary for notarization..."
+          result="$(xcrun notarytool submit "$zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 2h --output-format json)"
+          echo "$result"
+          status="$(jq -r '.status' <<< "$result")"
+          if [ "$status" != "Accepted" ]; then
+            id="$(jq -r '.id' <<< "$result")"
+            xcrun notarytool log "$id" \
+              --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::Notarization of the CLI binary finished with status: $status"
+            exit 1
+          fi
+          rm -f "$zip"
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          NAME: ${{ steps.build.outputs.name }}
+        run: |
+          set -euo pipefail
+          name="$NAME"
           cd dist-cli
           if [ "$RUNNER_OS" = "Windows" ]; then
             archive="${name}.zip"
