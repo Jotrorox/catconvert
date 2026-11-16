@@ -1,15 +1,18 @@
-//! Locating and running the ffmpeg/ffprobe binaries.
+//! Locating and running the ffmpeg/ffprobe binaries (and libjxl's tools,
+//! which [`Ffmpeg`] finds and runs alongside them).
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::convert::{OutputFormat, Plan};
+use crate::convert::{JxlSupport, OutputFormat, Plan, Step, Tool};
+use crate::jxl::{self, JxlTools};
 use crate::media::{self, MediaInfo, MediaKind};
 use crate::{Error, Result};
 
@@ -19,15 +22,19 @@ pub const FFMPEG_ENV: &str = "CATCONVERT_FFMPEG";
 /// `ffprobe` next to the chosen ffmpeg.
 pub const FFPROBE_ENV: &str = "CATCONVERT_FFPROBE";
 
-/// A usable ffmpeg + ffprobe pair.
+/// A usable ffmpeg + ffprobe pair, plus whichever libjxl tools are installed.
 ///
-/// Cheap to clone; the encoder list is shared.
+/// Cheap to clone; the codec lists and preview cache are shared.
 #[derive(Debug, Clone)]
 pub struct Ffmpeg {
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
     version: String,
     encoders: Arc<HashSet<String>>,
+    decoders: Arc<HashSet<String>>,
+    jxl: Arc<JxlTools>,
+    /// JPEG XL files djxl decoded for previews, when ffmpeg can't read them.
+    decoded: Arc<Mutex<DecodeCache>>,
 }
 
 /// One progress sample while a conversion runs.
@@ -69,12 +76,8 @@ impl Ffmpeg {
             return Self::at(ffmpeg, ffprobe);
         }
 
-        let path_dirs = std::env::var_os("PATH")
-            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-            .unwrap_or_default();
-        path_dirs
+        search_dirs()
             .into_iter()
-            .chain(extra_search_dirs())
             .find_map(|dir| {
                 let ffmpeg = executable(&dir, "ffmpeg")?;
                 let ffprobe = executable(&dir, "ffprobe")?;
@@ -85,7 +88,9 @@ impl Ffmpeg {
             })
     }
 
-    /// Use explicit binaries. Runs `ffmpeg -version` and `-encoders` once.
+    /// Use explicit binaries. Runs `ffmpeg -version`, `-encoders` and
+    /// `-decoders` once, and looks for libjxl's tools next to ffmpeg, on
+    /// `PATH` and in the usual install folders.
     ///
     /// # Errors
     ///
@@ -102,14 +107,49 @@ impl Ffmpeg {
             base_command(&ffmpeg).args(["-hide_banner", "-encoders"]),
             &ffmpeg,
         )?;
-        let encoders = parse_encoders(&String::from_utf8_lossy(&encoders_out));
+        let encoders = parse_codecs(&String::from_utf8_lossy(&encoders_out));
+        let decoders_out = capture(
+            base_command(&ffmpeg).args(["-hide_banner", "-decoders"]),
+            &ffmpeg,
+        )?;
+        let decoders = parse_codecs(&String::from_utf8_lossy(&decoders_out));
+
+        let jxl = JxlTools::locate(
+            ffmpeg
+                .parent()
+                .map(Path::to_path_buf)
+                .into_iter()
+                .chain(search_dirs()),
+        );
 
         Ok(Self {
             ffmpeg,
             ffprobe,
             version,
             encoders: Arc::new(encoders),
+            decoders: Arc::new(decoders),
+            jxl: Arc::new(jxl),
+            decoded: Arc::default(),
         })
+    }
+
+    /// The libjxl tools found.
+    #[must_use]
+    pub fn jxl_tools(&self) -> &JxlTools {
+        &self.jxl
+    }
+
+    /// Which JPEG XL paths are available, for [`crate::plan`].
+    #[must_use]
+    pub fn jxl_support(&self) -> JxlSupport {
+        JxlSupport {
+            cjxl: self.jxl.cjxl.is_some(),
+            djxl: self.jxl.djxl.is_some(),
+            ffmpeg_encoder: self.has_encoder("libjxl"),
+            ffmpeg_anim_encoder: self.has_encoder("libjxl_anim"),
+            ffmpeg_decoder: self.decoders.contains("libjxl"),
+            ffmpeg_anim_decoder: self.decoders.contains("libjxl_anim"),
+        }
     }
 
     /// Path of the ffmpeg binary in use.
@@ -136,13 +176,36 @@ impl Ffmpeg {
         self.encoders.contains(name)
     }
 
-    /// Whether this build of ffmpeg can write `format`.
+    /// Whether `format` can be written: ffmpeg has its encoder, or for JPEG
+    /// XL, libjxl's `cjxl` is installed.
     #[must_use]
     pub fn supports(&self, format: OutputFormat) -> bool {
-        self.has_encoder(format.encoder())
+        self.missing(format).is_none()
+    }
+
+    /// Why `format` can't be written, or `None` if it can.
+    #[must_use]
+    pub fn missing(&self, format: OutputFormat) -> Option<String> {
+        match format {
+            OutputFormat::Jxl if self.jxl_support().can_write() => None,
+            OutputFormat::Jxl => Some(
+                "writing JPEG XL needs libjxl's cjxl (e.g. `brew install jpeg-xl`) or an ffmpeg built with libjxl"
+                    .into(),
+            ),
+            _ if self.has_encoder(format.encoder()) => None,
+            _ => Some(format!(
+                "this ffmpeg can't write {} (missing the {} encoder)",
+                format.extension().to_uppercase(),
+                format.encoder()
+            )),
+        }
     }
 
     /// Inspect a file with ffprobe: duration, display size, frame rate and codecs.
+    ///
+    /// JPEG XL files are also asked of `jxlinfo` (ffprobe can't tell how long
+    /// an animation is without a libjxl decoder) and checked for JPEG
+    /// reconstruction data.
     ///
     /// # Errors
     ///
@@ -151,18 +214,79 @@ impl Ffmpeg {
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<MediaInfo> {
         let path = path.as_ref();
         let mut info = media::probe(path)?;
-        let out = capture(
+        let is_jxl = info.extension.as_deref() == Some("jxl") || jxl::is_jxl_file(path);
+        let probed = capture(
             base_command(&self.ffprobe)
                 .args(["-v", "error", "-print_format", "json"])
                 .args(["-show_format", "-show_streams"])
                 .arg(path),
             &self.ffprobe,
-        )?;
-        let json: Value = serde_json::from_slice(&out).map_err(|err| Error::Ffmpeg {
-            message: format!("ffprobe returned unreadable output: {err}"),
-        })?;
-        apply_probe(&mut info, &json);
+        )
+        .and_then(|out| {
+            serde_json::from_slice::<Value>(&out).map_err(|err| Error::Ffmpeg {
+                message: format!("ffprobe returned unreadable output: {err}"),
+            })
+        });
+        match probed {
+            Ok(json) => apply_probe(&mut info, &json),
+            // Older ffprobes don't know JPEG XL at all; jxlinfo may.
+            Err(err) if !is_jxl => return Err(err),
+            Err(_) => {}
+        }
+        if is_jxl {
+            if info.kind == MediaKind::Unknown {
+                info.kind = MediaKind::Image;
+            }
+            if info.video_codec.is_none() {
+                info.video_codec = Some("jpegxl".into());
+            }
+            info.reconstructs_jpeg = jxl::has_jpeg_reconstruction(path);
+            if let Some(jxlinfo) = &self.jxl.jxlinfo
+                && let Ok(out) = capture(base_command(jxlinfo).arg(path), jxlinfo)
+                && let Some(parsed) = jxl::parse_jxlinfo(&String::from_utf8_lossy(&out))
+            {
+                jxl::apply_jxlinfo(&mut info, &parsed);
+            }
+        }
         Ok(info)
+    }
+
+    /// A path ffmpeg can decode: `input` itself, or for JPEG XL that this
+    /// ffmpeg can't read, a (cached) PNG/APNG decoded by djxl.
+    fn readable(&self, input: &Path) -> Result<PathBuf> {
+        let support = self.jxl_support();
+        if (support.ffmpeg_decoder && support.ffmpeg_anim_decoder) || !jxl::is_jxl_file(input) {
+            return Ok(input.to_path_buf());
+        }
+        let Some(djxl) = self.jxl.djxl.as_deref() else {
+            return Err(Error::unsupported(
+                "previewing JPEG XL needs djxl from libjxl or an ffmpeg built with libjxl",
+            ));
+        };
+        let stamp = FileStamp::of(input)?;
+        let mut cache = self.decoded.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = cache.get(input, &stamp) {
+            return Ok(hit);
+        }
+        let dir = cache.dir()?;
+        let decoded = dir.join(format!("{}.png", cache.next_id()));
+        capture(
+            base_command(djxl).arg(input).arg(&decoded).arg("--quiet"),
+            djxl,
+        )?;
+        // djxl writes animations as APNG; give it the extension ffmpeg expects.
+        let decoded = if is_apng(&decoded) {
+            let apng = decoded.with_extension("apng");
+            std::fs::rename(&decoded, &apng).map_err(|source| Error::Io {
+                path: decoded.clone(),
+                source,
+            })?;
+            apng
+        } else {
+            decoded
+        };
+        cache.insert(input.to_path_buf(), stamp, decoded.clone());
+        Ok(decoded)
     }
 
     /// Grab one frame as a JPEG, scaled down to at most `max_height` pixels.
@@ -174,6 +298,7 @@ impl Ffmpeg {
     ///
     /// [`Error::Ffmpeg`] if decoding fails or there is no frame at `at_secs`.
     pub fn frame(&self, input: &Path, at_secs: f64, max_height: u32) -> Result<Vec<u8>> {
+        let input = &self.readable(input)?;
         let mut cmd = base_command(&self.ffmpeg);
         cmd.args(["-hide_banner", "-nostdin", "-v", "error"]);
         if at_secs > 0.0 {
@@ -224,25 +349,104 @@ impl Ffmpeg {
 
     /// Run a planned conversion to completion, reporting progress.
     ///
-    /// Raising `cancel` stops ffmpeg at its next progress report (a few times a
-    /// second). Partial output is removed on cancellation and on failure.
+    /// Raising `cancel` stops the running step within a fraction of a second.
+    /// Intermediate files are always removed; partial output is removed on
+    /// cancellation and on failure.
     ///
     /// # Errors
     ///
-    /// [`Error::Spawn`] if ffmpeg cannot be started, [`Error::Ffmpeg`] with the
-    /// most relevant line of its error output if the conversion fails.
+    /// [`Error::Spawn`] if a program cannot be started, [`Error::Ffmpeg`] with
+    /// the most relevant line of its error output if a step fails, and
+    /// [`Error::Unsupported`] if the plan needs a libjxl tool that is missing.
     pub fn run(
         &self,
         plan: &Plan,
         cancel: &AtomicBool,
         mut on_progress: impl FnMut(RunProgress),
     ) -> Result<RunOutcome> {
+        let remove_scratch = || {
+            for path in &plan.scratch {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        // Leftovers of a crashed earlier run would make ffmpeg's `-n` refuse.
+        remove_scratch();
+
+        let total: f32 = plan.steps.iter().map(|s| s.weight.max(0.0)).sum();
+        let total = total.max(f32::EPSILON);
+        let several = plan.steps.len() > 1;
+        let mut done = 0.0_f32;
+        let mut outcome = Ok(true);
+        for step in &plan.steps {
+            let (base, share) = (done / total, step.weight.max(0.0) / total);
+            if several {
+                on_progress(RunProgress {
+                    fraction: Some(base),
+                    speed: None,
+                });
+            }
+            outcome = match step.tool {
+                Tool::Ffmpeg => self.run_ffmpeg(step, cancel, |sample| {
+                    on_progress(RunProgress {
+                        fraction: sample.fraction.map(|f| base + f * share),
+                        // Speed relative to real time only makes sense for a lone ffmpeg.
+                        speed: sample.speed.filter(|_| !several),
+                    });
+                }),
+                tool => self.run_tool(tool, step, cancel),
+            };
+            if !matches!(outcome, Ok(true)) {
+                break;
+            }
+            done += step.weight.max(0.0);
+        }
+        remove_scratch();
+
+        match outcome {
+            Ok(true) => {
+                let output_bytes = std::fs::metadata(&plan.output)
+                    .map(|meta| meta.len())
+                    .map_err(|source| Error::Io {
+                        path: plan.output.clone(),
+                        source,
+                    })?;
+                Ok(RunOutcome::Done { output_bytes })
+            }
+            Ok(false) => {
+                let _ = std::fs::remove_file(&plan.output);
+                Ok(RunOutcome::Cancelled)
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&plan.output);
+                Err(err)
+            }
+        }
+    }
+
+    fn tool_path(&self, tool: Tool) -> Result<&Path> {
+        let path = match tool {
+            Tool::Ffmpeg => Some(self.ffmpeg.as_path()),
+            Tool::Cjxl => self.jxl.cjxl.as_deref(),
+            Tool::Djxl => self.jxl.djxl.as_deref(),
+        };
+        path.ok_or_else(|| {
+            Error::unsupported(format!("{} from libjxl is not installed", tool.name()))
+        })
+    }
+
+    /// One ffmpeg step. `Ok(false)` means it was cancelled.
+    fn run_ffmpeg(
+        &self,
+        step: &Step,
+        cancel: &AtomicBool,
+        mut on_progress: impl FnMut(RunProgress),
+    ) -> Result<bool> {
         let mut cmd = base_command(&self.ffmpeg);
         cmd.args(["-hide_banner", "-nostdin", "-v", "error", "-nostats"])
             .args(["-progress", "pipe:1", "-stats_period", "0.25"])
             // Never overwrite: the output path was chosen to be free.
             .arg("-n")
-            .args(&plan.args)
+            .args(&step.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -250,19 +454,11 @@ impl Ffmpeg {
             program: self.ffmpeg.clone(),
             source,
         })?;
-
-        // Drain stderr on its own thread so a chatty ffmpeg never blocks on a full pipe.
-        let stderr = child.stderr.take().map(|mut pipe| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = pipe.read_to_end(&mut buf);
-                String::from_utf8_lossy(&buf).into_owned()
-            })
-        });
+        let stderr = drain(child.stderr.take());
 
         let mut cancelled = false;
         if let Some(stdout) = child.stdout.take() {
-            let mut sample = ProgressParser::new(plan.duration_secs);
+            let mut sample = ProgressParser::new(step.duration_secs);
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 if cancel.load(Ordering::Relaxed) {
@@ -287,25 +483,166 @@ impl Ffmpeg {
         let stderr = stderr
             .and_then(|handle| handle.join().ok())
             .unwrap_or_default();
-
         if cancelled {
-            let _ = std::fs::remove_file(&plan.output);
-            return Ok(RunOutcome::Cancelled);
+            return Ok(false);
         }
-        if !status.success() {
-            let _ = std::fs::remove_file(&plan.output);
-            return Err(Error::Ffmpeg {
-                message: friendly_error(&stderr)
-                    .unwrap_or_else(|| format!("ffmpeg stopped unexpectedly ({status})")),
-            });
-        }
-        let output_bytes = std::fs::metadata(&plan.output)
-            .map(|meta| meta.len())
-            .map_err(|source| Error::Io {
-                path: plan.output.clone(),
+        check_status(Tool::Ffmpeg, status, &stderr)?;
+        Ok(true)
+    }
+
+    /// One cjxl/djxl step, which report no progress. `Ok(false)` means it was
+    /// cancelled.
+    fn run_tool(&self, tool: Tool, step: &Step, cancel: &AtomicBool) -> Result<bool> {
+        let program = self.tool_path(tool)?;
+        let mut child = base_command(program)
+            .args(&step.args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| Error::Spawn {
+                program: program.to_path_buf(),
                 source,
             })?;
-        Ok(RunOutcome::Done { output_bytes })
+        let stderr = drain(child.stderr.take());
+        let status = loop {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(false);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(source) => {
+                    return Err(Error::Spawn {
+                        program: program.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        };
+        let stderr = stderr
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+        check_status(tool, status, &stderr)?;
+        Ok(true)
+    }
+}
+
+/// Read a child's stderr on its own thread so a chatty program never blocks
+/// on a full pipe.
+fn drain(pipe: Option<std::process::ChildStderr>) -> Option<std::thread::JoinHandle<String>> {
+    pipe.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    })
+}
+
+fn check_status(tool: Tool, status: ExitStatus, stderr: &str) -> Result<()> {
+    if status.success() {
+        return Ok(());
+    }
+    Err(Error::Ffmpeg {
+        message: friendly_error(stderr)
+            .unwrap_or_else(|| format!("{} stopped unexpectedly ({status})", tool.name())),
+    })
+}
+
+/// Size and modification time, to notice a file changed since it was decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Result<Self> {
+        let meta = std::fs::metadata(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// The last few JPEG XL files djxl decoded for previews, in a private temp
+/// folder that disappears with the last clone of [`Ffmpeg`].
+#[derive(Debug, Default)]
+struct DecodeCache {
+    dir: Option<tempfile::TempDir>,
+    entries: Vec<(PathBuf, FileStamp, PathBuf)>,
+    counter: u64,
+}
+
+impl DecodeCache {
+    const CAPACITY: usize = 4;
+
+    fn get(&self, source: &Path, stamp: &FileStamp) -> Option<PathBuf> {
+        self.entries
+            .iter()
+            .find(|(path, s, _)| path == source && s == stamp)
+            .map(|(_, _, decoded)| decoded.clone())
+    }
+
+    fn dir(&mut self) -> Result<PathBuf> {
+        if self.dir.is_none() {
+            let dir = tempfile::Builder::new()
+                .prefix("catconvert-preview-")
+                .tempdir()
+                .map_err(|source| Error::Io {
+                    path: std::env::temp_dir(),
+                    source,
+                })?;
+            self.dir = Some(dir);
+        }
+        Ok(self
+            .dir
+            .as_ref()
+            .map(|d| d.path().to_path_buf())
+            .unwrap_or_default())
+    }
+
+    fn next_id(&mut self) -> u64 {
+        self.counter += 1;
+        self.counter
+    }
+
+    fn insert(&mut self, source: PathBuf, stamp: FileStamp, decoded: PathBuf) {
+        self.entries.retain(|(path, _, old)| {
+            let keep = *path != source;
+            if !keep {
+                let _ = std::fs::remove_file(old);
+            }
+            keep
+        });
+        if self.entries.len() >= Self::CAPACITY {
+            let (_, _, old) = self.entries.remove(0);
+            let _ = std::fs::remove_file(old);
+        }
+        self.entries.push((source, stamp, decoded));
+    }
+}
+
+/// Whether a PNG file is animated: an `acTL` chunk before the first `IDAT`.
+fn is_apng(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(64 * 1024);
+    if file.take(256 * 1024).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    let find = |needle: &[u8]| head.windows(4).position(|w| w == needle);
+    match (find(b"acTL"), find(b"IDAT")) {
+        (Some(actl), Some(idat)) => actl < idat,
+        (Some(_), None) => true,
+        _ => false,
     }
 }
 
@@ -313,7 +650,7 @@ impl Ffmpeg {
 // Process helpers
 // ---------------------------------------------------------------------------
 
-fn base_command(program: &Path) -> Command {
+pub(crate) fn base_command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     cmd.stdin(Stdio::null());
     #[cfg(windows)]
@@ -350,13 +687,23 @@ fn capture(cmd: &mut Command, program: &Path) -> Result<Vec<u8>> {
     }
 }
 
-fn executable(dir: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn executable(dir: &Path, name: &str) -> Option<PathBuf> {
     let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     path.is_file().then_some(path)
 }
 
 fn sibling(binary: &Path, name: &str) -> Option<PathBuf> {
     executable(binary.parent()?, name)
+}
+
+/// Every directory on `PATH`, then common install locations.
+fn search_dirs() -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(extra_search_dirs())
+        .collect()
 }
 
 fn extra_search_dirs() -> Vec<PathBuf> {
@@ -400,9 +747,9 @@ fn parse_version(output: &str) -> String {
         .to_owned()
 }
 
-/// Encoder names from `ffmpeg -encoders`, whose rows look like
+/// Codec names from `ffmpeg -encoders` or `-decoders`, whose rows look like
 /// ` V....D libx264              libx264 H.264 / AVC ...`.
-fn parse_encoders(output: &str) -> HashSet<String> {
+fn parse_codecs(output: &str) -> HashSet<String> {
     output
         .lines()
         .filter_map(|line| {
@@ -467,6 +814,8 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
         (MediaKind::Image, Some(_), _) if format_name.contains("gif") && duration.is_some() => {
             MediaKind::Video
         }
+        // Animated JPEG XL; jxlinfo fills in the length when installed.
+        (MediaKind::Image, Some(_), _) if format_name == "jpegxl_anim" => MediaKind::Video,
         (MediaKind::Image, _, _) => MediaKind::Image,
         (_, Some(v), _) if is_still_image(v, format_name) => MediaKind::Image,
         (_, Some(_), _) => MediaKind::Video,
@@ -613,6 +962,7 @@ mod tests {
             fps: None,
             video_codec: None,
             audio_codec: None,
+            reconstructs_jpeg: false,
         }
     }
 
@@ -628,7 +978,7 @@ mod tests {
     #[test]
     fn parses_encoder_rows_only() {
         let out = "Encoders:\n V..... = Video\n A..... = Audio\n ------\n V....D libx264              libx264 H.264\n A....D aac                  AAC\n VF...D png                  PNG\n";
-        let encoders = parse_encoders(out);
+        let encoders = parse_codecs(out);
         assert!(encoders.contains("libx264"));
         assert!(encoders.contains("aac"));
         assert!(encoders.contains("png"));

@@ -21,7 +21,7 @@ impl MediaKind {
     pub fn from_extension(ext: &str) -> Self {
         match ext.to_ascii_lowercase().as_str() {
             "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "heic" | "heif" | "tif" | "tiff"
-            | "bmp" | "jxl" => Self::Image,
+            | "bmp" | "jxl" | "apng" => Self::Image,
             "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "wmv" | "mpg" | "mpeg" => Self::Video,
             "mp3" | "m4a" | "aac" | "flac" | "wav" | "ogg" | "opus" | "aiff" | "wma" => Self::Audio,
             _ => Self::Unknown,
@@ -64,6 +64,10 @@ pub struct MediaInfo {
     /// Codec name of the primary audio stream, e.g. `"aac"`.
     #[serde(default)]
     pub audio_codec: Option<String>,
+    /// JPEG XL only: the file is a losslessly recompressed JPEG, so the
+    /// original JPEG can be restored bit for bit.
+    #[serde(default)]
+    pub reconstructs_jpeg: bool,
 }
 
 impl MediaInfo {
@@ -118,14 +122,36 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         fps: None,
         video_codec: None,
         audio_codec: None,
+        reconstructs_jpeg: false,
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Write;
 
     use super::*;
+
+    /// A `MediaInfo` as the extension-only probe would make it, for unit tests.
+    pub(crate) fn sample(name: &str, kind: MediaKind) -> MediaInfo {
+        let path = PathBuf::from(name);
+        MediaInfo {
+            extension: path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase()),
+            file_name: name.into(),
+            path,
+            size_bytes: 1,
+            kind,
+            duration_secs: None,
+            width: None,
+            height: None,
+            fps: None,
+            video_codec: None,
+            audio_codec: None,
+            reconstructs_jpeg: false,
+        }
+    }
 
     fn temp_file(name: &str, contents: &[u8]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -176,6 +202,8 @@ mod tests {
         assert_eq!(MediaKind::from_extension("MOV"), MediaKind::Video);
         assert_eq!(MediaKind::from_extension("flac"), MediaKind::Audio);
         assert_eq!(MediaKind::from_extension("webp"), MediaKind::Image);
+        assert_eq!(MediaKind::from_extension("JXL"), MediaKind::Image);
+        assert_eq!(MediaKind::from_extension("apng"), MediaKind::Image);
         assert_eq!(MediaKind::from_extension("txt"), MediaKind::Unknown);
     }
 

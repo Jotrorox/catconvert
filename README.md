@@ -12,6 +12,13 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 > You can drop files, trim, resize, rotate, mirror, change frame rate, quality and
 > format, drop the sound, and watch a serial queue with live progress. Results are
 > saved next to the original and never overwrite anything.
+>
+> JPEG XL is fully supported, still and animated, when libjxl's tools are installed
+> (`brew install jpeg-xl`; found like ffmpeg, or via `CATCONVERT_LIBJXL`). You get
+> lossless or lossy encoding, an effort setting and progressive files. Unedited JPEGs
+> are repacked losslessly and can later be restored bit for bit. Videos and GIFs
+> become animated JXL, and JXL files (animated too) open like any other file. An
+> ffmpeg built with libjxl works as a fallback.
 
 ## Quick start
 
@@ -78,6 +85,8 @@ Run from anywhere in the repo with `mise run <task>` (`mise tasks` lists them).
 ```sh
 mise run cli -- probe clip.mov                       # duration, size, codecs as JSON
 mise run cli -- convert clip.mov --to gif --start 1 --end 4 --size 480
+mise run cli -- convert photo.jpg --to jxl --lossless             # repack JPEG, restorable
+mise run cli -- convert clip.mov --to jxl --size 480 --effort 9    # animated JPEG XL
 mise run cli -- convert clip.mov --to mp3            # pull the audio
 mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print the ffmpeg command
 ```

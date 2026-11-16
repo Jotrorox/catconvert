@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use catconvert_core::{
-    ConvertOptions, Error, Ffmpeg, JobId, JobTicket, MediaInfo, OutputFormat, Queue,
+    ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat, Queue,
 };
 use serde::Serialize;
 use tauri::ipc::Response;
@@ -86,6 +86,9 @@ struct FfmpegStatus {
     path: Option<PathBuf>,
     error: Option<String>,
     formats: Vec<FormatSupport>,
+    /// Version of libjxl's tools, if `cjxl` was found.
+    libjxl: Option<String>,
+    jxl: JxlSupport,
 }
 
 fn status_of(state: &AppState) -> FfmpegStatus {
@@ -103,6 +106,8 @@ fn status_of(state: &AppState) -> FfmpegStatus {
         path: ffmpeg.as_ref().map(|f| f.ffmpeg_path().to_path_buf()),
         error: state.queue().err(),
         formats,
+        libjxl: ffmpeg.as_ref().and_then(|f| f.jxl_tools().version.clone()),
+        jxl: ffmpeg.as_ref().map(Ffmpeg::jxl_support).unwrap_or_default(),
     }
 }
 
@@ -166,11 +171,16 @@ async fn waveform(
     Ok(Response::new(bytes))
 }
 
-/// The ffmpeg command a conversion would run, for the "show command" panel.
+/// The command(s) a conversion would run, for the "show command" panel.
 #[tauri::command]
-fn preview_command(info: MediaInfo, options: ConvertOptions) -> Result<String, String> {
+fn preview_command(
+    state: State<'_, AppState>,
+    info: MediaInfo,
+    options: ConvertOptions,
+) -> Result<String, String> {
+    let jxl = state.ffmpeg().map(|f| f.jxl_support()).unwrap_or_default();
     let output = catconvert_core::output_path(&info.path, options.format, |_| false);
-    catconvert_core::plan(&info, &options, &output)
+    catconvert_core::plan(&info, &options, &output, jxl)
         .map(|plan| plan.command_line())
         .map_err(|err| err.to_string())
 }

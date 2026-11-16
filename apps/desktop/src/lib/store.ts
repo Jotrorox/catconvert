@@ -149,6 +149,8 @@ export async function refreshFfmpeg(relocate = false) {
       path: null,
       error: String(error),
       formats: [],
+      libjxl: null,
+      jxl: api.NO_JXL,
     };
     setState("ffmpeg", status);
     return status;

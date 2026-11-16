@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use catconvert_core::{ConvertOptions, Ffmpeg, OutputFormat, RunOutcome};
+use catconvert_core::{ConvertOptions, Ffmpeg, JxlOptions, OutputFormat, RunOutcome};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -28,7 +28,8 @@ enum Command {
         #[arg(long)]
         compact: bool,
     },
-    /// Convert a file with ffmpeg. The result is written next to the input.
+    /// Convert a file with ffmpeg (and libjxl's tools for JPEG XL). The result
+    /// is written next to the input.
     Convert {
         /// File to convert.
         file: PathBuf,
@@ -59,7 +60,17 @@ enum Command {
         /// Drop the audio track.
         #[arg(long)]
         mute: bool,
-        /// Print the ffmpeg command instead of running it.
+        /// JPEG XL: mathematically lossless (an unedited JPEG is recompressed
+        /// losslessly and can be restored bit for bit).
+        #[arg(long)]
+        lossless: bool,
+        /// JPEG XL: encoder effort, 1 (fast) to 10 (smallest).
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(1..=10))]
+        effort: u8,
+        /// JPEG XL: progressive decoding.
+        #[arg(long)]
+        progressive: bool,
+        /// Print the command(s) instead of running them.
         #[arg(long)]
         dry_run: bool,
     },
@@ -82,6 +93,7 @@ enum Format {
     Jpg,
     Webp,
     Avif,
+    Jxl,
 }
 
 impl From<Format> for OutputFormat {
@@ -101,21 +113,20 @@ impl From<Format> for OutputFormat {
             Format::Jpg => Self::Jpg,
             Format::Webp => Self::Webp,
             Format::Avif => Self::Avif,
+            Format::Jxl => Self::Jxl,
         }
     }
 }
 
 fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<(), String> {
     let ffmpeg = Ffmpeg::locate().map_err(|e| e.to_string())?;
-    if !ffmpeg.supports(options.format) {
-        return Err(format!(
-            "this ffmpeg lacks the {} encoder",
-            options.format.encoder()
-        ));
+    if let Some(reason) = ffmpeg.missing(options.format) {
+        return Err(reason);
     }
     let info = ffmpeg.probe(file).map_err(|e| e.to_string())?;
     let output = catconvert_core::output_path(&info.path, options.format, |_| false);
-    let plan = catconvert_core::plan(&info, options, &output).map_err(|e| e.to_string())?;
+    let plan = catconvert_core::plan(&info, options, &output, ffmpeg.jxl_support())
+        .map_err(|e| e.to_string())?;
     if dry_run {
         println!("{}", plan.command_line());
         return Ok(());
@@ -177,6 +188,9 @@ fn main() -> ExitCode {
             flip,
             quality,
             mute,
+            lossless,
+            effort,
+            progressive,
             dry_run,
         } => {
             let options = ConvertOptions {
@@ -189,6 +203,11 @@ fn main() -> ExitCode {
                 flip,
                 quality,
                 keep_audio: !mute,
+                jxl: JxlOptions {
+                    lossless,
+                    effort,
+                    progressive,
+                },
             };
             match convert(&file, &options, dry_run) {
                 Ok(()) => ExitCode::SUCCESS,

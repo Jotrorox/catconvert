@@ -19,12 +19,13 @@ vi.mock("./lib/api", () => ({
   revealInFolder: vi.fn(async () => {}),
   onJobProgress: vi.fn(),
   onFileDrop: vi.fn(),
+  NO_JXL: {},
 }));
 
 const ALL: OutputFormat[] = [
   ...["mp4", "webm", "mov", "mkv", "gif"],
   ...["mp3", "m4a", "wav", "flac", "ogg"],
-  ...["png", "jpg", "webp", "avif"],
+  ...["png", "jpg", "webp", "avif", "jxl"],
 ] as OutputFormat[];
 
 function status(found = true): FfmpegStatus {
@@ -34,6 +35,15 @@ function status(found = true): FfmpegStatus {
     path: found ? "/opt/homebrew/bin/ffmpeg" : null,
     error: found ? null : "ffmpeg was not found",
     formats: ALL.map((format) => ({ format, available: found && format !== "webp" })),
+    libjxl: found ? "0.13.0" : null,
+    jxl: {
+      cjxl: found,
+      djxl: found,
+      ffmpegEncoder: false,
+      ffmpegAnimEncoder: false,
+      ffmpegDecoder: false,
+      ffmpegAnimDecoder: false,
+    },
   };
 }
 
@@ -49,6 +59,30 @@ const VIDEO: MediaInfo = {
   fps: 30,
   videoCodec: "h264",
   audioCodec: "aac",
+  reconstructsJpeg: false,
+};
+
+const PHOTO: MediaInfo = {
+  ...VIDEO,
+  path: "/photos/cat.jpg",
+  fileName: "cat.jpg",
+  extension: "jpg",
+  kind: "image",
+  durationSecs: null,
+  width: 4032,
+  height: 3024,
+  fps: null,
+  videoCodec: "mjpeg",
+  audioCodec: null,
+};
+
+const PACKED: MediaInfo = {
+  ...PHOTO,
+  path: "/photos/cat.jxl",
+  fileName: "cat.jxl",
+  extension: "jxl",
+  videoCodec: "jpegxl",
+  reconstructsJpeg: true,
 };
 
 const SONG: MediaInfo = {
@@ -69,7 +103,13 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.ffmpegStatus).mockResolvedValue(status());
   vi.mocked(api.probeFile).mockImplementation(async (path) =>
-    path.endsWith(".wav") ? SONG : { ...VIDEO, path, fileName: path.split("/").pop() ?? path },
+    path.endsWith(".wav")
+      ? SONG
+      : path.endsWith(".jpg")
+        ? PHOTO
+        : path.endsWith(".jxl")
+          ? PACKED
+          : { ...VIDEO, path, fileName: path.split("/").pop() ?? path },
   );
   vi.mocked(api.startJob).mockImplementation(async (path, options) => ({
     id: 7,
@@ -143,6 +183,7 @@ describe("CatConvert", () => {
       flip: false,
       quality: 60,
       keepAudio: false,
+      jxl: { lossless: false, effort: 7, progressive: false },
     });
 
     applyProgress({
@@ -225,6 +266,66 @@ describe("CatConvert", () => {
     expect(screen.getByRole("button", { name: "GIF" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("combobox", { name: "Size" })).toHaveValue("480");
     expect(screen.queryByRole("switch", { name: "Keep sound" })).not.toBeInTheDocument();
+  });
+
+  it("repacks a JPEG into lossless JPEG XL with libjxl settings", async () => {
+    render(() => <App />);
+    await screen.findByText("ffmpeg 7.1");
+    expect(screen.queryByText(/libjxl 0.13.0/)).not.toBeInTheDocument();
+    openPaths([PHOTO.path]);
+    await screen.findByRole("heading", { name: "cat.jpg" });
+
+    fireEvent.click(screen.getByRole("button", { name: "JXL" }));
+    // JPEG input starts lossless: the JPEG is repacked, so quality is moot.
+    expect(screen.getByRole("switch", { name: "Lossless" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByText(/Repacks the JPEG without re-encoding/)).toBeInTheDocument();
+    expect(screen.queryByRole("slider", { name: "Quality" })).not.toBeInTheDocument();
+
+    // Turning it makes it an ordinary lossless encode.
+    fireEvent.click(screen.getByRole("button", { name: "Rotate 90°" }));
+    expect(screen.getByText(/every pixel and sample stays put/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("switch", { name: "Lossless" }));
+    expect(screen.getByRole("slider", { name: "Quality" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Thorough" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Progressive" }));
+    expect(screen.getByText("cat.jxl")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      PHOTO.path,
+      expect.objectContaining({
+        format: "jxl",
+        rotate: 90,
+        jxl: { lossless: false, effort: 9, progressive: true },
+      }),
+    );
+  });
+
+  it("turns a video into an animated JPEG XL with auto limits", async () => {
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "JXL" }));
+    expect(screen.getByRole("combobox", { name: "Size" })).toHaveDisplayValue("Auto (720p)");
+    expect(screen.queryByRole("switch", { name: "Keep sound" })).not.toBeInTheDocument();
+    const changes = within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "720p",
+      "Animated",
+    ]);
+  });
+
+  it("restores the original JPEG from a repacked JPEG XL", async () => {
+    render(() => <App />);
+    await screen.findByText("ffmpeg 7.1");
+    openPaths([PACKED.path]);
+    await screen.findByRole("heading", { name: "cat.jxl" });
+    expect(screen.getByText(/4032×3024 · JPEG XL/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "JPG" }));
+    expect(screen.getByText("Restores the original JPEG, bit for bit.")).toBeInTheDocument();
   });
 
   it("offers only sound formats and no picture tools for audio", async () => {

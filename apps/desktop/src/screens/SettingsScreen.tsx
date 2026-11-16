@@ -56,6 +56,19 @@ export const SettingsScreen: Component = () => {
           >
             <h2 class="label-strong">ffmpeg {state.ffmpeg?.version}</h2>
             <p class="item-meta mono path">{state.ffmpeg?.path}</p>
+            <p class="item-meta">
+              <Show
+                when={state.ffmpeg?.libjxl}
+                fallback={
+                  <>
+                    JPEG XL tools not found. For the full JPEG XL kit (animations, lossless JPEG
+                    repacking) install libjxl: <code class="mono">brew install jpeg-xl</code>
+                  </>
+                }
+              >
+                {(version) => <>JPEG XL: libjxl {version()} (cjxl, djxl)</>}
+              </Show>
+            </p>
           </Show>
           <button
             type="button"
@@ -94,7 +107,8 @@ export const SettingsScreen: Component = () => {
             </For>
           </div>
           <p class="item-meta settings-note">
-            Greyed-out formats need an ffmpeg built with more encoders.
+            Greyed-out formats need an ffmpeg built with more encoders. JXL works with libjxl's
+            tools or an ffmpeg built with libjxl.
           </p>
         </section>
       </Show>

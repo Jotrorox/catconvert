@@ -14,6 +14,7 @@ const clip: MediaInfo = {
   fps: 24,
   videoCodec: "h264",
   audioCodec: "aac",
+  reconstructsJpeg: false,
 };
 
 const all = () => true;

@@ -1705,6 +1705,26 @@ button.format-chip:not(:disabled):active {
   font-weight: 600;
 }
 
+/* JPEG XL */
+
+.jxl-settings {
+  display: grid;
+  gap: 16px;
+  padding: 14px;
+  border-radius: 16px;
+  background: var(--lavender-bg);
+}
+
+.jxl-settings .format-chips {
+  --tone-bg: var(--surface);
+  --tone-ink: var(--lavender-ink);
+  margin-bottom: 6px;
+}
+
+.jxl-settings .item-meta {
+  display: block;
+}
+
 /* Toggle */
 
 .toggle-row {

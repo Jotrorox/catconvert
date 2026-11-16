@@ -87,7 +87,7 @@ pub struct JobTicket {
     pub output: PathBuf,
     /// The probed input.
     pub input: MediaInfo,
-    /// The exact command that will run.
+    /// The exact command(s) that will run.
     pub command: String,
 }
 
@@ -162,24 +162,18 @@ impl Queue {
     /// # Errors
     ///
     /// Probe errors, [`Error::Unsupported`] if the options do not fit the input
-    /// or this ffmpeg lacks the encoder for the format.
+    /// or the tools to write the format are missing.
     pub fn submit(&self, input: impl AsRef<Path>, options: &ConvertOptions) -> Result<JobTicket> {
         let ffmpeg = &self.shared.ffmpeg;
-        if !ffmpeg.supports(options.format) {
-            return Err(Error::Unsupported {
-                message: format!(
-                    "this ffmpeg can't write {} (missing the {} encoder)",
-                    options.format.extension().to_uppercase(),
-                    options.format.encoder()
-                ),
-            });
+        if let Some(message) = ffmpeg.missing(options.format) {
+            return Err(Error::Unsupported { message });
         }
         let info = ffmpeg.probe(input)?;
 
         let (plan, id, cancel) = {
             let mut reserved = lock(&self.shared.reserved);
             let output = convert::output_path(&info.path, options.format, |p| reserved.contains(p));
-            let plan = convert::plan(&info, options, &output)?;
+            let plan = convert::plan(&info, options, &output, ffmpeg.jxl_support())?;
             reserved.insert(output);
             (plan, JobId::next(), Arc::new(AtomicBool::new(false)))
         };
@@ -384,5 +378,141 @@ mod tests {
             .expect("waveform");
         assert_eq!(&wave[1..4], b"PNG");
         assert!(ffmpeg.waveform(&input, 200, 40, "red;rm").is_err());
+    }
+
+    /// Wait for the final event of `id`.
+    fn finish_of(rx: &mpsc::Receiver<JobProgress>, id: JobId) -> JobProgress {
+        loop {
+            let event = rx.recv_timeout(Duration::from_secs(120)).expect("event");
+            if event.job_id == id && event.stage.is_final() {
+                return event;
+            }
+        }
+    }
+
+    /// Real JPEG XL round trips through cjxl/djxl. Skipped (passes) when
+    /// ffmpeg or the libjxl tools are not installed.
+    #[test]
+    fn jpeg_xl_end_to_end() {
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping JPEG XL test");
+            return;
+        };
+        let tools = ffmpeg.jxl_tools();
+        if tools.cjxl.is_none() || tools.djxl.is_none() || tools.jxlinfo.is_none() {
+            eprintln!("libjxl tools not found; skipping JPEG XL test");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let make = |args: &[&str], out: &Path| {
+            let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+                .args(["-v", "error", "-f", "lavfi", "-i"])
+                .args(args)
+                .arg(out)
+                .status()
+                .expect("run ffmpeg");
+            assert!(status.success());
+        };
+        let jpeg = dir.path().join("photo.jpg");
+        make(
+            &["testsrc2=s=320x240:d=1", "-frames:v", "1", "-q:v", "3"],
+            &jpeg,
+        );
+        let clip = dir.path().join("clip.mov");
+        make(&["testsrc2=s=320x240:d=2:r=10", "-c:v", "mjpeg"], &clip);
+
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let lossless = ConvertOptions {
+            format: OutputFormat::Jxl,
+            jxl: crate::JxlOptions {
+                lossless: true,
+                ..crate::JxlOptions::default()
+            },
+            ..ConvertOptions::default()
+        };
+
+        // JPEG → JXL losslessly, then back to the identical JPEG.
+        let ticket = queue.submit(&jpeg, &lossless).expect("submit");
+        assert!(ticket.command.starts_with("cjxl "), "{}", ticket.command);
+        assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
+        let jxl = ffmpeg.probe(&ticket.output).expect("probe jxl");
+        assert_eq!(jxl.kind, crate::MediaKind::Image);
+        assert_eq!((jxl.width, jxl.height), (Some(320), Some(240)));
+        assert!(jxl.reconstructs_jpeg);
+        assert!(jxl.size_bytes < std::fs::metadata(&jpeg).expect("meta").len());
+
+        let back = queue
+            .submit(
+                &ticket.output,
+                &ConvertOptions {
+                    format: OutputFormat::Jpg,
+                    ..ConvertOptions::default()
+                },
+            )
+            .expect("submit");
+        assert!(
+            back.command.contains("--reconstruct_jpeg"),
+            "{}",
+            back.command
+        );
+        assert_eq!(finish_of(&rx, back.id).stage, JobStage::Done);
+        assert_eq!(
+            std::fs::read(&back.output).expect("read"),
+            std::fs::read(&jpeg).expect("read"),
+            "restored JPEG is bit-identical"
+        );
+
+        // Edited still: ffmpeg → PNG → cjxl, scratch file cleaned up.
+        let turned = ConvertOptions {
+            format: OutputFormat::Jxl,
+            rotate: 90,
+            ..ConvertOptions::default()
+        };
+        let ticket = queue.submit(&jpeg, &turned).expect("submit");
+        assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
+        let out = ffmpeg.probe(&ticket.output).expect("probe");
+        assert_eq!((out.width, out.height), (Some(240), Some(320)));
+
+        // Video → animated JXL.
+        let animated = ConvertOptions {
+            format: OutputFormat::Jxl,
+            trim_start: Some(0.5),
+            max_size: Some(120),
+            ..ConvertOptions::default()
+        };
+        let ticket = queue.submit(&clip, &animated).expect("submit");
+        let done = finish_of(&rx, ticket.id);
+        assert_eq!(done.stage, JobStage::Done, "{done:?}");
+        let anim = ffmpeg.probe(&ticket.output).expect("probe animation");
+        assert_eq!(anim.kind, crate::MediaKind::Video);
+        assert_eq!((anim.width, anim.height), (Some(160), Some(120)));
+        let secs = anim.duration_secs.expect("duration");
+        assert!((secs - 1.5).abs() < 0.15, "{secs}");
+        assert!((anim.fps.expect("fps") - 10.0).abs() < 0.5);
+
+        // Animated JXL → trimmed GIF via djxl, and previews of it.
+        let gif = ConvertOptions {
+            format: OutputFormat::Gif,
+            trim_end: Some(1.0),
+            ..ConvertOptions::default()
+        };
+        let ticket2 = queue.submit(&ticket.output, &gif).expect("submit");
+        assert_eq!(finish_of(&rx, ticket2.id).stage, JobStage::Done);
+        let back = ffmpeg.probe(&ticket2.output).expect("probe gif");
+        assert_eq!(back.kind, crate::MediaKind::Video);
+        assert!((back.duration_secs.expect("duration") - 1.0).abs() < 0.15);
+        let frame = ffmpeg.frame(&ticket.output, 0.8, 90).expect("frame");
+        assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
+
+        // No scratch files left behind.
+        let hidden: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(hidden.is_empty(), "{hidden:?}");
     }
 }

@@ -32,6 +32,8 @@ export type MediaInfo = {
   fps: number | null;
   videoCodec: string | null;
   audioCodec: string | null;
+  /** JPEG XL only: a losslessly recompressed JPEG whose original can be restored. */
+  reconstructsJpeg: boolean;
 };
 
 export type OutputFormat =
@@ -48,9 +50,30 @@ export type OutputFormat =
   | "png"
   | "jpg"
   | "webp"
-  | "avif";
+  | "avif"
+  | "jxl";
 
 export type Rotation = 0 | 90 | 180 | 270;
+
+/** Settings that only matter when writing JPEG XL. */
+export type JxlOptions = {
+  /** Mathematically lossless; an unedited JPEG is recompressed and can be restored exactly. */
+  lossless: boolean;
+  /** 1 (fast) to 10 (slow, smallest). */
+  effort: number;
+  /** Sharp preview early while the file loads. */
+  progressive: boolean;
+};
+
+/** Which JPEG XL code paths are installed. */
+export type JxlSupport = {
+  cjxl: boolean;
+  djxl: boolean;
+  ffmpegEncoder: boolean;
+  ffmpegAnimEncoder: boolean;
+  ffmpegDecoder: boolean;
+  ffmpegAnimDecoder: boolean;
+};
 
 export type ConvertOptions = {
   format: OutputFormat;
@@ -64,6 +87,7 @@ export type ConvertOptions = {
   /** 0 = smallest file, 100 = best quality. */
   quality: number;
   keepAudio: boolean;
+  jxl: JxlOptions;
 };
 
 export type JobId = number;
@@ -93,6 +117,18 @@ export type FfmpegStatus = {
   path: string | null;
   error: string | null;
   formats: { format: OutputFormat; available: boolean }[];
+  /** Version of libjxl's cjxl/djxl, if installed. */
+  libjxl: string | null;
+  jxl: JxlSupport;
+};
+
+export const NO_JXL: JxlSupport = {
+  cjxl: false,
+  djxl: false,
+  ffmpegEncoder: false,
+  ffmpegAnimEncoder: false,
+  ffmpegDecoder: false,
+  ffmpegAnimDecoder: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -150,6 +186,8 @@ export async function ffmpegStatus(): Promise<FfmpegStatus> {
       path: null,
       error: "Open CatConvert as an app to convert files.",
       formats: [],
+      libjxl: null,
+      jxl: NO_JXL,
     };
   }
   return command("ffmpeg_status", {});
@@ -180,7 +218,7 @@ export async function waveform(
   return blobUrl(await command("waveform", { path, width, height, color }), "image/png");
 }
 
-/** The ffmpeg command a conversion would run. */
+/** The command(s) a conversion would run. */
 export function previewCommand(info: MediaInfo, options: ConvertOptions): Promise<string> {
   return command("preview_command", { info, options });
 }
@@ -207,9 +245,9 @@ export async function pickFiles(): Promise<string[]> {
       {
         name: "Media",
         extensions: [
-          ...["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpg", "mpeg", "gif"],
+          ...["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpg", "mpeg", "gif", "apng"],
           ...["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "aiff", "wma"],
-          ...["jpg", "jpeg", "png", "webp", "avif", "heic", "heif", "tif", "tiff", "bmp"],
+          ...["jpg", "jpeg", "png", "webp", "avif", "jxl", "heic", "heif", "tif", "tiff", "bmp"],
         ],
       },
     ],

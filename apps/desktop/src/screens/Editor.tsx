@@ -15,11 +15,16 @@ import { TrimBar } from "../components/TrimBar";
 import { type ConvertOptions, type MediaInfo, previewCommand } from "../lib/api";
 import { baseName, formatBytes, formatClock, formatSpan, parseClock } from "../lib/format";
 import {
+  autoLimits,
   formatKind,
   fpsChoices,
   groupsFor,
-  LOSSLESS,
+  isAnimatedImage,
+  isLossless,
+  JXL_EFFORTS,
   label,
+  repacksJpeg,
+  restoresJpeg,
   shortSide,
   sizeChoices,
   sizeLabel,
@@ -42,7 +47,8 @@ function describe(info: MediaInfo): string {
   const parts: string[] = [];
   if (info.width && info.height) parts.push(`${info.width}×${info.height}`);
   if (info.durationSecs) parts.push(formatClock(info.durationSecs));
-  if (info.videoCodec && info.kind === "video") parts.push(info.videoCodec.toUpperCase());
+  if (info.videoCodec?.startsWith("jpegxl")) parts.push("JPEG XL");
+  else if (info.videoCodec && info.kind === "video") parts.push(info.videoCodec.toUpperCase());
   else if (info.audioCodec && info.kind === "audio") parts.push(info.audioCodec.toUpperCase());
   parts.push(formatBytes(info.sizeBytes));
   return parts.join(" · ");
@@ -90,7 +96,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   // `draft` is a store proxy, so these stay reactive to option changes.
   const info = () => props.draft.info;
   const options = () => props.draft.options;
-  const outKind = () => formatKind(options().format);
+  const outKind = () => formatKind(options().format, info().kind);
   const duration = () => info().durationSecs;
   const timed = () => info().kind !== "image" && outKind() !== "image" && (duration() ?? 0) > 0;
   const visual = () => info().kind !== "audio" && outKind() !== "audio";
@@ -179,30 +185,50 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     QUALITY_STEPS[options().quality < 34 ? 0 : options().quality > 66 ? 2 : 1];
   const sizes = createMemo(() => sizeChoices(info()));
   const rates = createMemo(() => fpsChoices(info()));
-  const isGif = () => options().format === "gif";
-  const canKeepAudio = () => info().audioCodec !== null && outKind() === "video" && !isGif();
+  const isJxl = () => options().format === "jxl";
+  const animatedImage = () => isAnimatedImage(options().format, info().kind);
+  const auto = () => autoLimits(options().format, info().kind);
+  const autoSize = () => {
+    const limit = auto()?.size;
+    return limit !== undefined && (shortSide(info()) ?? 0) > limit ? limit : null;
+  };
+  const autoFps = () => {
+    const limit = auto()?.fps;
+    return limit !== undefined && (info().fps ?? 30) > limit + 0.01 ? limit : null;
+  };
+  const canKeepAudio = () =>
+    info().audioCodec !== null && outKind() === "video" && !animatedImage();
+  const restoring = () => restoresJpeg(info(), options());
+  const repacking = () => repacksJpeg(info(), options());
+  const lossless = () => isLossless(options()) || restoring();
+  const setJxl = (patch: Partial<ConvertOptions["jxl"]>) =>
+    updateOptions({ jxl: { ...options().jxl, ...patch } });
+  const unavailableReason = (format: ConvertOptions["format"]) =>
+    format === "jxl"
+      ? "Install libjxl (brew install jpeg-xl) or an ffmpeg with libjxl to write JXL"
+      : `Your ffmpeg can't write ${label(format)}`;
   const ready = () => state.ffmpeg?.found === true && isAvailable(options().format);
 
   const summary = createMemo(() => {
     const o = options();
     const items: {
-      icon: "scissors" | "image" | "rotate" | "flip" | "music" | "clock";
+      icon: "scissors" | "image" | "rotate" | "flip" | "music" | "clock" | "sparkle";
       text: string;
     }[] = [];
     if (timed() && trimmed()) {
       items.push({ icon: "scissors", text: `Keeps ${formatSpan(trimEnd() - trimStart())}` });
     }
     if (visual()) {
-      const autoGif = isGif() && o.maxSize === null && (shortSide(info()) ?? 0) > 480;
-      if (o.maxSize !== null || autoGif) {
-        items.push({ icon: "image", text: sizeLabel(o.maxSize ?? 480, outKind()) });
-      }
+      const size = o.maxSize ?? autoSize();
+      if (size !== null) items.push({ icon: "image", text: sizeLabel(size, outKind()) });
       if (o.rotate) items.push({ icon: "rotate", text: `Turned ${o.rotate}°` });
       if (o.flip) items.push({ icon: "flip", text: "Mirrored" });
-      if (outKind() === "video" && o.fps !== null)
-        items.push({ icon: "clock", text: `${o.fps} fps` });
+      const fps = o.fps ?? (outKind() === "video" ? autoFps() : null);
+      if (outKind() === "video" && fps !== null) items.push({ icon: "clock", text: `${fps} fps` });
     }
     if (canKeepAudio() && !o.keepAudio) items.push({ icon: "music", text: "No sound" });
+    if (isJxl() && info().kind === "video") items.push({ icon: "sparkle", text: "Animated" });
+    if (isJxl() && o.jxl.lossless) items.push({ icon: "sparkle", text: "Lossless" });
     return items;
   });
 
@@ -415,11 +441,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                             class="format-chip"
                             aria-pressed={options().format === format}
                             disabled={!isAvailable(format)}
-                            title={
-                              isAvailable(format)
-                                ? undefined
-                                : `Your ffmpeg can't write ${label(format)}`
-                            }
+                            title={isAvailable(format) ? undefined : unavailableReason(format)}
                             onClick={() => updateOptions({ format })}
                           >
                             {label(format)}
@@ -434,10 +456,15 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
           </fieldset>
 
           <Show
-            when={!LOSSLESS.has(options().format)}
+            when={!lossless()}
             fallback={
               <p class="lossless-note">
-                <Icon name="sparkle" size={16} /> Lossless: every pixel and sample stays put.
+                <Icon name="sparkle" size={16} />
+                {restoring()
+                  ? "Restores the original JPEG, bit for bit."
+                  : repacking()
+                    ? "Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly."
+                    : "Lossless: every pixel and sample stays put."}
               </p>
             }
           >
@@ -476,8 +503,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                     }}
                   >
                     <option value="" selected={options().maxSize === null}>
-                      {isGif() && (shortSide(info()) ?? 0) > 480
-                        ? "Auto (480p)"
+                      {autoSize() !== null
+                        ? `Auto (${sizeLabel(autoSize() ?? 0, outKind())})`
                         : `Original (${sizeLabel(shortSide(info()) ?? 0, info().kind)})`}
                     </option>
                     <For each={sizes()}>
@@ -501,8 +528,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                     }}
                   >
                     <option value="" selected={options().fps === null}>
-                      {isGif() && (info().fps ?? 30) > 15
-                        ? "Auto (15)"
+                      {autoFps() !== null
+                        ? `Auto (${autoFps()})`
                         : `Keep${info().fps ? ` (${Math.round(info().fps ?? 0)})` : ""}`}
                     </option>
                     <For each={rates()}>
@@ -537,6 +564,65 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
             </div>
           </Show>
 
+          <Show when={isJxl()}>
+            <div class="jxl-settings">
+              <div class="toggle-row">
+                <div>
+                  <span class="toggle-title" id="jxl-lossless">
+                    Lossless
+                  </span>
+                  <span class="item-meta">
+                    {info().extension === "jpg" || info().extension === "jpeg"
+                      ? "Repack the JPEG exactly, about 20% smaller"
+                      : "Keep every pixel exactly"}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  class="switch"
+                  role="switch"
+                  aria-checked={options().jxl.lossless}
+                  aria-labelledby="jxl-lossless"
+                  onClick={() => setJxl({ lossless: !options().jxl.lossless })}
+                />
+              </div>
+              <fieldset class="field">
+                <legend class="field-label">Effort</legend>
+                <div class="format-chips">
+                  <For each={JXL_EFFORTS}>
+                    {(preset) => (
+                      <button
+                        type="button"
+                        class="format-chip"
+                        aria-pressed={options().jxl.effort === preset.effort}
+                        onClick={() => setJxl({ effort: preset.effort })}
+                      >
+                        {preset.label}
+                      </button>
+                    )}
+                  </For>
+                </div>
+                <span class="item-meta">More effort: smaller file, slower to make.</span>
+              </fieldset>
+              <div class="toggle-row">
+                <div>
+                  <span class="toggle-title" id="jxl-progressive">
+                    Progressive
+                  </span>
+                  <span class="item-meta">Shows a sharp preview while it loads</span>
+                </div>
+                <button
+                  type="button"
+                  class="switch"
+                  role="switch"
+                  aria-checked={options().jxl.progressive}
+                  aria-labelledby="jxl-progressive"
+                  onClick={() => setJxl({ progressive: !options().jxl.progressive })}
+                />
+              </div>
+            </div>
+          </Show>
+
           <div class="outcome">
             <div class="outcome-name">
               <Icon name="arrow-right" size={18} />
@@ -566,7 +652,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
             onToggle={(e) => setShowCommand(e.currentTarget.open)}
           >
             <summary>
-              <Icon name="terminal" size={16} /> Show ffmpeg command
+              <Icon name="terminal" size={16} /> Show command
             </summary>
             <pre class="command-text">
               <code>{command() || "…"}</code>
