@@ -56,18 +56,18 @@ wrappers in `apps/desktop/src/lib/api.ts`.
 
 Run from anywhere in the repo with `mise run <task>` (`mise tasks` lists them).
 
-| Task        | What it does                                                              |
-| ----------- | ------------------------------------------------------------------------- |
-| `setup`     | `pnpm install` (frozen lockfile in CI)                                    |
-| `dev`       | Run the desktop app in dev mode (hot reload)                              |
-| `build`     | Production desktop bundle for the current OS (`target/release/bundle/`)   |
-| `cli`       | Run the CLI: `mise run cli -- probe photo.jpg`                            |
-| `fmt`       | `cargo fmt` + `biome format`                                              |
-| `fmt-check` | Formatting check without writing                                          |
-| `lint`      | `cargo clippy -D warnings`, `biome check`, `tsc --noEmit`, `actionlint`   |
-| `test`      | `cargo test --workspace` + `vitest run`                                   |
-| `check`     | `fmt-check` + `lint` + `test` (what CI runs)                              |
-| `release`   | `mise run release 0.2.0`: bump versions, commit, tag `v0.2.0` (no push)   |
+| Task        | What it does                                                            |
+| ----------- | ----------------------------------------------------------------------- |
+| `setup`     | `pnpm install` (frozen lockfile in CI)                                  |
+| `dev`       | Run the desktop app in dev mode (hot reload)                            |
+| `build`     | Production desktop bundle for the current OS (`target/release/bundle/`) |
+| `cli`       | Run the CLI: `mise run cli -- probe photo.jpg`                          |
+| `fmt`       | `cargo fmt` + `biome format`                                            |
+| `fmt-check` | Formatting check without writing                                        |
+| `lint`      | `cargo clippy -D warnings`, `biome check`, `tsc --noEmit`, `actionlint` |
+| `test`      | `cargo test --workspace` + `vitest run`                                 |
+| `check`     | `fmt-check` + `lint` + `test` (what CI runs)                            |
+| `release`   | `mise run release 0.2.0`: bump versions, commit, tag `v0.2.0` (no push) |
 
 ## CLI
 
@@ -103,18 +103,18 @@ git push origin main --follow-tags
 ### Signing (optional)
 
 Without these secrets, releases are built unsigned. Add them under
-*Settings → Secrets and variables → Actions*:
+_Settings → Secrets and variables → Actions_:
 
-| Secret                         | Purpose                                                        |
-| ------------------------------ | -------------------------------------------------------------- |
-| `APPLE_CERTIFICATE`            | Base64 of the exported "Developer ID Application" `.p12`       |
-| `APPLE_CERTIFICATE_PASSWORD`   | Password of that `.p12`                                        |
-| `APPLE_SIGNING_IDENTITY`       | e.g. `Developer ID Application: Your Name (TEAMID)`            |
-| `APPLE_ID`                     | Apple ID email used for notarization                           |
-| `APPLE_PASSWORD`               | App-specific password for that Apple ID                        |
-| `APPLE_TEAM_ID`                | 10-character team ID                                           |
-| `WINDOWS_CERTIFICATE`          | Base64 of a code-signing `.pfx`                                |
-| `WINDOWS_CERTIFICATE_PASSWORD` | Password of that `.pfx`                                        |
+| Secret                         | Purpose                                                  |
+| ------------------------------ | -------------------------------------------------------- |
+| `APPLE_CERTIFICATE`            | Base64 of the exported "Developer ID Application" `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD`   | Password of that `.p12`                                  |
+| `APPLE_SIGNING_IDENTITY`       | e.g. `Developer ID Application: Your Name (TEAMID)`      |
+| `APPLE_ID`                     | Apple ID email used for notarization                     |
+| `APPLE_PASSWORD`               | App-specific password for that Apple ID                  |
+| `APPLE_TEAM_ID`                | 10-character team ID                                     |
+| `WINDOWS_CERTIFICATE`          | Base64 of a code-signing `.pfx`                          |
+| `WINDOWS_CERTIFICATE_PASSWORD` | Password of that `.pfx`                                  |
 
 macOS signing needs the first three; notarization additionally needs the Apple
 ID trio. See [Tauri: macOS code signing](https://v2.tauri.app/distribute/sign/macos/)
