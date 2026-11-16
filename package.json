@@ -1,6 +1,6 @@
 {
   "name": "catconvert",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Offline photo, video and audio converter",
   "license": "BSD-3-Clause",

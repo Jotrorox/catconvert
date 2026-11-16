@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "catconvert-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "catconvert-core",
  "clap",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "catconvert-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "catconvert-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "catconvert-core",
  "serde",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "catconvert-ffi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "catconvert-core",
  "tempfile",
