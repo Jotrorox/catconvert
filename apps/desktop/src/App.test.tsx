@@ -22,11 +22,20 @@ vi.mock("./lib/api", () => ({
     if (options.format === "gif") return { audio: null, video: null };
     const q = options.quality;
     const kbps = q < 34 ? 96 : q < 67 ? 128 : 192;
+    const hardware = { hardware: false, hardwareQuality: null };
     return {
       audio: info.audioCodec ? { mode: "bitrate", kbps } : null,
-      video: options.videoBitrate
-        ? { codec: "h264", crf: null, kbps: options.videoBitrate, passes: 2 }
-        : { codec: "h264", crf: Math.round(34 - (16 * q) / 100), kbps: null, passes: 1 },
+      video: options.hardware
+        ? { codec: "h265", crf: null, kbps: null, passes: 1, hardware: true, hardwareQuality: 64 }
+        : options.videoBitrate
+          ? { codec: "h264", crf: null, kbps: options.videoBitrate, passes: 2, ...hardware }
+          : {
+              codec: "h264",
+              crf: Math.round(34 - (16 * q) / 100),
+              kbps: null,
+              passes: 1,
+              ...hardware,
+            },
     };
   }),
   previewSequenceCommand: vi.fn(async () => "ffmpeg -f concat -i list.txt cat.gif"),
@@ -76,7 +85,8 @@ function status(found = true): FfmpegStatus {
       available: found && format !== "webp",
       animated: found && ["mp4", "webm", "mov", "mkv", "gif", "jxl"].includes(format),
     })),
-    videoCodecs: found ? ["h264", "vp9", "av1"] : [],
+    videoCodecs: found ? ["h264", "h265", "vp9", "av1"] : [],
+    hevcHardware: false,
     readsAv1: found,
     libjxl: found ? "0.13.0" : null,
     jxl: {
@@ -346,6 +356,7 @@ describe("CatConvert", () => {
       keepAudio: false,
       videoCodec: null,
       videoBitrate: null,
+      hardware: false,
       jxl: { lossless: false, effort: 7, progressive: false },
       sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
       metadata: "noLocation",
@@ -394,7 +405,8 @@ describe("CatConvert", () => {
     expect(codecs().getByRole("button", { name: "AV1" })).toHaveAttribute("aria-pressed", "true");
     expect(codecs().getByRole("button", { name: "VP9" })).toHaveAttribute("aria-pressed", "false");
     fireEvent.click(screen.getByRole("button", { name: "MOV" }));
-    expect(screen.queryByRole("group", { name: "Video codec" })).not.toBeInTheDocument();
+    expect(codecs().queryByRole("button", { name: "AV1" })).not.toBeInTheDocument();
+    expect(codecs().getByRole("button", { name: "H.264" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.click(screen.getByRole("button", { name: "MKV" }));
     expect(codecs().getByRole("button", { name: "H.264" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.click(codecs().getByRole("button", { name: "AV1" }));
@@ -405,6 +417,55 @@ describe("CatConvert", () => {
       VIDEO.path,
       expect.objectContaining({ format: "mkv", videoCodec: "av1" }),
     );
+  });
+
+  it("encodes H.265 into MP4, MOV and MKV, in hardware where it can", async () => {
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({ ...status(), hevcHardware: true });
+    await openVideo();
+    const codecs = () => within(screen.getByRole("group", { name: "Video codec" }));
+    // No hardware switch until H.265 is picked.
+    expect(screen.queryByRole("switch", { name: "Fast (hardware)" })).not.toBeInTheDocument();
+    fireEvent.click(codecs().getByRole("button", { name: "H.265" }));
+    expect(codecs().getByRole("button", { name: "H.265" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText(/Plays on Apple devices/)).toBeInTheDocument();
+    const changes = () => within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes().getByText("H.265")).toBeInTheDocument();
+
+    // MOV keeps it; WebM can't hold it and falls back to VP9.
+    fireEvent.click(screen.getByRole("button", { name: "MOV" }));
+    expect(codecs().getByRole("button", { name: "H.265" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "WEBM" }));
+    expect(codecs().queryByRole("button", { name: "H.265" })).not.toBeInTheDocument();
+    expect(codecs().getByRole("button", { name: "VP9" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "MOV" }));
+    fireEvent.click(codecs().getByRole("button", { name: "H.265" }));
+
+    const hardware = screen.getByRole("switch", { name: "Fast (hardware)" });
+    expect(hardware).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(hardware);
+    expect(hardware).toHaveAttribute("aria-checked", "true");
+    expect(changes().getByText("H.265, hardware")).toBeInTheDocument();
+    expect(await screen.findByText(/\(hardware, quality 64\)$/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ format: "mov", videoCodec: "h265", hardware: true }),
+    );
+  });
+
+  it("offers no hardware switch, and no H.265, where ffmpeg can't", async () => {
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({
+      ...status(),
+      videoCodecs: ["h264", "vp9", "av1"],
+    });
+    await openVideo();
+    const codecs = within(screen.getByRole("group", { name: "Video codec" }));
+    const h265 = codecs.getByRole("button", { name: "H.265" });
+    expect(h265).toBeDisabled();
+    expect(h265).toHaveAttribute("title", "Your ffmpeg can't write H.265 video");
+    expect(screen.queryByRole("switch", { name: "Fast (hardware)" })).not.toBeInTheDocument();
   });
 
   it("shows the quality in bitrates, updating as the slider moves", async () => {
@@ -1376,6 +1437,86 @@ describe("CatConvert", () => {
         screen.getByText("1 picture was moved or deleted, so it's made from the other 2"),
       ).toBeInTheDocument();
     });
+
+    it("converts an animation again from History in the sequence editor", async () => {
+      vi.mocked(api.missingFiles).mockImplementation(async () => []);
+      await openAnimation();
+      fireEvent.click(screen.getByRole("button", { name: "0.25 s" }));
+      fireEvent.click(screen.getByRole("button", { name: "Boomerang" }));
+      fireEvent.click(screen.getByRole("button", { name: /Make animation/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      applyProgress({
+        jobId: 11,
+        stage: "done",
+        progress: 1,
+        speed: null,
+        outputBytes: 400_000,
+        error: null,
+      });
+      expect(state.history[0]).toMatchObject({
+        inputs: ["/pics/cat 1.jpg", "/pics/cat 2.jpg", "/pics/cat 10.jpg"],
+        options: { format: "gif", direction: "boomerang" },
+        sequence: { frameSecs: 0.25, fit: "pad" },
+      });
+
+      // One picture went missing since: the other two still make it.
+      vi.mocked(api.missingFiles).mockImplementation(async (paths) =>
+        paths.filter((p) => p === "/pics/cat 2.jpg"),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "History" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Convert cat.gif again" }));
+      await screen.findByRole("list", { name: "Pictures in order" });
+      expect(order()).toEqual(["1. cat 1.jpg", "2. cat 10.jpg"]);
+      expect(screen.getByRole("button", { name: "0.25 s" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      expect(screen.getByRole("button", { name: "Boomerang" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      expect(
+        screen.getByText("1 picture was moved or deleted, so it's made from the other 2"),
+      ).toBeInTheDocument();
+    });
+
+    it("opens the animation itself once its pictures are gone", async () => {
+      await openAnimation();
+      fireEvent.click(screen.getByRole("button", { name: /Make animation/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      applyProgress({
+        jobId: 11,
+        stage: "done",
+        progress: 1,
+        speed: null,
+        outputBytes: 400_000,
+        error: null,
+      });
+      vi.mocked(api.missingFiles).mockImplementation(async (paths) =>
+        paths.filter((p) => p.endsWith(".jpg")),
+      );
+      vi.mocked(api.probeFile).mockImplementation(async (path) => ({
+        ...VIDEO,
+        path,
+        fileName: "cat.gif",
+        extension: "gif",
+        kind: "video",
+      }));
+      fireEvent.click(screen.getByRole("button", { name: "History" }));
+      const again = await screen.findByRole("button", { name: "Convert cat.gif again" });
+      await waitFor(() =>
+        expect(again).toHaveAttribute(
+          "title",
+          "The pictures are gone; opens the animation instead",
+        ),
+      );
+      fireEvent.click(again);
+      expect(await screen.findByRole("heading", { name: "cat.gif" })).toBeInTheDocument();
+      expect(api.probeFile).toHaveBeenLastCalledWith("/pics/cat.gif");
+      expect(
+        screen.getByText("The pictures are gone, so the converted cat.gif opens instead"),
+      ).toBeInTheDocument();
+    });
   });
 
   it("adds and removes the Finder Quick Action in Settings", async () => {
@@ -1617,6 +1758,224 @@ describe("CatConvert", () => {
         "title",
         "The original was kept as clip.orig.mov",
       );
+
+      // Converting it again opens the converted file, which must not be
+      // replaced in turn: where it goes follows Settings.
+      vi.mocked(api.missingFiles).mockImplementation(async (paths) =>
+        paths.filter((p) => p === VIDEO.path),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Convert clip 2.mp4 again" }));
+      expect(await screen.findByRole("heading", { name: "clip 2.mp4" })).toBeInTheDocument();
+      expect(screen.getByRole("combobox", { name: "Save" })).toHaveDisplayValue(
+        "Next to the original",
+      );
+      expect(state.draft?.options.destination).toEqual({ kind: "nextToInput" });
+    });
+  });
+
+  describe("converting again from History", () => {
+    beforeEach(() => {
+      vi.mocked(api.missingFiles).mockImplementation(async () => []);
+    });
+
+    /** Convert clip.mov to MP4 at quality 80, turned 90°, and open History. */
+    async function convertedVideo() {
+      await openVideo();
+      fireEvent.input(screen.getByRole("slider", { name: "Quality" }), {
+        target: { value: "80" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Rotate 90°" }));
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      applyProgress({
+        jobId: 7,
+        stage: "done",
+        progress: 1,
+        speed: null,
+        outputBytes: 9,
+        error: null,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "History" }));
+      return screen.findByText("clip.mp4");
+    }
+
+    const quality = () =>
+      (screen.getByRole("slider", { name: "Quality" }) as HTMLInputElement).value;
+    const changes = () =>
+      within(screen.getByRole("list", { name: "Changes" }))
+        .getAllByRole("listitem")
+        .map((li) => li.textContent);
+
+    it("remembers the inputs and settings of each conversion", async () => {
+      await convertedVideo();
+      expect(state.history[0]).toMatchObject({
+        inputs: [VIDEO.path],
+        options: { format: "mp4", quality: 80, rotate: 90 },
+      });
+      expect(state.history[0]).not.toHaveProperty("command");
+      const saved = JSON.parse(localStorage.getItem("catconvert.history.v2") ?? "[]");
+      expect(saved[0]).toMatchObject({ inputs: [VIDEO.path], options: { quality: 80 } });
+    });
+
+    it("opens the original with the old settings and converts a new file", async () => {
+      await convertedVideo();
+      fireEvent.click(screen.getByRole("button", { name: "Convert clip.mp4 again" }));
+      expect(await screen.findByRole("heading", { name: "clip.mov" })).toBeInTheDocument();
+      expect(api.probeFile).toHaveBeenLastCalledWith(VIDEO.path);
+      expect(screen.getByRole("button", { name: "MP4" })).toHaveAttribute("aria-pressed", "true");
+      expect(quality()).toBe("80");
+      expect(changes()).toContain("Turned 90°");
+
+      fireEvent.click(screen.getByRole("button", { name: "WEBM" }));
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startJob).toHaveBeenLastCalledWith(
+        VIDEO.path,
+        expect.objectContaining({ format: "webm", quality: 80, rotate: 90 }),
+      );
+    });
+
+    it("opens the converted file instead when the original is gone", async () => {
+      vi.mocked(api.missingFiles).mockImplementation(async (paths) =>
+        paths.filter((p) => p === VIDEO.path),
+      );
+      await convertedVideo();
+      const again = await screen.findByRole("button", { name: "Convert clip.mp4 again" });
+      await waitFor(() =>
+        expect(again).toHaveAttribute(
+          "title",
+          "The original is gone; opens the converted file instead",
+        ),
+      );
+      fireEvent.click(again);
+      expect(await screen.findByRole("heading", { name: "clip.mp4" })).toBeInTheDocument();
+      expect(api.probeFile).toHaveBeenLastCalledWith("/clips/clip.mp4");
+      expect(
+        screen.getByText("clip.mov is gone, so the converted clip.mp4 opens instead"),
+      ).toBeInTheDocument();
+      // The format and quality carry over; the turn is already in the file.
+      expect(screen.getByRole("button", { name: "MP4" })).toHaveAttribute("aria-pressed", "true");
+      expect(quality()).toBe("80");
+      expect(screen.queryByRole("list", { name: "Changes" })?.textContent ?? "").not.toContain(
+        "Turned",
+      );
+    });
+
+    it("says why it can't when the original and the converted file are gone", async () => {
+      vi.mocked(api.missingFiles).mockImplementation(async (paths) => paths);
+      const name = await convertedVideo();
+      const again = screen.getByRole("button", { name: "Convert clip.mp4 again" });
+      await waitFor(() => expect(again).toBeDisabled());
+      expect(again).toHaveAttribute("title", "The original and the converted file are both gone");
+
+      fireEvent.contextMenu(name);
+      const menu = within(await screen.findByRole("menu", { name: "clip.mp4" }));
+      const item = menu.getByRole("menuitem", { name: /Convert again/ });
+      expect(item).toBeDisabled();
+      expect(item).toHaveTextContent("The original and the converted file are both gone");
+      expect(menu.queryByText("Convert again with")).not.toBeInTheDocument();
+      expect(menu.getByRole("menuitem", { name: /Show in folder/ })).toBeDisabled();
+      fireEvent.keyDown(menu.getByRole("menuitem", { name: /Convert again/ }), {
+        key: "Escape",
+      });
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    });
+
+    it("converts again with a recipe from the right-click menu", async () => {
+      const name = await convertedVideo();
+      fireEvent.contextMenu(name);
+      const menu = within(await screen.findByRole("menu", { name: "clip.mp4" }));
+      expect(menu.getByText("Convert again with")).toBeInTheDocument();
+      // Only recipes for videos; the first item has focus.
+      expect(menu.getByRole("menuitem", { name: /Convert again/ })).toHaveFocus();
+      expect(menu.getByRole("menuitem", { name: "Make a GIF" })).toBeInTheDocument();
+      fireEvent.keyDown(menu.getByRole("menuitem", { name: /Convert again/ }), { key: "End" });
+      expect(menu.getByRole("menuitem", { name: "Show in folder" })).toHaveFocus();
+
+      fireEvent.click(menu.getByRole("menuitem", { name: "Web friendly" }));
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+      expect(await screen.findByRole("heading", { name: "clip.mov" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "WEBM" })).toHaveAttribute("aria-pressed", "true");
+      expect(quality()).toBe("50");
+
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startJob).toHaveBeenLastCalledWith(
+        VIDEO.path,
+        expect.objectContaining({ format: "webm", quality: 50 }),
+      );
+      applyProgress({
+        jobId: 7,
+        stage: "done",
+        progress: 1,
+        speed: null,
+        outputBytes: 5,
+        error: null,
+      });
+      // Both jobs share the mocked id 7; the second one finishes here.
+      expect(state.jobs.at(-1)?.recipe).toBe("Web friendly");
+    });
+
+    it("asks to finish what's open in the editor first", async () => {
+      await convertedVideo();
+      openPaths([SONG.path]);
+      await screen.findByRole("heading", { name: "purr.wav" });
+      fireEvent.click(screen.getByRole("button", { name: "History" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Convert clip.mp4 again" }));
+      expect(await screen.findByText("Finish what's open in the editor first")).toBeInTheDocument();
+      expect(state.draft?.info.path).toBe(SONG.path);
+    });
+
+    it("moves version 1 history over and still shows its entries", async () => {
+      const old = {
+        id: "1-3",
+        name: "song.mp3",
+        output: "/music/song.mp3",
+        format: "mp3",
+        kind: "audio",
+        inputBytes: 4_000_000,
+        outputBytes: 1_000_000,
+        finishedAt: Date.now() - 60_000,
+      };
+      localStorage.setItem("catconvert.history.v1", JSON.stringify([old, "junk", null]));
+      resetStore();
+      expect(state.history).toEqual([old]);
+      expect(localStorage.getItem("catconvert.history.v1")).toBeNull();
+      expect(JSON.parse(localStorage.getItem("catconvert.history.v2") ?? "null")).toEqual([
+        old,
+        "junk",
+        null,
+      ]);
+
+      render(() => <App />);
+      navigate("history");
+      const name = await screen.findByText("song.mp3");
+      expect(screen.getByRole("button", { name: "Show song.mp3 in folder" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: /again/ })).not.toBeInTheDocument();
+      fireEvent.contextMenu(name);
+      const menu = within(await screen.findByRole("menu", { name: "song.mp3" }));
+      expect(menu.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+        "Show in folder",
+      ]);
+    });
+
+    it("keeps an entry whose stored settings are broken, without the action", () => {
+      const broken = {
+        id: "2-4",
+        name: "clip.mp4",
+        output: "/clips/clip.mp4",
+        format: "mp4",
+        kind: "video",
+        inputBytes: 1,
+        outputBytes: 1,
+        finishedAt: 1,
+        inputs: [VIDEO.path],
+        options: { quality: 80 },
+      };
+      localStorage.setItem("catconvert.history.v2", JSON.stringify([broken]));
+      resetStore();
+      const { inputs: _inputs, options: _options, ...shown } = broken;
+      expect(state.history).toEqual([shown]);
     });
   });
 });

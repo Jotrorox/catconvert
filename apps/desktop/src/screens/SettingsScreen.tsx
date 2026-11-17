@@ -420,8 +420,14 @@ export const SettingsScreen: Component = () => {
       <section class="card">
         <h2 class="section-title">Open-source licenses</h2>
         <p class="item-meta">
-          CatConvert comes with ffmpeg (GPL-2.0-or-later, built with x264) and libjxl's tools, which
-          it runs as separate programs. Every release on GitHub includes their complete source code.
+          CatConvert comes with ffmpeg (GPL-2.0-or-later, built with x264 and x265) and libjxl's
+          tools, which it runs as separate programs. Every release on GitHub includes their complete
+          source code.
+        </p>
+        <p class="item-meta">
+          H.264 and H.265 (HEVC) are covered by patents licensed through patent pools. CatConvert
+          includes the open-source x264 and x265 encoders, but no patent license; whether you need
+          one depends on where and how you use the videos.
         </p>
         <button
           type="button"

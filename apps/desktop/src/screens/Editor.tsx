@@ -90,6 +90,7 @@ import {
 } from "../lib/player";
 import { createFilmstrip, createFrame, createWaveform } from "../lib/preview";
 import {
+  canEncodeHevcInHardware,
   canRead,
   closeEditor,
   convertAll,
@@ -650,7 +651,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       if (fadeOut > 0) items.push({ icon: "fade", text: `Fades out ${formatSpan(fadeOut)}` });
     }
     const chosen = codec();
-    if (chosen === "av1") items.push({ icon: "sparkle", text: CODEC_LABELS[chosen] });
+    if (chosen === "h265" && o.hardware && canEncodeHevcInHardware()) {
+      items.push({ icon: "sparkle", text: "H.265, hardware" });
+    } else if (chosen === "h265" || chosen === "av1") {
+      items.push({ icon: "sparkle", text: CODEC_LABELS[chosen] });
+    }
     const exact = exactBitrate();
     if (exact !== null) items.push({ icon: "sliders", text: formatBitrate(exact * 1000) });
     if (isJxl() && info().kind === "video") items.push({ icon: "sparkle", text: "Animated" });
@@ -1115,6 +1120,27 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 available={isCodecAvailable}
                 onChange={(videoCodec) => updateOptions({ videoCodec })}
               />
+            </Show>
+
+            <Show when={codec() === "h265" && canEncodeHevcInHardware()}>
+              <div class="toggle-row">
+                <div>
+                  <span class="toggle-title" id="hardware-encoding">
+                    Fast (hardware)
+                  </span>
+                  <span class="item-meta">
+                    Encodes on the Mac's media engine: several times faster, somewhat bigger files
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  class="switch"
+                  role="switch"
+                  aria-checked={options().hardware ?? false}
+                  aria-labelledby="hardware-encoding"
+                  onClick={() => updateOptions({ hardware: !options().hardware })}
+                />
+              </div>
             </Show>
 
             <Show

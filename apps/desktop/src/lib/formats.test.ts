@@ -262,6 +262,21 @@ describe("formats", () => {
     expect(fitOptions(clip, { ...av1, format: "mov" }, all)?.videoCodec).toBeNull();
   });
 
+  it("offers H.265 in MP4, MOV and MKV but not WebM", () => {
+    for (const format of ["mp4", "mov", "mkv"] as const) {
+      expect(codecOf({ format, videoCodec: "h265" }), format).toBe("h265");
+      expect(codecFor(format, "h265"), format).toBe("h265");
+    }
+    expect(codecOf({ format: "webm", videoCodec: "h265" })).toBe("vp9");
+    expect(codecFor("webm", "h265")).toBeNull();
+    const h265 = { ...defaultOptions("mov"), videoCodec: "h265" as const };
+    expect(recipeDetail(clip, h265)).toBe("H.265 · balanced");
+    expect(recipeDetail(clip, { ...h265, hardware: true })).toBe("H.265 · hardware · balanced");
+    // The hardware switch only means something for H.265.
+    expect(recipeDetail(clip, { ...defaultOptions("mp4"), hardware: true })).toBe("Balanced");
+    expect(fitOptions(clip, { ...h265, format: "webm" }, all)?.videoCodec).toBeNull();
+  });
+
   it("times animations by their speed and direction", () => {
     const gif = { ...defaultOptions("gif"), trimStart: 2, trimEnd: 8 };
     expect(outputSeconds(clip, gif)).toBe(6);

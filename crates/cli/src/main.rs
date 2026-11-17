@@ -63,13 +63,20 @@ enum Command {
         /// 0 = smallest file, 100 = best quality.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u8).range(0..=100))]
         quality: u8,
-        /// MP4, MKV and WebM: video codec. Defaults to H.264 (VP9 for WebM);
-        /// AV1 makes smaller files and keeps HDR, but is slower. MOV is H.264 only.
+        /// MP4, MOV, MKV and WebM: video codec. Defaults to H.264 (VP9 for
+        /// WebM). H.265 (alias hevc; MP4, MOV, MKV) makes smaller files that
+        /// play almost everywhere; AV1 (MP4, MKV, WebM) smaller still, but is
+        /// slower. Both keep HDR.
         #[arg(long, value_enum)]
         codec: Option<Codec>,
+        /// H.265: encode on the graphics hardware (VideoToolbox on Apple
+        /// silicon Macs). Much faster, somewhat bigger files; uses x265 where
+        /// there is no hardware encoder.
+        #[arg(long)]
+        hardware: bool,
         /// MP4, MOV, MKV and WebM: aim for this average video bitrate instead
-        /// of a quality level, in kbit/s or with a unit (e.g. 800k, 4M). H.264
-        /// and VP9 are encoded in two passes.
+        /// of a quality level, in kbit/s or with a unit (e.g. 800k, 4M). H.264,
+        /// H.265 and VP9 are encoded in two passes.
         #[arg(long, value_name = "RATE", value_parser = parse_bitrate)]
         bitrate: Option<u32>,
         /// Drop the audio track.
@@ -142,7 +149,7 @@ enum Command {
         /// 0 = smallest file, 100 = best quality.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u8).range(0..=100))]
         quality: u8,
-        /// MP4 slideshow: video codec (H.264 unless set).
+        /// MP4, MOV or MKV slideshow: video codec (H.264 unless set).
         #[arg(long, value_enum)]
         codec: Option<Codec>,
         /// JPEG XL: mathematically lossless.
@@ -221,6 +228,8 @@ impl From<Playback> for Direction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Codec {
     H264,
+    #[value(alias = "hevc")]
+    H265,
     Vp9,
     Av1,
 }
@@ -229,6 +238,7 @@ impl From<Codec> for VideoCodec {
     fn from(codec: Codec) -> Self {
         match codec {
             Codec::H264 => Self::H264,
+            Codec::H265 => Self::H265,
             Codec::Vp9 => Self::Vp9,
             Codec::Av1 => Self::Av1,
         }
@@ -297,7 +307,8 @@ fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<()
     let output = catconvert_core::output_path(&info.path, options.format, |_| false);
     let plan = catconvert_core::plan(&info, options, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
-    if let Some(line) = describe_quality(catconvert_core::quality_summary(&info, options)) {
+    let summary = catconvert_core::quality_summary(&info, options, ffmpeg.support());
+    if let Some(line) = describe_quality(summary) {
         eprintln!("{line}");
     }
     run(&ffmpeg, &plan, dry_run)
@@ -305,20 +316,20 @@ fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<()
 
 /// The quality setting in numbers, e.g. `video H.264 CRF 24, audio 128 kbps`.
 fn describe_quality(summary: QualitySummary) -> Option<String> {
-    let video = summary.video.map(|rate| match (rate.kbps, rate.crf) {
-        (Some(kbps), _) if rate.passes > 1 => {
-            format!(
-                "video {} {kbps} kbps, {} passes",
-                rate.codec.label(),
-                rate.passes
-            )
+    let video = summary.video.map(|rate| {
+        let codec = if rate.hardware {
+            format!("{} (hardware)", rate.codec.label())
+        } else {
+            rate.codec.label().to_owned()
+        };
+        match (rate.kbps, rate.crf, rate.hardware_quality) {
+            (Some(kbps), ..) if rate.passes > 1 => {
+                format!("video {codec} {kbps} kbps, {} passes", rate.passes)
+            }
+            (Some(kbps), ..) => format!("video {codec} {kbps} kbps average"),
+            (None, None, Some(quality)) => format!("video {codec} quality {quality}"),
+            (None, crf, _) => format!("video {codec} CRF {}", crf.unwrap_or_default()),
         }
-        (Some(kbps), _) => format!("video {} {kbps} kbps average", rate.codec.label()),
-        (None, crf) => format!(
-            "video {} CRF {}",
-            rate.codec.label(),
-            crf.unwrap_or_default()
-        ),
     });
     let audio = summary.audio.map(|rate| match rate {
         AudioRate::Bitrate { kbps } => format!("audio {kbps} kbps"),
@@ -450,6 +461,7 @@ fn main() -> ExitCode {
             crop,
             quality,
             codec,
+            hardware,
             bitrate,
             mute,
             normalize,
@@ -480,6 +492,7 @@ fn main() -> ExitCode {
                 keep_audio: !mute,
                 video_codec: codec.map(Into::into),
                 video_bitrate: bitrate,
+                hardware,
                 jxl: JxlOptions {
                     lossless,
                     effort,
@@ -689,6 +702,31 @@ mod tests {
             panic!("expected convert");
         };
         assert_eq!(codec.map(VideoCodec::from), Some(VideoCodec::Av1));
+        for name in ["h265", "hevc"] {
+            let cli = Cli::try_parse_from([
+                "catconvert",
+                "convert",
+                "a",
+                "--to",
+                "mov",
+                "--codec",
+                name,
+                "--hardware",
+            ])
+            .expect("parse");
+            let Command::Convert {
+                codec, hardware, ..
+            } = cli.command
+            else {
+                panic!("expected convert");
+            };
+            assert_eq!(
+                codec.map(VideoCodec::from),
+                Some(VideoCodec::H265),
+                "{name}"
+            );
+            assert!(hardware);
+        }
         for bad in ["9x16", "0:1", "1:"] {
             assert!(
                 Cli::try_parse_from(["catconvert", "convert", "a", "--to", "mp4", "--crop", bad])
@@ -745,6 +783,8 @@ mod tests {
             crf: Some(24),
             kbps: None,
             passes: 1,
+            hardware: false,
+            hardware_quality: None,
         };
         let summary = QualitySummary {
             audio: Some(AudioRate::Bitrate { kbps: 128 }),
@@ -766,6 +806,20 @@ mod tests {
         assert_eq!(
             describe_quality(exact).as_deref(),
             Some("video H.264 4000 kbps, 2 passes")
+        );
+        let hardware = QualitySummary {
+            audio: None,
+            video: Some(VideoRate {
+                codec: VideoCodec::H265,
+                crf: None,
+                hardware: true,
+                hardware_quality: Some(64),
+                ..crf
+            }),
+        };
+        assert_eq!(
+            describe_quality(hardware).as_deref(),
+            Some("video H.265 (hardware) quality 64")
         );
         let mp3 = QualitySummary {
             audio: Some(AudioRate::Vbr {

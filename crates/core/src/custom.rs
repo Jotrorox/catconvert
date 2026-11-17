@@ -442,6 +442,11 @@ pub(crate) const PASSLOG_SUFFIXES: [&str; 4] = [
     "-0.log.mbtree.temp",
 ];
 
+/// What x265 writes for a two-pass encode with `-x265-stats file`: the
+/// statistics and its `.cutree` file, each as a `.temp` file until it is
+/// done. Two-pass H.265 plans list them all as scratch.
+pub(crate) const X265_STATS_SUFFIXES: [&str; 4] = ["", ".temp", ".cutree", ".cutree.temp"];
+
 /// The files a call writes, as written. Inputs aren't limited: reading a
 /// watermark or a subtitle file is fine.
 fn outputs(call: &Call) -> Result<Vec<String>> {
@@ -452,6 +457,8 @@ fn outputs(call: &Call) -> Result<Vec<String>> {
             let mut format = None;
             let mut pass = false;
             let mut passlog = None;
+            let mut x265 = false;
+            let mut x265_stats = None;
             while let Some(arg) = args.next() {
                 if arg == "-i" {
                     args.next()
@@ -473,6 +480,10 @@ fn outputs(call: &Call) -> Result<Vec<String>> {
                         "-f" => format = value.map(String::as_str),
                         "-pass" => pass = true,
                         "-passlogfile" => passlog = value,
+                        "-x265-stats" => x265_stats = value,
+                        "-c" | "-codec" | "-vcodec" if value.is_some_and(|v| v == "libx265") => {
+                            x265 = true;
+                        }
                         _ => {}
                     }
                 } else if arg == "-" && format == Some("null") {
@@ -491,6 +502,19 @@ fn outputs(call: &Call) -> Result<Vec<String>> {
                     return Err(invalid(
                         "-pass needs a -passlogfile next to the output, or ffmpeg writes its \
                          log where CatConvert can't clean it up",
+                    ));
+                }
+                None => {}
+            }
+            match x265_stats {
+                Some(stats) => {
+                    let files = X265_STATS_SUFFIXES.map(|suffix| format!("{stats}{suffix}"));
+                    outputs.splice(0..0, files);
+                }
+                None if pass && x265 => {
+                    return Err(invalid(
+                        "two-pass libx265 needs -x265-stats next to the output, or x265 writes \
+                         its statistics where CatConvert can't clean them up",
                     ));
                 }
                 None => {}
@@ -1144,6 +1168,31 @@ mod tests {
             ))
             .contains("placeholder")
         );
+    }
+
+    #[test]
+    fn two_pass_h265_writes_only_its_logs_and_x265_stats() {
+        let clip = video("/clips/garden.mov");
+        let exact = ConvertOptions {
+            video_bitrate: Some(4000),
+            video_codec: Some(crate::VideoCodec::H265),
+            ..mp4(false)
+        };
+        let planned = generated(&clip, &exact, "/clips/garden.mp4");
+        let text = planned.command_line();
+        let stats = "-x265-stats /clips/.garden.mp4.passlog.stats-0.x265.log";
+        assert!(text.contains(stats), "{text}");
+        let edited = text.replace("-b:v 4000k", "-b:v 2500k");
+        let custom = custom_plan(&clip, &planned, &edited, all_tools()).expect("edited");
+        assert_eq!(custom.scratch, planned.scratch);
+
+        // x265's statistics have to stay with the plan's other files.
+        let elsewhere = text.replace(stats, "-x265-stats /tmp/x265.log");
+        assert!(
+            error(custom_plan(&clip, &planned, &elsewhere, all_tools())).contains("/tmp/x265.log")
+        );
+        let missing = text.replace(&format!(" {stats}"), "");
+        assert!(error(custom_plan(&clip, &planned, &missing, all_tools())).contains("-x265-stats"));
     }
 
     #[test]

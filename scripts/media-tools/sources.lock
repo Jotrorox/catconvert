@@ -1,6 +1,7 @@
 # Pinned sources of the media tools bundled with the desktop app.
 # Read by build.sh. The ffmpeg/ffprobe builds are GPL-2.0-or-later because
-# they include x264; everything else is under permissive or LGPL licenses.
+# they include x264 and x265; everything else is under permissive or LGPL
+# licenses.
 #
 # Columns: name  version  license  url  sha256  license-files
 #   license is an SPDX id; several are joined with commas (all apply).
@@ -21,6 +22,7 @@ brotli         1.2.1    MIT                       https://github.com/google/brot
 highway        1.4.0    Apache-2.0                https://github.com/google/highway/archive/refs/tags/1.4.0.tar.gz                                             e72241ac9524bb653ae52ced768b508045d4438726a303f10181a38f764a453c  LICENSE
 libjxl         0.13.0   BSD-3-Clause              https://github.com/libjxl/libjxl/archive/refs/tags/v0.13.0.tar.gz                                            24d18c9af2d1f5a17730b3f8d3f70a5c16e5ac303f5d9d5fe9dc00cf7ca82af2  LICENSE,PATENTS
 x264           0.165-b35605a  GPL-2.0-or-later    git+https://code.videolan.org/videolan/x264.git@b35605ace3ddf7c1a5d67a2eb553f034aef41d55                    -                                                                 COPYING
+x265           4.2      GPL-2.0-or-later          https://download.videolan.org/pub/videolan/x265/x265_4.2.tar.gz                                              40b1ea0453e0309f0eba934e0ddf533f8f6295966679e8894e8f1c1c8d5e1210  COPYING
 libvpx         1.17.0   BSD-3-Clause              https://github.com/webmproject/libvpx/archive/refs/tags/v1.17.0.tar.gz                                       1020f184046187baa2985dbde38e0691f49c44088bca7a1842b0236c6081dc0a  LICENSE,PATENTS
 opus           1.6.1    BSD-3-Clause              https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz                                                   6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1  COPYING
 lame           4.0      LGPL-2.0-or-later         https://downloads.sourceforge.net/project/lame/lame/4.0/lame-4.0.tar.gz                                      3df5124d5ad3a98312ffd7ba6a9b36230e4f8a3e66d3ce0f425e336c32d216eb  COPYING

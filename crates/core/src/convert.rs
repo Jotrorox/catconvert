@@ -138,12 +138,13 @@ impl OutputFormat {
 
     /// The video codecs this format can carry, its usual one first. Empty for
     /// formats without a choice: GIFs, animated images, stills and sound.
-    /// MOV stays H.264, which is what the Apple tools it is meant for expect.
+    /// MOV takes H.264 or H.265, which is what the Apple tools it is meant
+    /// for play; WebM only the royalty-free VP9 and AV1.
     #[must_use]
     pub fn video_codecs(self) -> &'static [VideoCodec] {
         match self {
-            Self::Mp4 | Self::Mkv => &[VideoCodec::H264, VideoCodec::Av1],
-            Self::Mov => &[VideoCodec::H264],
+            Self::Mp4 | Self::Mkv => &[VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1],
+            Self::Mov => &[VideoCodec::H264, VideoCodec::H265],
             Self::Webm => &[VideoCodec::Vp9, VideoCodec::Av1],
             _ => &[],
         }
@@ -167,6 +168,11 @@ impl OutputFormat {
 pub enum VideoCodec {
     /// H.264 (AVC) with x264: plays everywhere.
     H264,
+    /// H.265 (HEVC) with x265: 30–50% smaller than H.264 at the same look,
+    /// with hardware decoding on nearly every recent device. HDR sources are
+    /// written in 10 bits (Main 10) and stay HDR. `"hevc"` is accepted too.
+    #[serde(alias = "hevc")]
+    H265,
     /// VP9 with libvpx: WebM's usual codec.
     Vp9,
     /// AV1 with SVT-AV1, in 10 bits: about a third smaller than H.264 at the
@@ -180,6 +186,7 @@ impl VideoCodec {
     pub fn encoder(self) -> &'static str {
         match self {
             Self::H264 => "libx264",
+            Self::H265 => "libx265",
             Self::Vp9 => "libvpx-vp9",
             Self::Av1 => "libsvtav1",
         }
@@ -190,11 +197,16 @@ impl VideoCodec {
     pub fn label(self) -> &'static str {
         match self {
             Self::H264 => "H.264",
+            Self::H265 => "H.265",
             Self::Vp9 => "VP9",
             Self::Av1 => "AV1",
         }
     }
 }
+
+/// VideoToolbox's H.265 encoder, which runs on the media engine of Apple
+/// silicon Macs. See [`ConvertOptions::hardware`].
+pub const HEVC_HARDWARE_ENCODER: &str = "hevc_videotoolbox";
 
 /// Settings that only matter when writing JPEG XL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,10 +343,17 @@ pub struct ConvertOptions {
     /// other formats.
     pub video_codec: Option<VideoCodec>,
     /// Exact average bitrate of the picture in kbit/s instead of the CRF
-    /// that `quality` picks, for MP4, MOV, MKV and WebM files. H.264 and VP9
-    /// get there in two passes, AV1 in one. `None` uses `quality`. Ignored
+    /// that `quality` picks, for MP4, MOV, MKV and WebM files. H.264, H.265
+    /// and VP9 get there in two passes, AV1 and hardware H.265 in one. `None` uses `quality`. Ignored
     /// for other formats and for animations made from pictures.
     pub video_bitrate: Option<u32>,
+    /// Encode H.265 on the graphics hardware where it can
+    /// ([`HEVC_HARDWARE_ENCODER`] on Apple silicon Macs, see
+    /// [`Support::hevc_hardware`]): several times faster than x265, but
+    /// the files come out bigger at the same look. Falls back to x265 where
+    /// there is no hardware encoder. Ignored for other codecs and for
+    /// animations made from pictures.
+    pub hardware: bool,
     /// JPEG XL settings, ignored for other formats.
     pub jxl: JxlOptions,
     /// Loudness and fades, ignored when the output has no sound.
@@ -383,6 +402,7 @@ impl Default for ConvertOptions {
             keep_audio: true,
             video_codec: None,
             video_bitrate: None,
+            hardware: false,
             jxl: JxlOptions::default(),
             sound: SoundOptions::default(),
             metadata: Metadata::default(),
@@ -466,6 +486,8 @@ pub struct Support {
     /// ffmpeg's `scale` filter converts between transfer functions (ffmpeg
     /// 8 and later), so HDR video can be tone-mapped for pictures and GIFs.
     pub tone_map: bool,
+    /// H.265 can be encoded in hardware (see [`ConvertOptions::hardware`]).
+    pub hevc_hardware: bool,
 }
 
 impl From<JxlSupport> for Support {
@@ -593,7 +615,8 @@ pub fn plan(
     output: &Path,
     support: impl Into<Support>,
 ) -> Result<Plan> {
-    let Support { jxl, tone_map } = support.into();
+    let support = support.into();
+    let Support { jxl, .. } = support;
     let format = options.format;
     if !format.accepts(input.kind) {
         return Err(Error::unsupported(format!(
@@ -781,7 +804,7 @@ pub fn plan(
                 trim,
                 Sink::Frames { animated },
                 &frames,
-                tone_map,
+                support,
             ));
             scratch.push(frames.clone());
             let frames = match scrub.filter(|_| !animated) {
@@ -805,7 +828,7 @@ pub fn plan(
                 trim,
                 Sink::Frames { animated: false },
                 &frames,
-                tone_map,
+                support,
             ));
             steps.push(scrub_step(&frames, &cleaned, metadata));
             let (width, height) = output_dims(input, options, None).unzip();
@@ -833,7 +856,18 @@ pub fn plan(
                 metadata: Metadata::Keep,
                 ..options.clone()
             };
-            let mut encode = ffmpeg_step(&edited, &as_is, (0.0, None), Sink::Output, output, false);
+            let no_tone_map = Support {
+                tone_map: false,
+                ..support
+            };
+            let mut encode = ffmpeg_step(
+                &edited,
+                &as_is,
+                (0.0, None),
+                Sink::Output,
+                output,
+                no_tone_map,
+            );
             encode.weight = 0.6;
             steps.push(encode);
             scratch.extend([frames, cleaned]);
@@ -844,7 +878,7 @@ pub fn plan(
                 trim,
                 Sink::Output,
                 output,
-                tone_map,
+                support,
             ));
         } else if animated {
             return Err(Error::unsupported(
@@ -864,11 +898,11 @@ pub fn plan(
             trim,
             Sink::Output,
             &encoded,
-            tone_map,
+            support,
         ));
         steps.push(scrub_step(&encoded, output, metadata));
         scratch.push(encoded);
-    } else if video_rate(options).is_some_and(|rate| rate.passes == 2) {
+    } else if let Some(rate) = video_rate(options, support).filter(|rate| rate.passes == 2) {
         // An exact bitrate, met evenly across the clip: the first pass
         // measures how hard each part is to encode, the second spends the
         // bits accordingly (see `PASSLOG_SUFFIXES` for its log files).
@@ -879,7 +913,7 @@ pub fn plan(
             trim,
             Sink::FirstPass { log: &log },
             Path::new("-"),
-            tone_map,
+            support,
         ));
         steps.push(ffmpeg_step(
             &source,
@@ -887,12 +921,19 @@ pub fn plan(
             trim,
             Sink::SecondPass { log: &log },
             output,
-            tone_map,
+            support,
         ));
         let stats = log.to_string_lossy();
         scratch.extend(
             crate::custom::PASSLOG_SUFFIXES.map(|suffix| PathBuf::from(format!("{stats}{suffix}"))),
         );
+        if rate.codec == VideoCodec::H265 {
+            let stats = x265_stats(&log);
+            scratch.extend(
+                crate::custom::X265_STATS_SUFFIXES
+                    .map(|suffix| PathBuf::from(format!("{stats}{suffix}"))),
+            );
+        }
     } else {
         steps.push(ffmpeg_step(
             &source,
@@ -900,7 +941,7 @@ pub fn plan(
             trim,
             Sink::Output,
             output,
-            tone_map,
+            support,
         ));
     }
 
@@ -928,15 +969,16 @@ enum Sink<'a> {
 
 /// The ffmpeg call that applies the edits in `options` to `input` and writes `out`.
 ///
-/// `tone_map` says whether this ffmpeg can turn HDR into SDR; it is used for
-/// HDR input written as pictures or GIFs, which can't hold HDR.
+/// `support` says whether this ffmpeg can turn HDR into SDR, which is used
+/// for HDR input written as pictures or GIFs (they can't hold HDR), and
+/// whether H.265 can be encoded in hardware.
 fn ffmpeg_step(
     input: &MediaInfo,
     options: &ConvertOptions,
     (start, end): (f64, Option<f64>),
     sink: Sink,
     out: &Path,
-    tone_map: bool,
+    support: Support,
 ) -> Step {
     let format = options.format;
     let passlog = match sink {
@@ -949,8 +991,9 @@ fn ffmpeg_step(
     } else {
         format.kind()
     };
-    let tone_map =
-        tone_map && input.hdr && (format == OutputFormat::Gif || format.kind() == MediaKind::Image);
+    let tone_map = support.tone_map
+        && input.hdr
+        && (format == OutputFormat::Gif || format.kind() == MediaKind::Image);
     let tone_mapped = |mut filters: Vec<String>| {
         if tone_map {
             filters.insert(0, TONE_MAP_FILTER.to_owned());
@@ -1040,9 +1083,9 @@ fn ffmpeg_step(
                 filters.extend(fades("fade", options.sound, t0, duration_secs));
             }
             push_video(&mut push, input, &[], &filters);
-            let rate = video_rate(options)
+            let rate = video_rate(options, support)
                 .unwrap_or_else(|| VideoRate::constant(VideoCodec::H264, options.quality));
-            push_video_encoder(&mut push, rate, Some((1, log)));
+            push_video_encoder(&mut push, rate, input.hdr, Some((1, log)));
             push(&["-an", "-sn", "-dn", "-f", "null"]);
         }
         (OutputFormat::Mp4 | OutputFormat::Mov | OutputFormat::Mkv | OutputFormat::Webm, _) => {
@@ -1060,17 +1103,15 @@ fn ffmpeg_step(
                     push(&["-af", &audio.join(",")]);
                 }
             }
-            let rate = video_rate(options)
+            let rate = video_rate(options, support)
                 .unwrap_or_else(|| VideoRate::constant(VideoCodec::H264, options.quality));
-            push_video_encoder(&mut push, rate, passlog.map(|log| (2, log)));
+            push_video_encoder(&mut push, rate, input.hdr, passlog.map(|log| (2, log)));
             match audio_rate(input, options).filter(|_| keep_audio) {
                 Some(rate) => push_audio_encoder(&mut push, format, rate),
                 None => push(&["-an"]),
             }
             push(&["-sn", "-dn"]);
-            if matches!(format, OutputFormat::Mp4 | OutputFormat::Mov) {
-                push(&["-movflags", "+faststart"]);
-            }
+            push_mp4_flags(&mut push, format, rate.codec);
         }
         (_, Sink::FirstPass { .. } | Sink::SecondPass { .. }) => {
             unreachable!("only video files are encoded in two passes")
@@ -1290,24 +1331,47 @@ fn push_video(
 }
 
 /// The video encoder of `rate.codec` at `rate`, in a pixel format every
-/// player of that codec reads. `pass` is the pass number and log file
-/// prefix of a two-pass encode.
+/// player of that codec reads. `hdr` says the picture is HDR. `pass` is the
+/// pass number and log file prefix of a two-pass encode.
 ///
 /// AV1 is written in 10 bits: every AV1 decoder handles them (they are part
 /// of the Main profile), they compress better than 8 bits even for SDR
 /// sources, and HDR video keeps its HDR (ffmpeg passes the source's colour
 /// tags on to SVT-AV1). SVT-AV1's preset 8 is about as quick as x264's
 /// `fast` and still well ahead of it in size.
+///
+/// H.265 is written in 10 bits (Main 10) only for HDR sources, which keeps
+/// them HDR the same way; SDR stays 8-bit Main, which older HEVC decoders
+/// need. x265's `fast` preset is several times slower than x264's, so
+/// [`ConvertOptions::hardware`] can hand it to VideoToolbox instead.
 pub(crate) fn push_video_encoder(
     push: &mut impl FnMut(&[&str]),
     rate: VideoRate,
+    hdr: bool,
     pass: Option<(u8, &Path)>,
 ) {
     let target = rate.kbps.map(|kbps| format!("{kbps}k"));
     let crf = rate.crf.map(|crf| crf.to_string());
+    let ten_bit = rate.codec == VideoCodec::Av1 || (rate.codec == VideoCodec::H265 && hdr);
     match rate.codec {
         VideoCodec::H264 => {
             push(&["-c:v", "libx264", "-preset", "fast"]);
+            match (&target, &crf) {
+                (Some(target), _) => push(&["-b:v", target]),
+                (None, Some(crf)) => push(&["-crf", crf]),
+                (None, None) => {}
+            }
+        }
+        VideoCodec::H265 if rate.hardware => {
+            push(&["-c:v", HEVC_HARDWARE_ENCODER]);
+            match (&target, rate.hardware_quality) {
+                (Some(target), _) => push(&["-b:v", target]),
+                (None, Some(quality)) => push(&["-q:v", &quality.to_string()]),
+                (None, None) => {}
+            }
+        }
+        VideoCodec::H265 => {
+            push(&["-c:v", "libx265", "-preset", "fast"]);
             match (&target, &crf) {
                 (Some(target), _) => push(&["-b:v", target]),
                 (None, Some(crf)) => push(&["-crf", crf]),
@@ -1337,31 +1401,79 @@ pub(crate) fn push_video_encoder(
     if let Some((pass, log)) = pass {
         push(&["-pass", &pass.to_string()]);
         push(&["-passlogfile", &log.to_string_lossy()]);
+        if rate.codec == VideoCodec::H265 {
+            // x265 keeps its own statistics and ignores -passlogfile.
+            push(&["-x265-stats", &x265_stats(log)]);
+        }
     }
-    let pix_fmt = if rate.codec == VideoCodec::Av1 {
-        "yuv420p10le"
-    } else {
-        "yuv420p"
+    let pix_fmt = match (ten_bit, rate.hardware) {
+        (true, true) => "p010le",
+        (true, false) => "yuv420p10le",
+        (false, _) => "yuv420p",
     };
     push(&["-pix_fmt", pix_fmt]);
+    if ten_bit && rate.codec == VideoCodec::H265 {
+        push(&["-profile:v", "main10"]);
+    }
+}
+
+/// Where x265 keeps the statistics of a two-pass encode whose ffmpeg log
+/// prefix is `log`. It writes the files of
+/// [`crate::custom::X265_STATS_SUFFIXES`] next to it.
+fn x265_stats(log: &Path) -> String {
+    format!("{}{X265_STATS_SUFFIX}", log.to_string_lossy())
+}
+
+/// What x265's statistics file adds to the ffmpeg log prefix of a two-pass
+/// encode.
+const X265_STATS_SUFFIX: &str = "-0.x265.log";
+
+/// MP4 and MOV flags: the index up front so playback starts before the file
+/// has loaded, and H.265 tagged `hvc1`, without which QuickTime, Safari,
+/// iOS and the Finder's preview won't play it.
+pub(crate) fn push_mp4_flags(
+    push: &mut impl FnMut(&[&str]),
+    format: OutputFormat,
+    codec: VideoCodec,
+) {
+    if !matches!(format, OutputFormat::Mp4 | OutputFormat::Mov) {
+        return;
+    }
+    if codec == VideoCodec::H265 {
+        push(&["-tag:v", "hvc1"]);
+    }
+    push(&["-movflags", "+faststart"]);
 }
 
 /// The CRF of each video encoder at quality 0 and 100. x264's default
-/// quality of 60 lands at 24; SVT-AV1's at 32, which looks about the same.
+/// quality of 60 lands at 24; x265's at 28 and SVT-AV1's at 32, which look
+/// about the same.
 #[must_use]
 pub fn crf_range(codec: VideoCodec) -> (u8, u8) {
     match codec {
         VideoCodec::H264 => (34, 18),
+        VideoCodec::H265 => (38, 22),
         VideoCodec::Vp9 => (48, 28),
         VideoCodec::Av1 => (48, 22),
     }
 }
+
+/// VideoToolbox's constant quality (`-q:v`, higher is better) at quality 0
+/// and 100. The default of 60 lands at 64.
+pub const HARDWARE_QUALITY_RANGE: (u8, u8) = (40, 80);
 
 /// The CRF `codec` is encoded with at quality `q`.
 fn crf(codec: VideoCodec, q: u8) -> u8 {
     let (worst, best) = crf_range(codec);
     let crf = lerp(q.min(100), f64::from(worst), f64::from(best));
     u8::try_from(crf).unwrap_or(worst)
+}
+
+/// VideoToolbox's quality at quality `q`.
+fn hardware_quality(q: u8) -> u8 {
+    let (worst, best) = HARDWARE_QUALITY_RANGE;
+    let quality = lerp(q.min(100), f64::from(worst), f64::from(best));
+    u8::try_from(quality).unwrap_or(worst)
 }
 
 /// Slowest and fastest exact video bitrate in kbit/s.
@@ -1399,12 +1511,19 @@ pub enum AudioRate {
 #[serde(rename_all = "camelCase")]
 pub struct VideoRate {
     pub codec: VideoCodec,
-    /// Constant rate factor; `None` with an exact bitrate.
+    /// Constant rate factor; `None` with an exact bitrate or in hardware.
     pub crf: Option<u8>,
     /// Exact average bitrate in kbit/s; `None` with a CRF.
     pub kbps: Option<u32>,
-    /// Encoding passes: 2 for an exact H.264 or VP9 bitrate, otherwise 1.
+    /// Encoding passes: 2 for an exact H.264, H.265 or VP9 bitrate in
+    /// software, otherwise 1.
     pub passes: u8,
+    /// Encoded by the graphics hardware ([`HEVC_HARDWARE_ENCODER`]) rather
+    /// than in software.
+    pub hardware: bool,
+    /// VideoToolbox's constant quality (see [`HARDWARE_QUALITY_RANGE`]) in
+    /// hardware without an exact bitrate, otherwise `None`.
+    pub hardware_quality: Option<u8>,
 }
 
 impl VideoRate {
@@ -1415,6 +1534,8 @@ impl VideoRate {
             crf: Some(crf(codec, q)),
             kbps: None,
             passes: 1,
+            hardware: false,
+            hardware_quality: None,
         }
     }
 }
@@ -1431,12 +1552,18 @@ pub struct QualitySummary {
 
 /// The audio bitrate and video CRF (or exact bitrate) that converting
 /// `input` with `options` uses, so the quality setting can be shown in
-/// numbers. Doesn't validate the options; [`plan`] does.
+/// numbers. `support` is what [`plan`] gets. Doesn't validate the options;
+/// [`plan`] does.
 #[must_use]
-pub fn quality_summary(input: &MediaInfo, options: &ConvertOptions) -> QualitySummary {
+pub fn quality_summary(
+    input: &MediaInfo,
+    options: &ConvertOptions,
+    support: impl Into<Support>,
+) -> QualitySummary {
     let format = options.format;
     let has_picture = format.kind() == MediaKind::Video && !format.animates(input.kind);
-    let video = has_picture.then(|| video_rate(options)).flatten();
+    let support = support.into();
+    let video = has_picture.then(|| video_rate(options, support)).flatten();
     let has_sound = input.has_audio()
         && match format.kind() {
             MediaKind::Audio => true,
@@ -1451,17 +1578,31 @@ pub fn quality_summary(input: &MediaInfo, options: &ConvertOptions) -> QualitySu
 
 /// How the picture of a video file is encoded, or `None` for formats
 /// without a video codec choice (GIFs, animations, stills, sound).
-fn video_rate(options: &ConvertOptions) -> Option<VideoRate> {
+fn video_rate(options: &ConvertOptions, support: Support) -> Option<VideoRate> {
     let codec = options.codec()?;
-    Some(match options.video_bitrate {
-        Some(kbps) => VideoRate {
+    let hardware = codec == VideoCodec::H265 && options.hardware && support.hevc_hardware;
+    Some(match (options.video_bitrate, hardware) {
+        (Some(kbps), _) => VideoRate {
             codec,
             crf: None,
             kbps: Some(kbps),
-            // ffmpeg's SVT-AV1 wrapper has no two-pass mode.
-            passes: if codec == VideoCodec::Av1 { 1 } else { 2 },
+            // ffmpeg's SVT-AV1 wrapper has no two-pass mode, and
+            // VideoToolbox aims for the average by itself.
+            passes: if codec == VideoCodec::Av1 || hardware {
+                1
+            } else {
+                2
+            },
+            hardware,
+            hardware_quality: None,
         },
-        None => VideoRate::constant(codec, options.quality),
+        (None, true) => VideoRate {
+            crf: None,
+            hardware: true,
+            hardware_quality: Some(hardware_quality(options.quality)),
+            ..VideoRate::constant(codec, options.quality)
+        },
+        (None, false) => VideoRate::constant(codec, options.quality),
     })
 }
 
@@ -2229,6 +2370,7 @@ mod tests {
             (OutputFormat::Mov, VideoCodec::Av1),
             (OutputFormat::Mp4, VideoCodec::Vp9),
             (OutputFormat::Webm, VideoCodec::H264),
+            (OutputFormat::Webm, VideoCodec::H265),
         ] {
             let options = ConvertOptions {
                 format,
@@ -2261,6 +2403,232 @@ mod tests {
             serde_json::from_value(serde_json::json!({"format": "mp4", "videoCodec": null}))
                 .expect("parse");
         assert_eq!(options.codec(), Some(VideoCodec::H264));
+        for name in ["h265", "hevc"] {
+            let options: ConvertOptions = serde_json::from_value(
+                serde_json::json!({"format": "mov", "videoCodec": name, "hardware": true}),
+            )
+            .expect("parse");
+            assert_eq!(options.codec(), Some(VideoCodec::H265), "{name}");
+            assert!(options.hardware);
+        }
+        assert_eq!(
+            serde_json::to_value(VideoCodec::H265).expect("json"),
+            serde_json::json!("h265")
+        );
+    }
+
+    fn h265(format: OutputFormat) -> ConvertOptions {
+        ConvertOptions {
+            format,
+            video_codec: Some(VideoCodec::H265),
+            ..ConvertOptions::default()
+        }
+    }
+
+    /// Software and hardware H.265.
+    const HEVC_HARDWARE: Support = Support {
+        jxl: JxlSupport {
+            cjxl: false,
+            djxl: false,
+            ffmpeg_encoder: false,
+            ffmpeg_anim_encoder: false,
+            ffmpeg_decoder: false,
+            ffmpeg_anim_decoder: false,
+        },
+        tone_map: false,
+        hevc_hardware: true,
+    };
+
+    #[test]
+    fn h265_mp4_is_eight_bit_x265_tagged_hvc1() {
+        assert_eq!(
+            command(
+                &video("garden.mov"),
+                &h265(OutputFormat::Mp4),
+                "/clips/garden.mp4"
+            ),
+            "ffmpeg -i /clips/garden.mov -map 0:v:0 -map 0:a:0 \
+             -c:v libx265 -preset fast -crf 28 -pix_fmt yuv420p -c:a aac -b:a 128k -sn -dn \
+             -tag:v hvc1 -movflags +faststart /clips/garden.mp4"
+        );
+        // MOV is tagged the same way; MKV has no such tags.
+        let mov = command(
+            &video("garden.mp4"),
+            &h265(OutputFormat::Mov),
+            "/clips/garden.mov",
+        );
+        assert!(mov.contains("-crf 28 -pix_fmt yuv420p "), "{mov}");
+        assert!(
+            mov.ends_with("-tag:v hvc1 -movflags +faststart /clips/garden.mov"),
+            "{mov}"
+        );
+        let mkv = ConvertOptions {
+            quality: 100,
+            ..h265(OutputFormat::Mkv)
+        };
+        let mkv = command(&video("garden.mov"), &mkv, "/clips/garden.mkv");
+        assert!(mkv.contains("-c:v libx265 -preset fast -crf 22 "), "{mkv}");
+        assert!(!mkv.contains("hvc1") && !mkv.contains("faststart"), "{mkv}");
+    }
+
+    #[test]
+    fn h265_keeps_hdr_in_main10() {
+        let hdr = MediaInfo {
+            hdr: true,
+            ..video("iphone.mov")
+        };
+        let cmd = command(&hdr, &h265(OutputFormat::Mov), "/clips/iphone 2.mov");
+        assert!(
+            cmd.contains(
+                "-c:v libx265 -preset fast -crf 28 -pix_fmt yuv420p10le -profile:v main10 "
+            ),
+            "{cmd}"
+        );
+        // HDR is never tone-mapped for video, and H.264 stays 8-bit as before.
+        assert!(!cmd.contains("out_transfer"), "{cmd}");
+        let h264 = ConvertOptions {
+            format: OutputFormat::Mov,
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&hdr, &h264, "/clips/iphone 2.mov");
+        assert!(cmd.contains("-pix_fmt yuv420p "), "{cmd}");
+        assert!(!cmd.contains("main10") && !cmd.contains("hvc1"), "{cmd}");
+    }
+
+    #[test]
+    fn exact_bitrate_for_h265_takes_two_passes_with_x265_stats() {
+        let input = video("garden.mov");
+        let options = ConvertOptions {
+            video_bitrate: Some(3000),
+            ..h265(OutputFormat::Mp4)
+        };
+        let plan = plan(
+            &input,
+            &options,
+            Path::new("/clips/garden.mp4"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let [first, second] = [0, 1].map(|i| {
+            plan.steps[i]
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let log = "/clips/.garden.mp4.passlog.stats";
+        assert!(
+            first.contains(&format!(
+                "-c:v libx265 -preset fast -b:v 3000k -pass 1 -passlogfile {log} \
+                 -x265-stats {log}-0.x265.log -pix_fmt yuv420p -an -sn -dn -f null -"
+            )),
+            "{first}"
+        );
+        assert!(second.contains("-pass 2"), "{second}");
+        assert!(
+            second.contains(&format!("-x265-stats {log}-0.x265.log")),
+            "{second}"
+        );
+        assert!(second.contains("-tag:v hvc1"), "{second}");
+        assert_eq!(
+            plan.scratch,
+            [
+                "-0.log",
+                "-0.log.temp",
+                "-0.log.mbtree",
+                "-0.log.mbtree.temp",
+                "-0.x265.log",
+                "-0.x265.log.temp",
+                "-0.x265.log.cutree",
+                "-0.x265.log.cutree.temp",
+            ]
+            .map(|suffix| PathBuf::from(format!("{log}{suffix}")))
+        );
+        assert_eq!(
+            quality_summary(&input, &options, JxlSupport::default()).video,
+            Some(VideoRate {
+                codec: VideoCodec::H265,
+                crf: None,
+                kbps: Some(3000),
+                passes: 2,
+                hardware: false,
+                hardware_quality: None,
+            })
+        );
+    }
+
+    #[test]
+    fn hardware_h265_uses_videotoolbox_where_there_is_one() {
+        let input = video("garden.mov");
+        let fast = ConvertOptions {
+            hardware: true,
+            ..h265(OutputFormat::Mp4)
+        };
+        let run = |input: &MediaInfo, options: &ConvertOptions, support: Support| {
+            plan(input, options, Path::new("/clips/garden.mp4"), support).expect("plan")
+        };
+        let cmd = run(&input, &fast, HEVC_HARDWARE).command_line();
+        assert!(
+            cmd.contains("-c:v hevc_videotoolbox -q:v 64 -pix_fmt yuv420p -c:a aac"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("-tag:v hvc1 -movflags +faststart"), "{cmd}");
+        assert_eq!(
+            quality_summary(&input, &fast, HEVC_HARDWARE).video,
+            Some(VideoRate {
+                codec: VideoCodec::H265,
+                crf: None,
+                kbps: None,
+                passes: 1,
+                hardware: true,
+                hardware_quality: Some(64),
+            })
+        );
+
+        // HDR stays HDR in 10 bits.
+        let hdr = MediaInfo {
+            hdr: true,
+            ..video("iphone.mov")
+        };
+        let cmd = run(&hdr, &fast, HEVC_HARDWARE).command_line();
+        assert!(
+            cmd.contains("-c:v hevc_videotoolbox -q:v 64 -pix_fmt p010le -profile:v main10"),
+            "{cmd}"
+        );
+
+        // An exact bitrate is one pass: VideoToolbox aims for it by itself.
+        let exact = ConvertOptions {
+            video_bitrate: Some(5000),
+            quality: 100,
+            ..fast.clone()
+        };
+        let plan = run(&input, &exact, HEVC_HARDWARE);
+        assert_eq!(plan.steps.len(), 1);
+        assert!(plan.scratch.is_empty());
+        assert!(
+            plan.command_line()
+                .contains("-c:v hevc_videotoolbox -b:v 5000k -pix_fmt yuv420p"),
+            "{}",
+            plan.command_line()
+        );
+
+        // Without a hardware encoder it falls back to x265, and other codecs
+        // ignore the setting.
+        let cmd = run(&input, &fast, Support::default()).command_line();
+        assert!(cmd.contains("-c:v libx265 -preset fast -crf 28"), "{cmd}");
+        let h264 = ConvertOptions {
+            video_codec: None,
+            ..fast.clone()
+        };
+        let cmd = run(&input, &h264, HEVC_HARDWARE).command_line();
+        assert!(cmd.contains("-c:v libx264"), "{cmd}");
+        assert!(
+            !quality_summary(&input, &fast, Support::default())
+                .video
+                .expect("video")
+                .hardware
+        );
     }
 
     #[test]
@@ -3612,6 +3980,7 @@ mod tests {
     }
 
     const TONE_MAP: Support = Support {
+        hevc_hardware: false,
         jxl: JxlSupport {
             cjxl: false,
             djxl: false,
@@ -3745,6 +4114,7 @@ mod tests {
             ..image("sunset.avif", 4000, 3000)
         };
         let ffmpeg_jxl = Support {
+            hevc_hardware: false,
             jxl: JxlSupport {
                 ffmpeg_encoder: true,
                 ..JxlSupport::default()
@@ -3805,7 +4175,12 @@ mod tests {
 
     #[test]
     fn crf_follows_quality_within_each_codecs_range() {
-        for codec in [VideoCodec::H264, VideoCodec::Vp9, VideoCodec::Av1] {
+        for codec in [
+            VideoCodec::H264,
+            VideoCodec::H265,
+            VideoCodec::Vp9,
+            VideoCodec::Av1,
+        ] {
             let (worst, best) = crf_range(codec);
             assert_eq!(crf(codec, 0), worst, "{codec:?}");
             assert_eq!(crf(codec, 100), best, "{codec:?}");
@@ -3819,6 +4194,7 @@ mod tests {
         }
         // The default quality of 60.
         assert_eq!(crf(VideoCodec::H264, 60), 24);
+        assert_eq!(crf(VideoCodec::H265, 60), 28);
         assert_eq!(crf(VideoCodec::Vp9, 60), 36);
         assert_eq!(crf(VideoCodec::Av1, 60), 32);
     }
@@ -3832,7 +4208,7 @@ mod tests {
                 quality,
                 ..ConvertOptions::default()
             };
-            quality_summary(&input, &options).audio
+            quality_summary(&input, &options, JxlSupport::default()).audio
         };
         let kbps = |kbps| Some(AudioRate::Bitrate { kbps });
         for (quality, aac, opus, music) in [
@@ -3887,7 +4263,7 @@ mod tests {
             ..ConvertOptions::default()
         };
         assert_eq!(
-            quality_summary(&unknown, &wav).audio,
+            quality_summary(&unknown, &wav, JxlSupport::default()).audio,
             Some(AudioRate::Pcm { kbps: None })
         );
     }
@@ -3895,7 +4271,9 @@ mod tests {
     #[test]
     fn quality_summary_only_covers_what_the_output_has() {
         let input = video("garden.mov");
-        let summary = |input: &MediaInfo, options: ConvertOptions| quality_summary(input, &options);
+        let summary = |input: &MediaInfo, options: ConvertOptions| {
+            quality_summary(input, &options, JxlSupport::default())
+        };
         let mp4 = ConvertOptions::default();
         assert_eq!(
             summary(&input, mp4.clone()),
@@ -3906,6 +4284,8 @@ mod tests {
                     crf: Some(24),
                     kbps: None,
                     passes: 1,
+                    hardware: false,
+                    hardware_quality: None,
                 }),
             }
         );
@@ -3954,8 +4334,8 @@ mod tests {
             OutputFormat::Ogg,
         ];
         for format in formats {
-            for &video_codec in &[None, Some(VideoCodec::Av1)] {
-                if video_codec.is_some() && !format.video_codecs().contains(&VideoCodec::Av1) {
+            for video_codec in [None, Some(VideoCodec::H265), Some(VideoCodec::Av1)] {
+                if video_codec.is_some_and(|codec| !format.video_codecs().contains(&codec)) {
                     continue;
                 }
                 for quality in (0..=100).step_by(5) {
@@ -3967,7 +4347,7 @@ mod tests {
                     };
                     let out = format!("/clips/out.{}", format.extension());
                     let cmd = command(&input, &options, &out);
-                    let summary = quality_summary(&input, &options);
+                    let summary = quality_summary(&input, &options, JxlSupport::default());
                     let audio = match summary.audio.expect("sound") {
                         AudioRate::Bitrate { kbps } => format!("-b:a {kbps}k "),
                         AudioRate::Vbr { level, .. } => format!("-q:a {level} "),
@@ -3977,7 +4357,7 @@ mod tests {
                     assert!(cmd.contains(&audio), "{audio} in {cmd}");
                     if let Some(rate) = summary.video {
                         let preset = match rate.codec {
-                            VideoCodec::H264 => "-preset fast ",
+                            VideoCodec::H264 | VideoCodec::H265 => "-preset fast ",
                             VideoCodec::Vp9 => "",
                             VideoCodec::Av1 => "-preset 8 ",
                         };
@@ -4034,12 +4414,14 @@ mod tests {
             .map(PathBuf::from)
         );
         assert_eq!(
-            quality_summary(&input, &options).video,
+            quality_summary(&input, &options, JxlSupport::default()).video,
             Some(VideoRate {
                 codec: VideoCodec::H264,
                 crf: None,
                 kbps: Some(4000),
                 passes: 2,
+                hardware: false,
+                hardware_quality: None,
             })
         );
     }
@@ -4102,7 +4484,9 @@ mod tests {
             "{cmd}"
         );
         assert_eq!(
-            quality_summary(&input, &av1).video.map(|v| v.passes),
+            quality_summary(&input, &av1, JxlSupport::default())
+                .video
+                .map(|v| v.passes),
             Some(1)
         );
     }
@@ -4154,7 +4538,14 @@ mod tests {
             serde_json::to_value(summary).expect("json"),
             serde_json::json!({
                 "audio": {"mode": "vbr", "level": 2, "kbps": 190},
-                "video": {"codec": "av1", "crf": 32, "kbps": null, "passes": 1}
+                "video": {
+                    "codec": "av1",
+                    "crf": 32,
+                    "kbps": null,
+                    "passes": 1,
+                    "hardware": false,
+                    "hardwareQuality": null
+                }
             })
         );
         assert_eq!(
