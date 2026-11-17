@@ -5,11 +5,15 @@ type Props = {
   duration: number;
   start: number;
   end: number;
-  /** Time shown in the preview; drawn as a thin line. */
+  /** Time shown in the preview or being played; a line that can be dragged. */
   playhead: number | null;
+  /** Playing: the playhead follows the sound without easing. */
+  playing?: boolean;
   onChange: (start: number, end: number) => void;
-  /** A position worth previewing (handle moved, track clicked). */
+  /** A position worth previewing (handle or range moved). */
   onScrub: (time: number) => void;
+  /** Go to a time (track clicked or dragged, playhead moved); defaults to `onScrub`. */
+  onSeek?: (time: number) => void;
   /** Fade lengths in seconds, drawn as ramps at the ends of the kept range. */
   fades?: { fadeIn: number; fadeOut: number } | undefined;
   /** Track background: filmstrip or waveform. */
@@ -18,9 +22,13 @@ type Props = {
 
 type Drag = "start" | "end" | "range";
 
+/** Pixels the range must move before a press on it becomes a drag rather than a click. */
+const CLICK_SLOP = 3;
+
 /**
  * Two draggable handles over a filmstrip/waveform. Handles are sliders for
- * keyboard users: arrows nudge 0.1 s, Shift+arrows 1 s.
+ * keyboard users: arrows nudge 0.1 s, Shift+arrows 1 s. Clicking or dragging
+ * the track seeks, as does the playhead (a slider too: arrows 1 s, Shift 5 s).
  */
 export const TrimBar: Component<Props> = (props) => {
   let track: HTMLDivElement | undefined;
@@ -39,6 +47,29 @@ export const TrimBar: Component<Props> = (props) => {
     return Math.min(props.duration, Math.max(0, ratio * props.duration));
   };
 
+  const seek = (t: number) => (props.onSeek ?? props.onScrub)(t);
+
+  /** Follow the pointer with the playhead until the button is let go. */
+  const beginSeek = (event: PointerEvent) => {
+    if (event.button !== 0 || !track) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = track;
+    target.setPointerCapture(event.pointerId);
+    target.classList.add("seeking");
+    seek(timeAt(event.clientX));
+    const move = (e: PointerEvent) => seek(timeAt(e.clientX));
+    const up = () => {
+      target.classList.remove("seeking");
+      target.removeEventListener("pointermove", move);
+      target.removeEventListener("pointerup", up);
+      target.removeEventListener("pointercancel", up);
+    };
+    target.addEventListener("pointermove", move);
+    target.addEventListener("pointerup", up);
+    target.addEventListener("pointercancel", up);
+  };
+
   const setStart = (t: number) => {
     const start = Math.min(Math.max(0, t), props.end - minGap());
     props.onChange(start, props.end);
@@ -51,17 +82,27 @@ export const TrimBar: Component<Props> = (props) => {
   };
 
   const beginDrag = (kind: Drag, event: PointerEvent) => {
+    // A range spanning the whole file can't move: dragging it seeks.
+    if (kind === "range" && props.end - props.start >= props.duration - minGap()) {
+      beginSeek(event);
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const target = event.currentTarget as HTMLElement;
     target.setPointerCapture(event.pointerId);
     target.focus();
+    const grabX = event.clientX;
     const grabTime = timeAt(event.clientX);
     const grabStart = props.start;
     const length = props.end - props.start;
+    // A press on the range that doesn't move is a click: seek there.
+    let moved = kind !== "range";
     track?.classList.add("dragging");
 
     const move = (e: PointerEvent) => {
+      if (!moved && Math.abs(e.clientX - grabX) < CLICK_SLOP) return;
+      moved = true;
       const t = timeAt(e.clientX);
       if (kind === "start") setStart(t);
       else if (kind === "end") setEnd(t);
@@ -71,8 +112,9 @@ export const TrimBar: Component<Props> = (props) => {
         props.onScrub(start);
       }
     };
-    const up = () => {
+    const up = (e: PointerEvent) => {
       track?.classList.remove("dragging");
+      if (!moved && e.type === "pointerup") seek(timeAt(e.clientX));
       target.removeEventListener("pointermove", move);
       target.removeEventListener("pointerup", up);
       target.removeEventListener("pointercancel", up);
@@ -107,6 +149,30 @@ export const TrimBar: Component<Props> = (props) => {
     event.preventDefault();
   };
 
+  const onPlayheadKey = (event: KeyboardEvent) => {
+    const step = event.shiftKey ? 5 : 1;
+    const at = props.playhead ?? 0;
+    switch (event.key) {
+      case "ArrowLeft":
+      case "ArrowDown":
+        seek(Math.max(0, at - step));
+        break;
+      case "ArrowRight":
+      case "ArrowUp":
+        seek(Math.min(props.duration, at + step));
+        break;
+      case "Home":
+        seek(0);
+        break;
+      case "End":
+        seek(props.duration);
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+  };
+
   const handle = (kind: "start" | "end") => (
     <div
       role="slider"
@@ -128,10 +194,9 @@ export const TrimBar: Component<Props> = (props) => {
   return (
     <div
       class="trim-track"
+      classList={{ playing: props.playing === true }}
       ref={track}
-      onPointerDown={(e) => {
-        if (e.button === 0) props.onScrub(timeAt(e.clientX));
-      }}
+      onPointerDown={beginSeek}
     >
       <div class="trim-bg">{props.children}</div>
       <div class="trim-shade left" style={{ left: 0, width: `${pct(props.start)}%` }} />
@@ -150,7 +215,24 @@ export const TrimBar: Component<Props> = (props) => {
         onPointerDown={(e) => beginDrag("range", e)}
       />
       <Show when={props.playhead !== null}>
-        <span class="trim-playhead" style={{ left: `${pct(props.playhead ?? 0)}%` }} />
+        <div
+          role="slider"
+          tabIndex={0}
+          class="trim-playhead"
+          style={{ left: `${pct(props.playhead ?? 0)}%` }}
+          aria-label="Playback position"
+          aria-valuemin={0}
+          aria-valuemax={props.duration}
+          aria-valuenow={props.playhead ?? 0}
+          aria-valuetext={formatClock(props.playhead ?? 0, true)}
+          onPointerDown={(e) => {
+            e.currentTarget.focus();
+            beginSeek(e);
+          }}
+          onKeyDown={onPlayheadKey}
+        >
+          <span class="trim-playhead-knob" />
+        </div>
       </Show>
       {handle("start")}
       {handle("end")}

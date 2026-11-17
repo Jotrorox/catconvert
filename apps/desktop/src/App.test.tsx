@@ -4,6 +4,7 @@ import App from "./App";
 import type { FfmpegStatus, MediaInfo, OutputFormat } from "./lib/api";
 import * as api from "./lib/api";
 import { applyProgress, navigate, openPaths, resetStore, state } from "./lib/store";
+import { FakeAudio, installFakeAudio } from "./test/audio";
 
 vi.mock("./lib/api", () => ({
   inTauri: false,
@@ -12,6 +13,8 @@ vi.mock("./lib/api", () => ({
   probeFile: vi.fn(),
   previewFrame: vi.fn(async () => "blob:frame"),
   waveform: vi.fn(async () => "blob:wave"),
+  playbackUrl: vi.fn(async (path: string) => `asset://localhost${path}`),
+  loudness: vi.fn(async () => -22),
   previewCommand: vi.fn(async () => "ffmpeg -i clip.mov clip.mp4"),
   previewSequenceCommand: vi.fn(async () => "ffmpeg -f concat -i list.txt cat.gif"),
   saveFrame: vi.fn(),
@@ -130,6 +133,7 @@ beforeEach(() => {
   localStorage.clear();
   resetStore();
   vi.clearAllMocks();
+  installFakeAudio();
   vi.mocked(api.ffmpegStatus).mockResolvedValue(status());
   vi.mocked(api.quickActionStatus).mockResolvedValue({ supported: false, installed: false });
   vi.mocked(api.probeFile).mockImplementation(async (path) =>
@@ -152,6 +156,16 @@ beforeEach(() => {
 function ffmpegFound() {
   return waitFor(() => expect(state.ffmpeg?.found).toBe(true));
 }
+
+async function openSong() {
+  render(() => <App />);
+  await ffmpegFound();
+  openPaths([SONG.path]);
+  return screen.findByRole("heading", { name: "purr.wav" });
+}
+
+/** Let the player load (microtasks and resolved promises). */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 async function openVideo() {
   render(() => <App />);
@@ -592,6 +606,118 @@ describe("CatConvert", () => {
     expect(screen.getByRole("button", { name: "MP3" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.queryByRole("button", { name: "Rotate 90°" })).not.toBeInTheDocument();
     expect(screen.getByRole("slider", { name: "Trim end" })).toBeInTheDocument();
+  });
+
+  it("plays a song, just the kept part or on a loop, with Space as the shortcut", async () => {
+    await openSong();
+    const play = screen.getByRole("button", { name: "Play" });
+    expect(play).toHaveAttribute("aria-keyshortcuts", "Space");
+    fireEvent.click(play);
+    await settle();
+    expect(api.playbackUrl).toHaveBeenCalledWith(SONG.path, false);
+    expect(FakeAudio.playing()?.src).toBe("asset://localhost/music/purr.wav");
+    expect(screen.getByRole("button", { name: "Pause" })).toBeInTheDocument();
+    expect(screen.getByText("/ 1:00.0")).toBeInTheDocument();
+
+    // Space pauses, unless it is pressing a focused button.
+    fireEvent.keyDown(screen.getByRole("button", { name: "Pause" }), { key: " " });
+    expect(screen.getByRole("button", { name: "Pause" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: " " });
+    expect(screen.getByRole("button", { name: "Play" })).toBeInTheDocument();
+    expect(FakeAudio.playing()).toBeUndefined();
+
+    // Shift+Space plays the selection from where it starts.
+    fireEvent.keyDown(screen.getByRole("slider", { name: "Trim start" }), { key: "End" });
+    fireEvent.click(screen.getByRole("button", { name: "Loop" }));
+    expect(screen.getByRole("button", { name: "Loop" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(window, { key: " ", shiftKey: true });
+    await settle();
+    const selection = screen.getByRole("button", { name: "Play selection" });
+    expect(selection).toHaveAttribute("aria-pressed", "true");
+    expect(FakeAudio.playing()?.currentTime).toBeCloseTo(41.9, 1);
+
+    // Seeking with the playhead slider.
+    fireEvent.click(selection);
+    const playhead = screen.getByRole("slider", { name: "Playback position" });
+    fireEvent.keyDown(playhead, { key: "Home" });
+    fireEvent.keyDown(playhead, { key: "ArrowRight", shiftKey: true });
+    expect(playhead).toHaveAttribute("aria-valuenow", "5");
+  });
+
+  it("lets you hear even loudness and fades before converting", async () => {
+    await openSong();
+    expect(screen.queryByText(/as the copy will/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: "Even out loudness" }));
+    expect(screen.getByText("You hear the even loudness as the copy will.")).toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Fade in" })).getByRole("button", { name: "1 s" }),
+    );
+    expect(
+      screen.getByText("You hear the fades and even loudness as the copy will."),
+    ).toBeInTheDocument();
+
+    // Loudness is measured once, when first heard.
+    expect(api.loudness).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await settle();
+    expect(api.loudness).toHaveBeenCalledTimes(1);
+    expect(api.loudness).toHaveBeenCalledWith(SONG.path);
+  });
+
+  it("says when a file can't be played and stops playing on leaving the editor", async () => {
+    vi.mocked(api.playbackUrl).mockRejectedValueOnce("ffmpeg was not found");
+    await openSong();
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("ffmpeg was not found");
+
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await settle();
+    expect(FakeAudio.playing()).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(FakeAudio.playing()).toBeUndefined();
+  });
+
+  it("plays the sound of a video, with the picture following when paused", async () => {
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await settle();
+    // The preview opened at 1 s, so the sound starts there.
+    const audio = FakeAudio.playing() as FakeAudio;
+    expect(audio.src).toBe("asset://localhost/clips/clip.mov");
+    expect(audio.currentTime).toBe(1);
+    audio.currentTime = 7;
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    expect(screen.getByText("0:07.0", { selector: ".frame-time" })).toBeInTheDocument();
+  });
+
+  it("plays finished sound files from the Queue and History", async () => {
+    await openSong();
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    applyProgress({
+      jobId: 7,
+      stage: "done",
+      progress: 1,
+      speed: null,
+      outputBytes: 9,
+      error: null,
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Play purr.mp3" }));
+    await settle();
+    expect(api.playbackUrl).toHaveBeenCalledWith("/music/purr.mp3", false);
+    expect(screen.getByRole("button", { name: "Pause purr.mp3" })).toBeInTheDocument();
+    expect(screen.getByText("0:00 / 1:00")).toBeInTheDocument();
+
+    // Leaving the screen stops it; History has its own button.
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    expect(FakeAudio.playing()).toBeUndefined();
+    fireEvent.click(await screen.findByRole("button", { name: "Play purr.mp3" }));
+    await settle();
+    expect(FakeAudio.playing()?.src).toBe("asset://localhost/music/purr.mp3");
   });
 
   it("checks for an update, installs it and restarts", async () => {

@@ -11,6 +11,10 @@
 //! (see `tauri.media-tools.conf.json`); without them the app falls back to an
 //! installed ffmpeg.
 //!
+//! The editor, Queue and History play sound straight from disk through the
+//! asset protocol. Its scope starts empty: [`playback_source`] adds each file
+//! as it is played, so the webview can't read anything else.
+//!
 //! Files can also come in from outside the window ("Open with", the Finder
 //! Quick Action, "Send to"); see [`incoming`] and [`quick_action`].
 
@@ -248,6 +252,40 @@ async fn waveform(
     Ok(Response::new(bytes))
 }
 
+/// Let the webview play `path` through the asset protocol and return the file
+/// to load: `path` itself, or with `decode` a WAV copy of its sound for
+/// formats the webview can't play (see [`Ffmpeg::listenable`]).
+#[tauri::command]
+async fn playback_source(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    decode: bool,
+) -> Result<PathBuf, String> {
+    let source = if decode {
+        let ffmpeg = state.queue()?.ffmpeg().clone();
+        blocking(move || ffmpeg.listenable(path.as_ref())).await?
+    } else {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(format!("{} is no longer there", path.display()));
+        }
+        path
+    };
+    app.asset_protocol_scope()
+        .allow_file(&source)
+        .map_err(|err| err.to_string())?;
+    Ok(source)
+}
+
+/// Integrated loudness of the sound in LUFS (`None` if silent), so the
+/// editor can preview loudness normalisation.
+#[tauri::command]
+async fn loudness(state: State<'_, AppState>, path: String) -> Result<Option<f64>, String> {
+    let ffmpeg = state.queue()?.ffmpeg().clone();
+    blocking(move || ffmpeg.loudness(path.as_ref())).await
+}
+
 /// The command(s) a conversion would run, for the "show command" panel.
 #[tauri::command]
 fn preview_command(
@@ -400,6 +438,8 @@ pub fn run() {
             probe_file,
             preview_frame,
             waveform,
+            playback_source,
+            loudness,
             preview_command,
             save_frame,
             preview_sequence_command,
