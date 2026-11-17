@@ -196,8 +196,16 @@ setup_target() {
       # libjxl needs std::thread, which the win32-threads mingw flavour lacks.
       local flavour=""
       command -v "${CROSS_PREFIX}g++-posix" >/dev/null 2>&1 && flavour="-posix"
-      export CC="${CROSS_PREFIX}gcc$flavour" CXX="${CROSS_PREFIX}g++$flavour"
-      export AR="${CROSS_PREFIX}ar" RANLIB="${CROSS_PREFIX}ranlib"
+      # Full paths: cmake_install turns off PATH lookups, and a Windows
+      # target's system prefixes don't include /usr, so CMake can't resolve
+      # bare tool names in the toolchain file.
+      local windres
+      CC=$(command -v "${CROSS_PREFIX}gcc$flavour") || die "${CROSS_PREFIX}gcc$flavour not found; install mingw-w64"
+      CXX=$(command -v "${CROSS_PREFIX}g++$flavour") || die "${CROSS_PREFIX}g++$flavour not found; install mingw-w64"
+      AR=$(command -v "${CROSS_PREFIX}ar") || die "${CROSS_PREFIX}ar not found; install mingw-w64"
+      RANLIB=$(command -v "${CROSS_PREFIX}ranlib") || die "${CROSS_PREFIX}ranlib not found; install mingw-w64"
+      windres=$(command -v "${CROSS_PREFIX}windres") || die "${CROSS_PREFIX}windres not found; install mingw-w64"
+      export CC CXX AR RANLIB
       export CFLAGS="-O2" CXXFLAGS="-O2" LDFLAGS="-static -static-libgcc -static-libstdc++"
       mkdir -p "$BUILD"
       cat >"$BUILD/mingw.cmake" <<EOF
@@ -205,7 +213,9 @@ set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 set(CMAKE_C_COMPILER $CC)
 set(CMAKE_CXX_COMPILER $CXX)
-set(CMAKE_RC_COMPILER ${CROSS_PREFIX}windres)
+set(CMAKE_AR $AR)
+set(CMAKE_RANLIB $RANLIB)
+set(CMAKE_RC_COMPILER $windres)
 set(CMAKE_FIND_ROOT_PATH $PREFIX)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
