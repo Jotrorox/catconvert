@@ -95,6 +95,21 @@ jobs:
         shell: bash
         run: chmod +x apps/desktop/src-tauri/binaries/catconvert-*
 
+      # A universal build compiles each architecture on its own, and Tauri's
+      # build script then looks for <tool>-aarch64-apple-darwin and
+      # <tool>-x86_64-apple-darwin; only the universal files get bundled.
+      - name: Name the media tools for each macOS architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd apps/desktop/src-tauri/binaries
+          for universal in catconvert-*-universal-apple-darwin; do
+            tool="${universal%-universal-apple-darwin}"
+            lipo "$universal" -thin arm64 -output "$tool-aarch64-apple-darwin"
+            lipo "$universal" -thin x86_64 -output "$tool-x86_64-apple-darwin"
+          done
+
       # Signing is optional: secrets are only exported when all required ones
       # exist, so forks and fresh repos still produce unsigned builds.
       - name: Configure macOS signing and notarization (optional)
