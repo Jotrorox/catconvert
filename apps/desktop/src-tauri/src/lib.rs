@@ -22,7 +22,7 @@ use std::sync::{Arc, RwLock};
 
 use catconvert_core::{
     ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat, Queue,
-    SavedFrame, SequenceOptions,
+    SavedFrame, SequenceOptions, VideoCodec,
 };
 use serde::Serialize;
 use tauri::ipc::Response;
@@ -118,6 +118,10 @@ struct FfmpegStatus {
     path: Option<PathBuf>,
     error: Option<String>,
     formats: Vec<FormatSupport>,
+    /// Video codecs ffmpeg can write, for MP4, MKV and WebM's codec choice.
+    video_codecs: Vec<VideoCodec>,
+    /// ffmpeg decodes AV1 video and AVIF pictures (it has dav1d or libaom).
+    reads_av1: bool,
     /// Version of libjxl's tools, if `cjxl` was found.
     libjxl: Option<String>,
     jxl: JxlSupport,
@@ -142,6 +146,15 @@ fn status_of(state: &AppState) -> FfmpegStatus {
         path: ffmpeg.as_ref().map(|f| f.ffmpeg_path().to_path_buf()),
         error: state.queue().err(),
         formats,
+        video_codecs: [VideoCodec::H264, VideoCodec::Vp9, VideoCodec::Av1]
+            .into_iter()
+            .filter(|&codec| {
+                ffmpeg
+                    .as_ref()
+                    .is_some_and(|f| f.missing_codec(codec).is_none())
+            })
+            .collect(),
+        reads_av1: ffmpeg.as_ref().is_some_and(Ffmpeg::reads_av1),
         libjxl: ffmpeg.as_ref().and_then(|f| f.jxl_tools().version.clone()),
         jxl: ffmpeg.as_ref().map(Ffmpeg::jxl_support).unwrap_or_default(),
     }

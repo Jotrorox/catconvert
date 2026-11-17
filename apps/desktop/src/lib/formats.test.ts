@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { MediaInfo } from "./api";
 import {
   autoLimits,
+  codecFor,
+  codecOf,
   DEFAULTS,
   defaultFormat,
   defaultOptions,
@@ -192,6 +194,22 @@ describe("formats", () => {
     expect(fitOptions({ ...clip, kind: "audio" }, base, all)).toBeNull();
     expect(fitOptions(clip, base, (f) => f !== "webm")).toBeNull();
     expect(fitOptions({ ...clip, audioCodec: null }, defaultOptions("mp3"), all)).toBeNull();
+  });
+
+  it("offers AV1 where the container can hold it", () => {
+    expect(codecOf(defaultOptions("mp4"))).toBe("h264");
+    expect(codecOf(defaultOptions("webm"))).toBe("vp9");
+    expect(codecOf({ format: "mkv", videoCodec: "av1" })).toBe("av1");
+    expect(codecOf({ format: "mov", videoCodec: "av1" })).toBe("h264");
+    expect(codecOf({ format: "gif", videoCodec: "av1" })).toBeNull();
+    // Switching formats keeps AV1 where it fits and falls back elsewhere.
+    expect(codecFor("webm", "av1")).toBe("av1");
+    expect(codecFor("mov", "av1")).toBeNull();
+    expect(codecFor("mp4", "vp9")).toBeNull();
+    const av1 = { ...defaultOptions("mp4"), videoCodec: "av1" as const };
+    expect(recipeDetail(clip, av1)).toBe("AV1 · balanced");
+    expect(fitOptions(clip, av1, all)?.videoCodec).toBe("av1");
+    expect(fitOptions(clip, { ...av1, format: "mov" }, all)?.videoCodec).toBeNull();
   });
 
   it("times animations by their speed and direction", () => {

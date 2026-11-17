@@ -10,6 +10,7 @@ import type {
   MetadataMode,
   OutputFormat,
   SequenceOptions,
+  VideoCodec,
 } from "./api";
 import { aspectText, cropBox, cropForOtherFile, pictureSize, turnedSize } from "./crop";
 
@@ -123,6 +124,53 @@ export function isLossless(options: ConvertOptions): boolean {
 
 export const label = (format: OutputFormat) => format.toUpperCase();
 
+/**
+ * The video codecs a format can carry, its usual one first; empty for formats
+ * without a choice. Mirrors `OutputFormat::video_codecs` in convert.rs.
+ */
+export function videoCodecs(format: OutputFormat): readonly VideoCodec[] {
+  switch (format) {
+    case "mp4":
+    case "mkv":
+      return ["h264", "av1"];
+    case "mov":
+      return ["h264"];
+    case "webm":
+      return ["vp9", "av1"];
+    default:
+      return [];
+  }
+}
+
+/** The codec the picture is encoded with, or `null` for formats without a choice. */
+export function codecOf(options: Pick<ConvertOptions, "format" | "videoCodec">): VideoCodec | null {
+  const codecs = videoCodecs(options.format);
+  if (options.videoCodec && codecs.includes(options.videoCodec)) return options.videoCodec;
+  return codecs[0] ?? null;
+}
+
+/**
+ * The codec choice to keep when switching to `format`: the same codec if the
+ * format can hold it (AV1 MP4 → AV1 WebM), otherwise the format's usual one.
+ */
+export function codecFor(format: OutputFormat, codec: VideoCodec | null): VideoCodec | null {
+  return codec && videoCodecs(format).includes(codec) ? codec : null;
+}
+
+export const CODEC_LABELS: Record<VideoCodec, string> = { h264: "H.264", vp9: "VP9", av1: "AV1" };
+
+/** One line on what picking `codec` means. */
+export function codecHint(codec: VideoCodec): string {
+  switch (codec) {
+    case "av1":
+      return "Smaller files that keep HDR, but slower to make. Plays on recent devices and browsers.";
+    case "vp9":
+      return "Plays in every browser.";
+    default:
+      return "Plays everywhere, quick to make.";
+  }
+}
+
 /** Tile colour for each kind of file. */
 export const KIND_TONE: Record<MediaKind, Tone> = {
   video: "pink",
@@ -210,6 +258,7 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     crop: null,
     quality: 60,
     keepAudio: true,
+    videoCodec: null,
     jxl: { lossless: false, effort: 7, progressive: false },
     sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
     metadata: "noLocation",
@@ -421,6 +470,7 @@ export function fitOptions(
   if (formatKind(options.format, info.kind) === "audio" && info.audioCodec === null) return null;
   const fitted = {
     ...options,
+    videoCodec: codecFor(options.format, options.videoCodec ?? null),
     jxl: { ...options.jxl },
     sound: { ...options.sound },
     trimStart: null,
@@ -487,6 +537,8 @@ export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
     if (options.direction !== "forward") parts.push(options.direction);
   }
   const video = out === "video" && !isAnimatedImage(options.format, info.kind);
+  const codec = codecOf(options);
+  if (video && codec && codec !== videoCodecs(options.format)[0]) parts.push(CODEC_LABELS[codec]);
   if (video && !options.keepAudio) parts.push("no sound");
   parts.push(isLossless(options) ? "lossless" : qualityStep(options.quality).toLowerCase());
   if (outputHasSound(info, options)) {

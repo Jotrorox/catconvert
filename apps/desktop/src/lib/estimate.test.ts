@@ -68,6 +68,7 @@ describe("estimateBytes", () => {
     const cases: [MediaInfo, OutputFormat][] = [
       [clip, "mp4"],
       [clip, "webm"],
+      [clip, "mkv"],
       [clip, "gif"],
       [clip, "jxl"],
       [song, "mp3"],
@@ -93,6 +94,18 @@ describe("estimateBytes", () => {
     expect(mp4).toBeLessThan(40e6);
     // Sharing-size 720p is much smaller.
     expect(size(clip, "mp4", { maxSize: 720, quality: 40 })).toBeLessThan(mp4 / 2);
+  });
+
+  it("expects AV1 to be smaller than H.264 and to grow with quality", () => {
+    const av1 = { videoCodec: "av1" as const };
+    for (const format of ["mp4", "mkv"] as const) {
+      expect(size(clip, format, av1), format).toBeLessThan(size(clip, format) * 0.8);
+      expect(size(clip, format, av1), format).toBeGreaterThan(size(clip, format) * 0.4);
+    }
+    expect(size(clip, "webm", { ...av1, quality: 0 })).toBeLessThan(size(clip, "webm", av1));
+    expect(size(clip, "webm", av1)).toBeLessThan(size(clip, "webm", { ...av1, quality: 100 }));
+    // MOV can't hold AV1, so the choice doesn't count there.
+    expect(size(clip, "mov", av1)).toBe(size(clip, "mov"));
   });
 
   it("follows trims, dropped sound, frame rate and size", () => {

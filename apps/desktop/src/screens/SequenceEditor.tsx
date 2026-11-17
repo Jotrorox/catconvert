@@ -8,6 +8,7 @@ import {
   onCleanup,
   Show,
 } from "solid-js";
+import { CodecField } from "../components/CodecField";
 import { Icon } from "../components/Icon";
 import { QualityField } from "../components/QualityField";
 import {
@@ -19,6 +20,7 @@ import {
 import { describeSequenceEstimate } from "../lib/estimate";
 import { formatBytes, formatSpan } from "../lib/format";
 import {
+  codecOf,
   DIRECTIONS,
   FRAME_TIMES,
   isLossless,
@@ -38,6 +40,7 @@ import {
   closeEditor,
   convertSequence,
   isAnimated,
+  isCodecAvailable,
   movePicture,
   removePicture,
   type SequenceDraft,
@@ -191,7 +194,14 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
   const setJxl = (patch: Partial<ConvertOptions["jxl"]>) =>
     updateSequenceOptions({ jxl: { ...options().jxl, ...patch } });
   const estimate = createMemo(() => describeSequenceEstimate(pictures(), options()));
-  const ready = () => state.ffmpeg?.found === true && isAnimated(options().format);
+  const ready = () => {
+    const codec = codecOf(options());
+    return (
+      state.ffmpeg?.found === true &&
+      isAnimated(options().format) &&
+      (codec === null || isCodecAvailable(codec))
+    );
+  };
   const unavailableReason = (format: ConvertOptions["format"]) =>
     format === "jxl"
       ? "Install libjxl (brew install jpeg-xl) or an ffmpeg with libjxl_anim for animated JXL"
@@ -411,6 +421,13 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
               </For>
             </div>
           </fieldset>
+
+          <CodecField
+            format={options().format}
+            codec={options().videoCodec ?? null}
+            available={isCodecAvailable}
+            onChange={(videoCodec) => updateSequenceOptions({ videoCodec })}
+          />
 
           <fieldset class="field">
             <legend class="field-label">Each picture shows for</legend>

@@ -11,7 +11,10 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::convert::{JxlSupport, OutputFormat, Plan, Step, Support, TONE_MAP_FILTER, Tool};
+use crate::convert::{
+    ConvertOptions, JxlSupport, OutputFormat, Plan, Step, Support, TONE_MAP_FILTER, Tool,
+    VideoCodec,
+};
 use crate::jxl::{self, JxlTools};
 use crate::media::{self, MediaInfo, MediaKind};
 use crate::scrub;
@@ -256,6 +259,51 @@ impl Ffmpeg {
                 format.encoder()
             )),
         }
+    }
+
+    /// Why `codec` can't be written, or `None` if it can.
+    #[must_use]
+    pub fn missing_codec(&self, codec: VideoCodec) -> Option<String> {
+        (!self.has_encoder(codec.encoder())).then(|| {
+            format!(
+                "this ffmpeg can't write {} video (missing the {} encoder)",
+                codec.label(),
+                codec.encoder()
+            )
+        })
+    }
+
+    /// Why the file `options` describe can't be written, or `None` if it
+    /// can: [`Ffmpeg::missing`], asking for the chosen video codec's encoder
+    /// rather than the format's usual one.
+    #[must_use]
+    pub fn missing_output(&self, options: &ConvertOptions) -> Option<String> {
+        match options.codec() {
+            Some(codec) => self.missing_codec(codec),
+            None => self.missing(options.format),
+        }
+    }
+
+    /// Whether this ffmpeg decodes AV1 (video, and AVIF pictures) without
+    /// hardware help, with dav1d or libaom. Its own `av1` decoder only drives
+    /// hardware decoders, which CatConvert doesn't ask for.
+    #[must_use]
+    pub fn reads_av1(&self) -> bool {
+        AV1_DECODERS
+            .iter()
+            .any(|name| self.decoders.contains(*name))
+    }
+
+    /// Why ffmpeg can't decode the picture of `info`, or `None` if it can
+    /// (as far as one can tell before trying).
+    #[must_use]
+    pub fn unreadable(&self, info: &MediaInfo) -> Option<String> {
+        (info.video_codec.as_deref() == Some("av1") && !self.reads_av1()).then(|| {
+            format!(
+                "this ffmpeg can't read the AV1 picture of {}: it needs one built with dav1d",
+                info.file_name
+            )
+        })
     }
 
     /// Why `format` can't be written as an animation, or `None` if it can.
@@ -933,8 +981,16 @@ fn parse_codecs(output: &str) -> HashSet<String> {
         .collect()
 }
 
+/// Software AV1 decoders, in ffmpeg's order of preference.
+const AV1_DECODERS: [&str; 2] = ["libdav1d", "libaom-av1"];
+
 /// Pick the line of ffmpeg's error output most likely to make sense to a person.
 fn friendly_error(stderr: &str) -> Option<String> {
+    // ffmpeg's own AV1 decoder only works with a hardware decoder and says so
+    // in terms nobody can act on.
+    if stderr.contains("hardware accelerated AV1 decoding") {
+        return Some("This ffmpeg can't read AV1 video: it needs one built with dav1d".into());
+    }
     let line = stderr.lines().rev().map(str::trim).find(|line| {
         !line.is_empty()
             && !line.starts_with("Conversion failed")
@@ -1257,6 +1313,16 @@ mod tests {
             Some("Width not divisible by 2")
         );
         assert_eq!(friendly_error("\n\n"), None);
+    }
+
+    #[test]
+    fn friendly_error_explains_missing_av1_decoder() {
+        let stderr = "[av1 @ 0x1] Your platform doesn't support hardware accelerated AV1 decoding.\n\
+                      [av1 @ 0x1] Failed to get pixel format.\nConversion failed!\n";
+        assert_eq!(
+            friendly_error(stderr).as_deref(),
+            Some("This ffmpeg can't read AV1 video: it needs one built with dav1d")
+        );
     }
 
     #[test]

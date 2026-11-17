@@ -53,6 +53,8 @@ function status(found = true): FfmpegStatus {
       available: found && format !== "webp",
       animated: found && ["mp4", "webm", "mov", "mkv", "gif", "jxl"].includes(format),
     })),
+    videoCodecs: found ? ["h264", "vp9", "av1"] : [],
+    readsAv1: found,
     libjxl: found ? "0.13.0" : null,
     jxl: {
       cjxl: found,
@@ -299,6 +301,7 @@ describe("CatConvert", () => {
       crop: null,
       quality: 60,
       keepAudio: false,
+      videoCodec: null,
       jxl: { lossless: false, effort: 7, progressive: false },
       sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
       metadata: "noLocation",
@@ -330,6 +333,41 @@ describe("CatConvert", () => {
     expect(api.revealInFolder).toHaveBeenCalledWith("/clips/clip.webm");
     expect(screen.getByText("All done. Purrfect.")).toBeInTheDocument();
     expect(state.history[0]?.outputBytes).toBe(3_000_000);
+  });
+
+  it("encodes video as AV1 where the format can hold it", async () => {
+    await openVideo();
+    const codecs = () => within(screen.getByRole("group", { name: "Video codec" }));
+    expect(codecs().getByRole("button", { name: "H.264" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(codecs().getByRole("button", { name: "AV1" }));
+    expect(codecs().getByRole("button", { name: "AV1" })).toHaveAttribute("aria-pressed", "true");
+    const changes = within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes.getByText("AV1")).toBeInTheDocument();
+
+    // WebM can hold AV1 too; MOV can't, so the choice falls back to H.264.
+    fireEvent.click(screen.getByRole("button", { name: "WEBM" }));
+    expect(codecs().getByRole("button", { name: "AV1" })).toHaveAttribute("aria-pressed", "true");
+    expect(codecs().getByRole("button", { name: "VP9" })).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(screen.getByRole("button", { name: "MOV" }));
+    expect(screen.queryByRole("group", { name: "Video codec" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "MKV" }));
+    expect(codecs().getByRole("button", { name: "H.264" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(codecs().getByRole("button", { name: "AV1" }));
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ format: "mkv", videoCodec: "av1" }),
+    );
+  });
+
+  it("says so when ffmpeg can't read an AV1 file", async () => {
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({ ...status(), readsAv1: false });
+    vi.mocked(api.probeFile).mockResolvedValue({ ...VIDEO, videoCodec: "av1" });
+    await openVideo();
+    expect(screen.getByRole("alert")).toHaveTextContent(/AV1, which your ffmpeg can't read/);
+    expect(screen.getByRole("button", { name: /Start converting/ })).toBeDisabled();
   });
 
   it("crops to a shape that follows the picture when it turns", async () => {
