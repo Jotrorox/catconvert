@@ -329,6 +329,11 @@ pub struct ConvertOptions {
     /// format's usual one (see [`OutputFormat::video_codecs`]). Ignored for
     /// other formats.
     pub video_codec: Option<VideoCodec>,
+    /// Exact average bitrate of the picture in kbit/s instead of the CRF
+    /// that `quality` picks, for MP4, MOV, MKV and WebM files. H.264 and VP9
+    /// get there in two passes, AV1 in one. `None` uses `quality`. Ignored
+    /// for other formats and for animations made from pictures.
+    pub video_bitrate: Option<u32>,
     /// JPEG XL settings, ignored for other formats.
     pub jxl: JxlOptions,
     /// Loudness and fades, ignored when the output has no sound.
@@ -373,6 +378,7 @@ impl Default for ConvertOptions {
             quality: 60,
             keep_audio: true,
             video_codec: None,
+            video_bitrate: None,
             jxl: JxlOptions::default(),
             sound: SoundOptions::default(),
             metadata: Metadata::default(),
@@ -604,6 +610,16 @@ pub fn plan(
         return Err(Error::unsupported("this file has no sound to keep"));
     }
     options.check_codec()?;
+    if let Some(kbps) = options.video_bitrate
+        && !VIDEO_KBPS.contains(&kbps)
+        && options.codec().is_some()
+    {
+        return Err(Error::unsupported(format!(
+            "the video bitrate must be between {} kbps and {} Mbps, not {kbps} kbps",
+            VIDEO_KBPS.start(),
+            VIDEO_KBPS.end() / 1000
+        )));
+    }
     if !matches!(options.rotate, 0 | 90 | 180 | 270) {
         return Err(Error::unsupported(
             "rotation must be 0, 90, 180 or 270 degrees",
@@ -856,6 +872,38 @@ pub fn plan(
         ));
         steps.push(scrub_step(&encoded, output, metadata));
         scratch.push(encoded);
+    } else if video_rate(options).is_some_and(|rate| rate.passes == 2) {
+        // An exact bitrate, met evenly across the clip: the first pass
+        // measures how hard each part is to encode, the second spends the
+        // bits accordingly. x264 writes `<log>-0.log` and its `.mbtree`
+        // (as `.temp` files until done), libvpx just the first.
+        let log = scratch_path(output, "passlog", "stats");
+        steps.push(ffmpeg_step(
+            &source,
+            options,
+            trim,
+            Sink::FirstPass { log: &log },
+            Path::new("-"),
+            tone_map,
+        ));
+        steps.push(ffmpeg_step(
+            &source,
+            options,
+            trim,
+            Sink::SecondPass { log: &log },
+            output,
+            tone_map,
+        ));
+        let stats = log.to_string_lossy();
+        scratch.extend(
+            [
+                "-0.log",
+                "-0.log.temp",
+                "-0.log.mbtree",
+                "-0.log.mbtree.temp",
+            ]
+            .map(|suffix| PathBuf::from(format!("{stats}{suffix}"))),
+        );
     } else {
         steps.push(ffmpeg_step(
             &source,
@@ -877,9 +925,14 @@ pub fn plan(
 
 /// Where an ffmpeg step writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Sink {
+enum Sink<'a> {
     /// The final file, in `options.format`.
     Output,
+    /// The analysis pass of a two-pass video encode: it writes only the
+    /// encoder's statistics, to log files starting with `log`.
+    FirstPass { log: &'a Path },
+    /// The final file, encoded with the statistics of a [`Sink::FirstPass`].
+    SecondPass { log: &'a Path },
     /// Lossless PNG (or APNG when `animated`) for another tool to pick up.
     Frames { animated: bool },
 }
@@ -897,6 +950,10 @@ fn ffmpeg_step(
     tone_map: bool,
 ) -> Step {
     let format = options.format;
+    let passlog = match sink {
+        Sink::SecondPass { log } => Some(log),
+        _ => None,
+    };
     let animated = format.animates(input.kind);
     let out_kind = if animated {
         MediaKind::Video
@@ -983,6 +1040,22 @@ fn ffmpeg_step(
             }
         }
         (_, Sink::Frames { .. }) => unreachable!("only JPEG XL goes through intermediate frames"),
+        (
+            OutputFormat::Mp4 | OutputFormat::Mov | OutputFormat::Mkv | OutputFormat::Webm,
+            Sink::FirstPass { log },
+        ) => {
+            // The analysis pass sees the same frames as the real one: the
+            // fades of the sound take the picture along there too.
+            let mut filters = video_filters(input, options, None, true);
+            if options.keep_audio && input.has_audio() {
+                filters.extend(fades("fade", options.sound, t0, duration_secs));
+            }
+            push_video(&mut push, input, &[], &filters);
+            let rate = video_rate(options)
+                .unwrap_or_else(|| VideoRate::constant(VideoCodec::H264, options.quality));
+            push_video_encoder(&mut push, rate, Some((1, log)));
+            push(&["-an", "-sn", "-dn", "-f", "null"]);
+        }
         (OutputFormat::Mp4 | OutputFormat::Mov | OutputFormat::Mkv | OutputFormat::Webm, _) => {
             let keep_audio = options.keep_audio && input.has_audio();
             let audio: &[&str] = if keep_audio { &["-map", "0:a:0"] } else { &[] };
@@ -998,20 +1071,20 @@ fn ffmpeg_step(
                     push(&["-af", &audio.join(",")]);
                 }
             }
-            push_video_encoder(&mut push, options.codec().unwrap_or(VideoCodec::H264), q);
-            if keep_audio {
-                if format == OutputFormat::Webm {
-                    push(&["-c:a", "libopus", "-b:a", tiered(q, ["64k", "96k", "160k"])]);
-                } else {
-                    push(&["-c:a", "aac", "-b:a", tiered(q, ["96k", "128k", "192k"])]);
-                }
-            } else {
-                push(&["-an"]);
+            let rate = video_rate(options)
+                .unwrap_or_else(|| VideoRate::constant(VideoCodec::H264, options.quality));
+            push_video_encoder(&mut push, rate, passlog.map(|log| (2, log)));
+            match audio_rate(input, options).filter(|_| keep_audio) {
+                Some(rate) => push_audio_encoder(&mut push, format, rate),
+                None => push(&["-an"]),
             }
             push(&["-sn", "-dn"]);
             if matches!(format, OutputFormat::Mp4 | OutputFormat::Mov) {
                 push(&["-movflags", "+faststart"]);
             }
+        }
+        (_, Sink::FirstPass { .. } | Sink::SecondPass { .. }) => {
+            unreachable!("only video files are encoded in two passes")
         }
         (OutputFormat::Gif, _) => {
             let mut filters = tone_mapped(animation_filters(input, options, lead_trim));
@@ -1050,18 +1123,11 @@ fn ffmpeg_step(
             if !audio.is_empty() {
                 push(&["-af", &audio.join(",")]);
             }
-            match format {
-                OutputFormat::Mp3 => {
-                    let vbr = lerp(q, 7.0, 0.0).to_string();
-                    push(&["-c:a", "libmp3lame", "-q:a", &vbr]);
-                }
-                OutputFormat::M4a => {
-                    push(&["-c:a", "aac", "-b:a", tiered(q, ["128k", "192k", "256k"])]);
-                    push(&["-movflags", "+faststart"]);
-                }
-                OutputFormat::Wav => push(&["-c:a", "pcm_s16le"]),
-                OutputFormat::Flac => push(&["-c:a", "flac"]),
-                _ => push(&["-c:a", "libopus", "-b:a", tiered(q, ["64k", "96k", "160k"])]),
+            if let Some(rate) = audio_rate(input, options) {
+                push_audio_encoder(&mut push, format, rate);
+            }
+            if format == OutputFormat::M4a {
+                push(&["-movflags", "+faststart"]);
             }
         }
         (
@@ -1104,6 +1170,7 @@ fn ffmpeg_step(
     }
 
     match options.metadata {
+        _ if matches!(sink, Sink::FirstPass { .. }) => {}
         Metadata::Keep => {}
         // Videos keep their place in container tags, e.g. `location` or
         // `com.apple.quicktime.location.ISO6709`; an empty value deletes one.
@@ -1117,10 +1184,11 @@ fn ffmpeg_step(
         }
     }
     args.push(out.as_os_str().to_owned());
-    let weight = if matches!(sink, Sink::Frames { .. }) {
-        0.4
-    } else {
-        1.0
+    let weight = match sink {
+        Sink::Frames { .. } => 0.4,
+        // x264 and libvpx analyse quickly on the first pass.
+        Sink::FirstPass { .. } => 0.5,
+        Sink::Output | Sink::SecondPass { .. } => 1.0,
     };
     Step {
         tool: Tool::Ffmpeg,
@@ -1232,38 +1300,236 @@ fn push_video(
     }
 }
 
-/// The video encoder of `codec` at quality `q`, in a pixel format every
-/// player of that codec reads.
+/// The video encoder of `rate.codec` at `rate`, in a pixel format every
+/// player of that codec reads. `pass` is the pass number and log file
+/// prefix of a two-pass encode.
 ///
 /// AV1 is written in 10 bits: every AV1 decoder handles them (they are part
 /// of the Main profile), they compress better than 8 bits even for SDR
 /// sources, and HDR video keeps its HDR (ffmpeg passes the source's colour
 /// tags on to SVT-AV1). SVT-AV1's preset 8 is about as quick as x264's
 /// `fast` and still well ahead of it in size.
-pub(crate) fn push_video_encoder(push: &mut impl FnMut(&[&str]), codec: VideoCodec, q: u8) {
-    match codec {
+pub(crate) fn push_video_encoder(
+    push: &mut impl FnMut(&[&str]),
+    rate: VideoRate,
+    pass: Option<(u8, &Path)>,
+) {
+    let target = rate.kbps.map(|kbps| format!("{kbps}k"));
+    let crf = rate.crf.map(|crf| crf.to_string());
+    match rate.codec {
         VideoCodec::H264 => {
-            let crf = lerp(q, 34.0, 18.0).to_string();
-            push(&["-c:v", "libx264", "-preset", "fast", "-crf", &crf]);
-            push(&["-pix_fmt", "yuv420p"]);
+            push(&["-c:v", "libx264", "-preset", "fast"]);
+            match (&target, &crf) {
+                (Some(target), _) => push(&["-b:v", target]),
+                (None, Some(crf)) => push(&["-crf", crf]),
+                (None, None) => {}
+            }
         }
         VideoCodec::Vp9 => {
-            let crf = lerp(q, 48.0, 28.0).to_string();
-            push(&["-c:v", "libvpx-vp9", "-crf", &crf, "-b:v", "0"]);
+            push(&["-c:v", "libvpx-vp9"]);
+            match (&target, &crf) {
+                (Some(target), _) => push(&["-b:v", target]),
+                // Constant quality needs the bitrate cap off.
+                (None, Some(crf)) => push(&["-crf", crf, "-b:v", "0"]),
+                (None, None) => {}
+            }
             push(&["-row-mt", "1", "-deadline", "good", "-cpu-used", "4"]);
-            push(&["-pix_fmt", "yuv420p"]);
         }
         VideoCodec::Av1 => {
-            let crf = lerp(q, AV1_CRF.0, AV1_CRF.1).to_string();
-            push(&["-c:v", "libsvtav1", "-preset", "8", "-crf", &crf]);
-            push(&["-pix_fmt", "yuv420p10le"]);
+            push(&["-c:v", "libsvtav1", "-preset", "8"]);
+            match (&target, &crf) {
+                // SVT-AV1 aims for an average (VBR) when given a bitrate.
+                (Some(target), _) => push(&["-b:v", target]),
+                (None, Some(crf)) => push(&["-crf", crf]),
+                (None, None) => {}
+            }
+        }
+    }
+    if let Some((pass, log)) = pass {
+        push(&["-pass", &pass.to_string()]);
+        push(&["-passlogfile", &log.to_string_lossy()]);
+    }
+    let pix_fmt = if rate.codec == VideoCodec::Av1 {
+        "yuv420p10le"
+    } else {
+        "yuv420p"
+    };
+    push(&["-pix_fmt", pix_fmt]);
+}
+
+/// The CRF of each video encoder at quality 0 and 100. x264's default
+/// quality of 60 lands at 24; SVT-AV1's at 32, which looks about the same.
+#[must_use]
+pub fn crf_range(codec: VideoCodec) -> (u8, u8) {
+    match codec {
+        VideoCodec::H264 => (34, 18),
+        VideoCodec::Vp9 => (48, 28),
+        VideoCodec::Av1 => (48, 22),
+    }
+}
+
+/// The CRF `codec` is encoded with at quality `q`.
+fn crf(codec: VideoCodec, q: u8) -> u8 {
+    let (worst, best) = crf_range(codec);
+    let crf = lerp(q.min(100), f64::from(worst), f64::from(best));
+    u8::try_from(crf).unwrap_or(worst)
+}
+
+/// Slowest and fastest exact video bitrate in kbit/s.
+pub const VIDEO_KBPS: std::ops::RangeInclusive<u32> = 100..=200_000;
+
+/// Opus bitrates in kbit/s for low, middle and high quality.
+const OPUS_KBPS: [u32; 3] = [64, 96, 160];
+/// AAC bitrates in kbit/s alongside a picture (MP4, MOV, MKV).
+const AAC_VIDEO_KBPS: [u32; 3] = [96, 128, 192];
+/// AAC bitrates in kbit/s for music (M4A), a step above video's.
+const AAC_MUSIC_KBPS: [u32; 3] = [128, 192, 256];
+/// LAME's typical average bitrate in kbit/s for VBR levels V0 to V7.
+const MP3_VBR_KBPS: [u32; 8] = [245, 225, 190, 175, 165, 130, 115, 100];
+
+/// How the sound of an output is encoded: what the quality setting
+/// becomes for it. See [`quality_summary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum AudioRate {
+    /// AAC or Opus aiming for this many kbit/s.
+    Bitrate { kbps: u32 },
+    /// MP3 at LAME's VBR level (`-q:a`, 0 best to 7 smallest), which
+    /// averages about `kbps` kbit/s depending on the sound.
+    Vbr { level: u8, kbps: u32 },
+    /// FLAC: every sample kept, at whatever size that takes.
+    Lossless,
+    /// WAV: uncompressed 16-bit PCM at `kbps` kbit/s, `None` when the
+    /// source's sample rate or channel count is unknown.
+    Pcm { kbps: Option<u32> },
+}
+
+/// How the picture of a video file is encoded: what the quality setting (or
+/// an exact bitrate) becomes for it. See [`quality_summary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoRate {
+    pub codec: VideoCodec,
+    /// Constant rate factor; `None` with an exact bitrate.
+    pub crf: Option<u8>,
+    /// Exact average bitrate in kbit/s; `None` with a CRF.
+    pub kbps: Option<u32>,
+    /// Encoding passes: 2 for an exact H.264 or VP9 bitrate, otherwise 1.
+    pub passes: u8,
+}
+
+impl VideoRate {
+    /// The CRF `codec` gets at quality `q`.
+    pub(crate) fn constant(codec: VideoCodec, q: u8) -> Self {
+        Self {
+            codec,
+            crf: Some(crf(codec, q)),
+            kbps: None,
+            passes: 1,
         }
     }
 }
 
-/// SVT-AV1's CRF at quality 0 and 100. The default quality of 60 lands at
-/// 32, which looks about like x264's 24.
-const AV1_CRF: (f64, f64) = (48.0, 22.0);
+/// What the quality setting means in numbers for one conversion. The planned
+/// command uses exactly these values; `None` where the output has no sound,
+/// or no picture with a bitrate (stills, GIFs and other animations).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualitySummary {
+    pub audio: Option<AudioRate>,
+    pub video: Option<VideoRate>,
+}
+
+/// The audio bitrate and video CRF (or exact bitrate) that converting
+/// `input` with `options` uses, so the quality setting can be shown in
+/// numbers. Doesn't validate the options; [`plan`] does.
+#[must_use]
+pub fn quality_summary(input: &MediaInfo, options: &ConvertOptions) -> QualitySummary {
+    let format = options.format;
+    let has_picture = format.kind() == MediaKind::Video && !format.animates(input.kind);
+    let video = has_picture.then(|| video_rate(options)).flatten();
+    let has_sound = input.has_audio()
+        && match format.kind() {
+            MediaKind::Audio => true,
+            MediaKind::Video => options.keep_audio && video.is_some(),
+            _ => false,
+        };
+    QualitySummary {
+        audio: has_sound.then(|| audio_rate(input, options)).flatten(),
+        video,
+    }
+}
+
+/// How the picture of a video file is encoded, or `None` for formats
+/// without a video codec choice (GIFs, animations, stills, sound).
+fn video_rate(options: &ConvertOptions) -> Option<VideoRate> {
+    let codec = options.codec()?;
+    Some(match options.video_bitrate {
+        Some(kbps) => VideoRate {
+            codec,
+            crf: None,
+            kbps: Some(kbps),
+            // ffmpeg's SVT-AV1 wrapper has no two-pass mode.
+            passes: if codec == VideoCodec::Av1 { 1 } else { 2 },
+        },
+        None => VideoRate::constant(codec, options.quality),
+    })
+}
+
+/// How the sound is encoded in `options.format`, or `None` if that format
+/// has no sound.
+fn audio_rate(input: &MediaInfo, options: &ConvertOptions) -> Option<AudioRate> {
+    let q = options.quality.min(100);
+    Some(match options.format {
+        OutputFormat::Mp4 | OutputFormat::Mov | OutputFormat::Mkv => AudioRate::Bitrate {
+            kbps: tiered(q, AAC_VIDEO_KBPS),
+        },
+        OutputFormat::Webm | OutputFormat::Ogg => AudioRate::Bitrate {
+            kbps: tiered(q, OPUS_KBPS),
+        },
+        OutputFormat::M4a => AudioRate::Bitrate {
+            kbps: tiered(q, AAC_MUSIC_KBPS),
+        },
+        OutputFormat::Mp3 => {
+            let level = u8::try_from(lerp(q, 7.0, 0.0)).unwrap_or(4);
+            AudioRate::Vbr {
+                level,
+                kbps: MP3_VBR_KBPS[usize::from(level.min(7))],
+            }
+        }
+        OutputFormat::Flac => AudioRate::Lossless,
+        OutputFormat::Wav => {
+            // loudnorm resamples, and the rate it settles on is the source's.
+            let rate = input
+                .sample_rate
+                .or(options.sound.normalize.then_some(FALLBACK_SAMPLE_RATE));
+            let kbps = rate
+                .zip(input.audio_channels)
+                .map(|(rate, channels)| rate.saturating_mul(channels).saturating_mul(16) / 1000);
+            AudioRate::Pcm { kbps }
+        }
+        _ => return None,
+    })
+}
+
+/// The ffmpeg encoder arguments for the sound in `format` at `rate`.
+fn push_audio_encoder(push: &mut impl FnMut(&[&str]), format: OutputFormat, rate: AudioRate) {
+    match rate {
+        AudioRate::Bitrate { kbps } => {
+            let codec = if matches!(format, OutputFormat::Webm | OutputFormat::Ogg) {
+                "libopus"
+            } else {
+                "aac"
+            };
+            push(&["-c:a", codec, "-b:a", &format!("{kbps}k")]);
+        }
+        AudioRate::Vbr { level, .. } => {
+            push(&["-c:a", "libmp3lame", "-q:a", &level.to_string()]);
+        }
+        AudioRate::Lossless => push(&["-c:a", "flac"]),
+        AudioRate::Pcm { .. } => push(&["-c:a", "pcm_s16le"]),
+    }
+}
 
 /// libwebp's animation encoder at quality `q`, looping forever.
 pub(crate) fn push_animated_webp(push: &mut impl FnMut(&[&str]), q: u8) {
@@ -1801,6 +2067,10 @@ mod tests {
             video_codec: Some("h264".into()),
             audio_codec: Some("aac".into()),
             sample_rate: Some(44_100),
+            audio_channels: Some(2),
+            bitrate: None,
+            video_bitrate: None,
+            audio_bitrate: None,
             reconstructs_jpeg: false,
             hdr: false,
             has_location: false,
@@ -3505,5 +3775,368 @@ mod tests {
         assert_eq!(shell_quote("/a/b.mp4"), "/a/b.mp4");
         assert_eq!(shell_quote("my clip.mov"), "'my clip.mov'");
         assert_eq!(shell_quote("it's.mov"), r"'it'\''s.mov'");
+    }
+
+    #[test]
+    fn crf_follows_quality_within_each_codecs_range() {
+        for codec in [VideoCodec::H264, VideoCodec::Vp9, VideoCodec::Av1] {
+            let (worst, best) = crf_range(codec);
+            assert_eq!(crf(codec, 0), worst, "{codec:?}");
+            assert_eq!(crf(codec, 100), best, "{codec:?}");
+            assert_eq!(crf(codec, 255), best, "{codec:?} clamps");
+            let mut last = worst;
+            for q in 0..=100 {
+                let value = crf(codec, q);
+                assert!(value <= last && value >= best, "{codec:?} at {q}");
+                last = value;
+            }
+        }
+        // The default quality of 60.
+        assert_eq!(crf(VideoCodec::H264, 60), 24);
+        assert_eq!(crf(VideoCodec::Vp9, 60), 36);
+        assert_eq!(crf(VideoCodec::Av1, 60), 32);
+    }
+
+    #[test]
+    fn audio_bitrate_tiers() {
+        let input = video("song.mov");
+        let audio = |format, quality| {
+            let options = ConvertOptions {
+                format,
+                quality,
+                ..ConvertOptions::default()
+            };
+            quality_summary(&input, &options).audio
+        };
+        let kbps = |kbps| Some(AudioRate::Bitrate { kbps });
+        for (quality, aac, opus, music) in [
+            (0, 96, 64, 128),
+            (33, 96, 64, 128),
+            (34, 128, 96, 192),
+            (60, 128, 96, 192),
+            (66, 128, 96, 192),
+            (67, 192, 160, 256),
+            (100, 192, 160, 256),
+        ] {
+            for format in [OutputFormat::Mp4, OutputFormat::Mov, OutputFormat::Mkv] {
+                assert_eq!(audio(format, quality), kbps(aac), "{format:?} at {quality}");
+            }
+            assert_eq!(audio(OutputFormat::Webm, quality), kbps(opus));
+            assert_eq!(audio(OutputFormat::Ogg, quality), kbps(opus));
+            assert_eq!(audio(OutputFormat::M4a, quality), kbps(music));
+        }
+        assert_eq!(
+            audio(OutputFormat::Mp3, 0),
+            Some(AudioRate::Vbr {
+                level: 7,
+                kbps: 100
+            })
+        );
+        assert_eq!(
+            audio(OutputFormat::Mp3, 60),
+            Some(AudioRate::Vbr {
+                level: 3,
+                kbps: 175
+            })
+        );
+        assert_eq!(
+            audio(OutputFormat::Mp3, 100),
+            Some(AudioRate::Vbr {
+                level: 0,
+                kbps: 245
+            })
+        );
+        assert_eq!(audio(OutputFormat::Flac, 0), Some(AudioRate::Lossless));
+        // 44.1 kHz stereo at 16 bits.
+        assert_eq!(
+            audio(OutputFormat::Wav, 0),
+            Some(AudioRate::Pcm { kbps: Some(1411) })
+        );
+        let unknown = MediaInfo {
+            audio_channels: None,
+            ..video("stream.mkv")
+        };
+        let wav = ConvertOptions {
+            format: OutputFormat::Wav,
+            ..ConvertOptions::default()
+        };
+        assert_eq!(
+            quality_summary(&unknown, &wav).audio,
+            Some(AudioRate::Pcm { kbps: None })
+        );
+    }
+
+    #[test]
+    fn quality_summary_only_covers_what_the_output_has() {
+        let input = video("garden.mov");
+        let summary = |input: &MediaInfo, options: ConvertOptions| quality_summary(input, &options);
+        let mp4 = ConvertOptions::default();
+        assert_eq!(
+            summary(&input, mp4.clone()),
+            QualitySummary {
+                audio: Some(AudioRate::Bitrate { kbps: 128 }),
+                video: Some(VideoRate {
+                    codec: VideoCodec::H264,
+                    crf: Some(24),
+                    kbps: None,
+                    passes: 1,
+                }),
+            }
+        );
+        let muted = ConvertOptions {
+            keep_audio: false,
+            ..mp4.clone()
+        };
+        assert_eq!(summary(&input, muted).audio, None);
+        let silent = MediaInfo {
+            audio_codec: None,
+            ..video("silent.mov")
+        };
+        assert_eq!(summary(&silent, mp4).audio, None);
+        for format in [OutputFormat::Gif, OutputFormat::Webp, OutputFormat::Png] {
+            let options = ConvertOptions {
+                format,
+                ..ConvertOptions::default()
+            };
+            assert_eq!(
+                summary(&input, options),
+                QualitySummary::default(),
+                "{format:?}"
+            );
+        }
+        let mp3 = ConvertOptions {
+            format: OutputFormat::Mp3,
+            video_bitrate: Some(4000),
+            ..ConvertOptions::default()
+        };
+        assert_eq!(summary(&input, mp3).video, None);
+    }
+
+    /// The summary is what the command does: every quality, every format.
+    #[test]
+    fn quality_summary_matches_the_command() {
+        let input = video("garden.mov");
+        let formats = [
+            OutputFormat::Mp4,
+            OutputFormat::Webm,
+            OutputFormat::Mov,
+            OutputFormat::Mkv,
+            OutputFormat::Mp3,
+            OutputFormat::M4a,
+            OutputFormat::Wav,
+            OutputFormat::Flac,
+            OutputFormat::Ogg,
+        ];
+        for format in formats {
+            for &video_codec in &[None, Some(VideoCodec::Av1)] {
+                if video_codec.is_some() && !format.video_codecs().contains(&VideoCodec::Av1) {
+                    continue;
+                }
+                for quality in (0..=100).step_by(5) {
+                    let options = ConvertOptions {
+                        format,
+                        quality,
+                        video_codec,
+                        ..ConvertOptions::default()
+                    };
+                    let out = format!("/clips/out.{}", format.extension());
+                    let cmd = command(&input, &options, &out);
+                    let summary = quality_summary(&input, &options);
+                    let audio = match summary.audio.expect("sound") {
+                        AudioRate::Bitrate { kbps } => format!("-b:a {kbps}k "),
+                        AudioRate::Vbr { level, .. } => format!("-q:a {level} "),
+                        AudioRate::Lossless => "-c:a flac ".into(),
+                        AudioRate::Pcm { .. } => "-c:a pcm_s16le ".into(),
+                    };
+                    assert!(cmd.contains(&audio), "{audio} in {cmd}");
+                    if let Some(rate) = summary.video {
+                        let preset = match rate.codec {
+                            VideoCodec::H264 => "-preset fast ",
+                            VideoCodec::Vp9 => "",
+                            VideoCodec::Av1 => "-preset 8 ",
+                        };
+                        let crf = rate.crf.expect("crf");
+                        let crf = format!("-c:v {} {preset}-crf {crf} ", rate.codec.encoder());
+                        assert!(cmd.contains(&crf), "{crf} in {cmd}");
+                    } else {
+                        assert_eq!(format.kind(), MediaKind::Audio);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_bitrate_encodes_h264_in_two_passes() {
+        let options = ConvertOptions {
+            video_bitrate: Some(4000),
+            sound: sound(false, 1.0, 0.0),
+            ..ConvertOptions::default()
+        };
+        let input = video("garden.mov");
+        let plan = plan(
+            &input,
+            &options,
+            Path::new("/clips/garden.mp4"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        assert_eq!(tools(&plan), [Tool::Ffmpeg, Tool::Ffmpeg]);
+        let cmd = plan.command_line();
+        assert_eq!(
+            cmd,
+            "ffmpeg -i /clips/garden.mov -map 0:v:0 -vf fade=t=in:d=1 \
+             -c:v libx264 -preset fast -b:v 4000k -pass 1 \
+             -passlogfile /clips/.garden.mp4.passlog.stats -pix_fmt yuv420p \
+             -an -sn -dn -f null - && \\\n  \
+             ffmpeg -i /clips/garden.mov -map 0:v:0 -map 0:a:0 -vf fade=t=in:d=1 \
+             -af afade=t=in:d=1 -c:v libx264 -preset fast -b:v 4000k -pass 2 \
+             -passlogfile /clips/.garden.mp4.passlog.stats -pix_fmt yuv420p \
+             -c:a aac -b:a 128k -sn -dn -movflags +faststart /clips/garden.mp4"
+        );
+        // Both passes cover the whole clip, for the progress bar.
+        assert!(plan.steps.iter().all(|s| s.duration_secs == Some(42.0)));
+        assert!(plan.steps[0].weight < plan.steps[1].weight);
+        assert_eq!(
+            plan.scratch,
+            [
+                "/clips/.garden.mp4.passlog.stats-0.log",
+                "/clips/.garden.mp4.passlog.stats-0.log.temp",
+                "/clips/.garden.mp4.passlog.stats-0.log.mbtree",
+                "/clips/.garden.mp4.passlog.stats-0.log.mbtree.temp",
+            ]
+            .map(PathBuf::from)
+        );
+        assert_eq!(
+            quality_summary(&input, &options).video,
+            Some(VideoRate {
+                codec: VideoCodec::H264,
+                crf: None,
+                kbps: Some(4000),
+                passes: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn exact_bitrate_for_vp9_and_av1() {
+        let input = video("garden.mov");
+        let webm = ConvertOptions {
+            format: OutputFormat::Webm,
+            video_bitrate: Some(2500),
+            metadata: Metadata::None,
+            ..ConvertOptions::default()
+        };
+        let plan = plan(
+            &input,
+            &webm,
+            Path::new("/clips/garden.webm"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let [first, second] = [0, 1].map(|i| {
+            plan.steps[i]
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        assert!(
+            first.contains(
+                "-c:v libvpx-vp9 -b:v 2500k -row-mt 1 -deadline good -cpu-used 4 -pass 1"
+            ),
+            "{first}"
+        );
+        // The first pass writes nothing, so it has no tags to drop.
+        assert!(first.ends_with("-an -sn -dn -f null -"), "{first}");
+        assert!(second.contains("-b:v 2500k -row-mt 1"), "{second}");
+        assert!(second.contains("-pass 2"), "{second}");
+        assert!(second.contains("-map_metadata -1"), "{second}");
+        assert!(!second.contains("-crf"), "{second}");
+
+        // SVT-AV1 has no two-pass mode in ffmpeg: one pass aiming for the average.
+        let av1 = ConvertOptions {
+            video_codec: Some(VideoCodec::Av1),
+            video_bitrate: Some(3000),
+            ..ConvertOptions::default()
+        };
+        let one = super::plan(
+            &input,
+            &av1,
+            Path::new("/clips/garden.mp4"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        assert_eq!(one.steps.len(), 1);
+        assert!(one.scratch.is_empty());
+        let cmd = one.command_line();
+        assert!(
+            cmd.contains("-c:v libsvtav1 -preset 8 -b:v 3000k -pix_fmt yuv420p10le"),
+            "{cmd}"
+        );
+        assert_eq!(
+            quality_summary(&input, &av1).video.map(|v| v.passes),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn exact_bitrate_must_be_sensible() {
+        let input = video("garden.mov");
+        for kbps in [0, 99, 200_001] {
+            let options = ConvertOptions {
+                video_bitrate: Some(kbps),
+                ..ConvertOptions::default()
+            };
+            let err = plan(
+                &input,
+                &options,
+                Path::new("/clips/a.mp4"),
+                JxlSupport::default(),
+            )
+            .expect_err("out of range");
+            assert!(err.to_string().contains("video bitrate"), "{err}");
+        }
+        // Formats without a video codec ignore it.
+        let gif = ConvertOptions {
+            format: OutputFormat::Gif,
+            video_bitrate: Some(0),
+            ..ConvertOptions::default()
+        };
+        assert!(
+            plan(
+                &input,
+                &gif,
+                Path::new("/clips/a.gif"),
+                JxlSupport::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn summaries_serialize_for_the_front_end() {
+        let summary = QualitySummary {
+            audio: Some(AudioRate::Vbr {
+                level: 2,
+                kbps: 190,
+            }),
+            video: Some(VideoRate::constant(VideoCodec::Av1, 60)),
+        };
+        assert_eq!(
+            serde_json::to_value(summary).expect("json"),
+            serde_json::json!({
+                "audio": {"mode": "vbr", "level": 2, "kbps": 190},
+                "video": {"codec": "av1", "crf": 32, "kbps": null, "passes": 1}
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(AudioRate::Pcm { kbps: None }).expect("json"),
+            serde_json::json!({"mode": "pcm", "kbps": null})
+        );
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"videoBitrate": 4000})).expect("options");
+        assert_eq!(options.video_bitrate, Some(4000));
     }
 }

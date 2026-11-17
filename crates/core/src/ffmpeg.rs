@@ -1100,11 +1100,56 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
             let rate = rate.round() as u32;
             rate
         });
+    info.audio_channels = audio
+        .and_then(|a| a["channels"].as_u64())
+        .and_then(|c| u32::try_from(c).ok())
+        .filter(|c| *c > 0);
     info.duration_secs = if info.kind == MediaKind::Image {
         None
     } else {
         duration
     };
+    // A bitrate only means something for sound and moving pictures.
+    if matches!(info.kind, MediaKind::Video | MediaKind::Audio) {
+        let total = as_bitrate(&format["bit_rate"]);
+        let sound = audio.and_then(stream_bitrate);
+        info.bitrate = total;
+        info.audio_bitrate = sound.or(if video.is_none() { total } else { None });
+        info.video_bitrate = match video {
+            Some(_) if info.kind == MediaKind::Video => {
+                video.and_then(stream_bitrate).or_else(|| {
+                    // What's left of the file's bitrate once the sound is
+                    // taken out; unknowable if the sound's own isn't known.
+                    let sound = if audio.is_some() { sound? } else { 0 };
+                    total?.checked_sub(sound).filter(|rest| *rest > 0)
+                })
+            }
+            _ => None,
+        };
+    }
+}
+
+/// A stream's average bitrate in bit/s: ffprobe's `bit_rate`, or the `BPS`
+/// tag mkvmerge writes into Matroska files, which have no field for it.
+fn stream_bitrate(stream: &Value) -> Option<u64> {
+    as_bitrate(&stream["bit_rate"]).or_else(|| {
+        stream["tags"]
+            .as_object()?
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("BPS") || key.starts_with("BPS-"))
+            .and_then(|(_, value)| as_bitrate(value))
+    })
+}
+
+/// A bitrate in bit/s from ffprobe's JSON, where it is a string of digits.
+fn as_bitrate(value: &Value) -> Option<u64> {
+    as_f64(value)
+        .filter(|rate| rate.is_finite() && *rate >= 1.0 && *rate < 1e15)
+        .map(|rate| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let rate = rate.round() as u64;
+            rate
+        })
 }
 
 /// Whether `ffmpeg -h filter=scale` lists the colour-management options of
@@ -1272,6 +1317,10 @@ mod tests {
             video_codec: None,
             audio_codec: None,
             sample_rate: None,
+            audio_channels: None,
+            bitrate: None,
+            video_bitrate: None,
+            audio_bitrate: None,
             reconstructs_jpeg: false,
             hdr: false,
             has_location: false,
@@ -1351,6 +1400,69 @@ mod tests {
         assert!(!info.has_location);
         assert_eq!(info.sample_rate, Some(48_000));
         assert!(!info.hdr);
+    }
+
+    #[test]
+    fn probe_json_reads_stream_bitrates() {
+        // MP4 and MOV record each stream's bitrate.
+        let mut info = base("clip.mp4");
+        apply_probe(
+            &mut info,
+            &json!({
+                "streams": [
+                    {"codec_type": "video", "codec_name": "h264", "bit_rate": "12000000"},
+                    {"codec_type": "audio", "codec_name": "aac", "bit_rate": "256000",
+                     "channels": 2}
+                ],
+                "format": {"format_name": "mov,mp4", "duration": "10", "bit_rate": "12300000"}
+            }),
+        );
+        assert_eq!(info.video_bitrate, Some(12_000_000));
+        assert_eq!(info.audio_bitrate, Some(256_000));
+        assert_eq!(info.bitrate, Some(12_300_000));
+        assert_eq!(info.audio_channels, Some(2));
+
+        // mkvmerge leaves BPS tags; the picture is the rest otherwise.
+        let mut info = base("clip.mkv");
+        apply_probe(
+            &mut info,
+            &json!({
+                "streams": [
+                    {"codec_type": "video", "codec_name": "hevc", "tags": {"DURATION": "0:10"}},
+                    {"codec_type": "audio", "codec_name": "opus", "tags": {"BPS-eng": "128000"}}
+                ],
+                "format": {"format_name": "matroska,webm", "duration": "10", "bit_rate": "5128000"}
+            }),
+        );
+        assert_eq!(info.audio_bitrate, Some(128_000));
+        assert_eq!(info.video_bitrate, Some(5_000_000));
+
+        // Neither stream says: the sound's share is unknown, so is the picture's.
+        let mut info = base("clip.webm");
+        apply_probe(
+            &mut info,
+            &json!({
+                "streams": [
+                    {"codec_type": "video", "codec_name": "vp9"},
+                    {"codec_type": "audio", "codec_name": "opus"}
+                ],
+                "format": {"format_name": "matroska,webm", "duration": "10", "bit_rate": "900000"}
+            }),
+        );
+        assert_eq!((info.video_bitrate, info.audio_bitrate), (None, None));
+        assert_eq!(info.bitrate, Some(900_000));
+
+        // A silent video is all picture.
+        let mut info = base("screen.webm");
+        apply_probe(
+            &mut info,
+            &json!({
+                "streams": [{"codec_type": "video", "codec_name": "vp9"}],
+                "format": {"format_name": "matroska,webm", "duration": "10", "bit_rate": "700000"}
+            }),
+        );
+        assert_eq!(info.video_bitrate, Some(700_000));
+        assert_eq!(info.audio_bitrate, None);
     }
 
     #[test]
@@ -1471,12 +1583,15 @@ mod tests {
                     {"codec_type": "video", "codec_name": "mjpeg", "width": 500, "height": 500,
                      "disposition": {"attached_pic": 1}}
                 ],
-                "format": {"format_name": "mp3", "duration": "180.2"}
+                "format": {"format_name": "mp3", "duration": "180.2", "bit_rate": "320000"}
             }),
         );
         assert_eq!(info.kind, MediaKind::Audio);
         assert_eq!(info.width, None);
         assert_eq!(info.duration_secs, Some(180.2));
+        // The cover art isn't a picture track; the file's bitrate is the sound's.
+        assert_eq!(info.audio_bitrate, Some(320_000));
+        assert_eq!(info.video_bitrate, None);
     }
 
     #[test]
@@ -1486,11 +1601,12 @@ mod tests {
             &mut png,
             &json!({
                 "streams": [{"codec_type": "video", "codec_name": "png", "width": 801, "height": 600}],
-                "format": {"format_name": "png_pipe"}
+                "format": {"format_name": "png_pipe", "bit_rate": "40000000"}
             }),
         );
         assert_eq!(png.kind, MediaKind::Image);
         assert_eq!(png.duration_secs, None);
+        assert_eq!((png.bitrate, png.video_bitrate), (None, None));
         assert_eq!(png.width, Some(801));
 
         let mut gif = base("loop.gif");
