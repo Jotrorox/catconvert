@@ -370,6 +370,26 @@ mod tests {
             stage => assert_eq!(stage, JobStage::Done),
         }
 
+        // A fast boomerang GIF: 1.2 s at 2× is 0.6 s, there and back
+        // without repeating the turnaround frames: 9 + 7 frames at 15 fps.
+        if ffmpeg.supports(OutputFormat::Gif) {
+            let boomerang = ConvertOptions {
+                format: OutputFormat::Gif,
+                trim_start: Some(0.4),
+                trim_end: Some(1.6),
+                max_size: Some(60),
+                speed: 2.0,
+                direction: crate::Direction::Boomerang,
+                ..ConvertOptions::default()
+            };
+            let ticket = queue.submit(&input, &boomerang).expect("submit");
+            let done = finish_of(&rx, ticket.id);
+            assert_eq!(done.stage, JobStage::Done, "{done:?}");
+            let out = ffmpeg.probe(&ticket.output).expect("probe gif");
+            let secs = out.duration_secs.expect("duration");
+            assert!((secs - 16.0 / 15.0).abs() < 0.1, "{secs}");
+        }
+
         // Preview helpers.
         let frame = ffmpeg.frame(&input, 1.0, 90).expect("frame");
         assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");

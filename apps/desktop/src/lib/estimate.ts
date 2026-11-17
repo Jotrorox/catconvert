@@ -10,7 +10,14 @@
 import type { ConvertOptions, MediaInfo } from "./api";
 import { pictureSize } from "./crop";
 import { formatBytes } from "./format";
-import { autoLimits, formatKind, isAnimatedImage, repacksJpeg, restoresJpeg } from "./formats";
+import {
+  autoLimits,
+  formatKind,
+  isAnimatedImage,
+  outputSeconds,
+  repacksJpeg,
+  restoresJpeg,
+} from "./formats";
 
 /** Same as `lerp` in convert.rs: quality 0–100 onto `worst..=best`, rounded. */
 function lerp(quality: number, worst: number, best: number): number {
@@ -170,10 +177,9 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
     return (pixels * bpp) / 8;
   }
 
-  const start = options.trimStart ?? 0;
-  const end = options.trimEnd ?? info.durationSecs;
-  if (end === null) return null;
-  const seconds = Math.max(0, end - start);
+  // Animations play at their own speed, a boomerang twice.
+  const seconds = outputSeconds(info, options);
+  if (seconds === null) return null;
 
   if (out === "audio") {
     if (info.audioCodec === null) return null;
@@ -186,7 +192,9 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
   const limits = autoLimits(options.format, info.kind);
   const pixels = outputPixels(info, options, options.maxSize ?? limits?.size ?? null);
   if (pixels === null) return null;
-  const sourceFps = info.fps ?? 30;
+  // Speeding up packs more source frames into each second, until the cap.
+  const speed = isAnimatedImage(options.format, info.kind) ? options.speed : 1;
+  const sourceFps = (info.fps ?? 30) * speed;
   const fps = Math.min(sourceFps, options.fps ?? limits?.fps ?? sourceFps);
   const busy = complexity(info, sourceAudio);
   const frames = pixels * fps * seconds;

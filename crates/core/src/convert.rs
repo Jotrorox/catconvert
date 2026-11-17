@@ -157,6 +157,26 @@ impl Default for JxlOptions {
     }
 }
 
+/// Which way an animation plays.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    #[default]
+    Forward,
+    /// Back to front.
+    Reverse,
+    /// Forward, then back again, so the loop has no seam.
+    Boomerang,
+}
+
+impl Direction {
+    /// How many times the kept range plays per loop.
+    #[must_use]
+    pub fn passes(self) -> f64 {
+        if self == Self::Boomerang { 2.0 } else { 1.0 }
+    }
+}
+
 /// Clean-up for the sound. Only applies when the output has sound; video
 /// fades the picture along with it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -250,6 +270,11 @@ pub struct ConvertOptions {
     /// Carry over dates, location, titles and other tags where the output
     /// format can hold them. Off strips them.
     pub keep_metadata: bool,
+    /// Playback speed of animations (GIF, animated JPEG XL), from 0.25 to 4.
+    /// Ignored for other outputs.
+    pub speed: f64,
+    /// Playback direction of animations. Ignored for other outputs.
+    pub direction: Direction,
 }
 
 impl Default for ConvertOptions {
@@ -268,7 +293,16 @@ impl Default for ConvertOptions {
             jxl: JxlOptions::default(),
             sound: SoundOptions::default(),
             keep_metadata: true,
+            speed: 1.0,
+            direction: Direction::Forward,
         }
+    }
+}
+
+impl ConvertOptions {
+    /// Whether speed or direction change how an animation plays.
+    fn changes_playback(&self) -> bool {
+        (self.speed - 1.0).abs() > 1e-9 || self.direction != Direction::Forward
     }
 }
 
@@ -396,9 +430,11 @@ const GIF_FPS: f64 = 15.0;
 const ANIMATED_JXL_MAX_SIZE: u32 = 720;
 /// Default frame-rate cap of animated JPEG XL.
 const ANIMATED_JXL_FPS: f64 = 30.0;
-/// `cjxl` holds every decoded frame in memory; refuse animations whose raw
-/// frames would exceed this many bytes.
-const CJXL_MEMORY_BUDGET: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
+/// `cjxl` and ffmpeg's `reverse` filter hold every decoded frame in memory;
+/// refuse animations whose raw frames would exceed this many bytes.
+const FRAME_MEMORY_BUDGET: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
+/// Slowest and fastest animation speed.
+const SPEEDS: std::ops::RangeInclusive<f64> = 0.25..=4.0;
 /// Inputs `cjxl` reads itself, keeping metadata, bit depth and (for JPEG) the
 /// original bitstream.
 const CJXL_INPUTS: [&str; 6] = ["png", "apng", "gif", "jpg", "jpeg", "jxl"];
@@ -448,11 +484,24 @@ pub fn plan(
         ));
     }
     let trim = trim_range(input, options)?;
+    let jxl_in = is_jxl(input);
+    let animated = format.animates(input.kind);
+    if animated && !(options.speed.is_finite() && SPEEDS.contains(&options.speed)) {
+        return Err(Error::unsupported("speed must be between 0.25× and 4×"));
+    }
+    // ffmpeg's `reverse` buffers the whole (already shrunk) clip.
+    let defaults = animation_defaults(format);
+    if animated
+        && options.direction != Direction::Forward
+        && animation_bytes(input, options, defaults, trim).is_some_and(|b| b > FRAME_MEMORY_BUDGET)
+    {
+        return Err(Error::unsupported(
+            "this clip is too long to play backwards: trim it, or lower the size or frame rate",
+        ));
+    }
     // cjxl and djxl carry metadata over and can't drop it, so stripping
     // means going through ffmpeg.
     let untouched = is_untouched(input, options) && options.keep_metadata;
-    let jxl_in = is_jxl(input);
-    let animated = format.animates(input.kind);
 
     // Single-tool shortcuts for unedited files. libjxl does these best: they
     // keep metadata, colour profiles, high bit depth and, for JPEG, the
@@ -460,8 +509,8 @@ pub fn plan(
     if untouched && format == OutputFormat::Jxl && jxl.cjxl {
         let ext = input.extension.as_deref().unwrap_or_default();
         let fits = !animated
-            || animation_bytes(input, options, None, None, trim)
-                .is_none_or(|b| b <= CJXL_MEMORY_BUDGET);
+            || animation_bytes(input, options, (None, None), trim)
+                .is_none_or(|b| b <= FRAME_MEMORY_BUDGET);
         if CJXL_INPUTS.contains(&ext) && fits {
             let jpeg = matches!(ext, "jpg" | "jpeg");
             return Ok(Plan::single(
@@ -525,18 +574,12 @@ pub fn plan(
     }
 
     if format == OutputFormat::Jxl {
+        // cjxl holds the whole animation, both halves of a boomerang.
         let raw_bytes = animated
-            .then(|| {
-                animation_bytes(
-                    input,
-                    options,
-                    Some(ANIMATED_JXL_MAX_SIZE),
-                    Some(ANIMATED_JXL_FPS),
-                    trim,
-                )
-            })
-            .flatten();
-        let too_big_for_cjxl = raw_bytes.is_some_and(|b| b > CJXL_MEMORY_BUDGET);
+            .then(|| animation_bytes(input, options, defaults, trim))
+            .flatten()
+            .map(|b| b * options.direction.passes());
+        let too_big_for_cjxl = raw_bytes.is_some_and(|b| b > FRAME_MEMORY_BUDGET);
         let ffmpeg_can = if animated {
             jxl.ffmpeg_anim_encoder
         } else {
@@ -614,27 +657,48 @@ fn ffmpeg_step(
     // (the decoder then fails); those short clips are decoded from the start.
     let timed_input = input.kind != MediaKind::Image;
     let seek_input = !is_jxl(input);
+    // A new speed or direction retimes the output, so output-side -ss/-t
+    // would cut the wrong part: the range is limited on the input instead
+    // (or by a trim filter where the input can't seek).
+    let retimed = animated && options.changes_playback();
+    let trim_end = end.filter(|_| options.trim_end.is_some());
+    let mut lead_trim = None;
     if timed_input && start > 0.0 && seek_input {
         push(&["-ss", &format_secs(start)]);
     }
+    if timed_input && retimed {
+        if let Some(end) = trim_end {
+            let read = if seek_input { end - start } else { end };
+            push(&["-t", &format_secs(read)]);
+        }
+        if start > 0.0 && !seek_input {
+            lead_trim = Some(start);
+        }
+    }
     push(&["-i"]);
     args.push(input.path.clone().into_os_string());
-    if timed_input && start > 0.0 && !seek_input {
+    if timed_input && start > 0.0 && !seek_input && !retimed {
         args.extend(["-ss".into(), format_secs(start).into()]);
     }
     // Where the kept range starts on the filters' clock: 0 after an input
-    // seek, the trim start after an output seek.
-    let t0 = if timed_input && !seek_input {
+    // seek or a lead trim, the trim start after an output seek.
+    let t0 = if timed_input && !seek_input && !retimed {
         start
     } else {
         0.0
     };
     let duration_secs = if timed_input && out_kind != MediaKind::Image {
-        let end = end.or(input.duration_secs);
-        if let Some(end) = end.filter(|_| options.trim_end.is_some()) {
+        if let Some(end) = trim_end.filter(|_| !retimed) {
             args.extend(["-t".into(), format_secs(end - start).into()]);
         }
-        end.map(|end| (end - start).max(0.0))
+        end.or(input.duration_secs).map(|end| {
+            let kept = (end - start).max(0.0);
+            if animated {
+                kept / options.speed * options.direction.passes()
+            } else {
+                kept
+            }
+        })
     } else {
         None
     };
@@ -644,7 +708,7 @@ fn ffmpeg_step(
 
     match (format, sink) {
         (OutputFormat::Jxl, Sink::Frames { animated }) => {
-            let filters = animation_filters(input, options);
+            let filters = animation_filters(input, options, lead_trim);
             if animated {
                 push_video(&mut push, input, &[], &filters);
                 // Fast zlib: this file only lives until cjxl has read it.
@@ -696,10 +760,7 @@ fn ffmpeg_step(
             }
         }
         (OutputFormat::Gif, _) => {
-            let mut filters = video_filters(input, options, Some(GIF_MAX_SIZE), false);
-            if options.fps.is_none() && input.fps.is_none_or(|fps| fps > GIF_FPS) {
-                filters.push(format!("fps={GIF_FPS}"));
-            }
+            let mut filters = animation_filters(input, options, lead_trim);
             let colors = lerp(q, 32.0, 256.0);
             filters.push(format!(
                 "split[a][b];[a]palettegen=max_colors={colors}:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4"
@@ -710,7 +771,7 @@ fn ffmpeg_step(
         (OutputFormat::Jxl, Sink::Output) if animated => {
             // ffmpeg's libjxl_anim emits the codestream frame by frame; the
             // data muxer writes the packets back to back as one file.
-            let filters = animation_filters(input, options);
+            let filters = animation_filters(input, options, lead_trim);
             push_video(&mut push, input, &[], &filters);
             push(&["-c:v", "libjxl_anim"]);
             push_ffmpeg_jxl(&mut push, options);
@@ -931,43 +992,85 @@ fn jxl_distance(options: &ConvertOptions) -> String {
     format_secs((distance * 100.0).round() / 100.0)
 }
 
-/// Filters for animated or still JPEG XL: like [`video_filters`], plus the
-/// default size and frame-rate caps of animations.
-fn animation_filters(input: &MediaInfo, options: &ConvertOptions) -> Vec<String> {
+/// The size and frame-rate caps an animation gets when the user picks none.
+fn animation_defaults(format: OutputFormat) -> (Option<u32>, Option<f64>) {
+    match format {
+        OutputFormat::Gif => (Some(GIF_MAX_SIZE), Some(GIF_FPS)),
+        OutputFormat::Jxl => (Some(ANIMATED_JXL_MAX_SIZE), Some(ANIMATED_JXL_FPS)),
+        _ => (None, None),
+    }
+}
+
+/// Filters for GIFs and JPEG XL (animated or still), minus the GIF palette.
+///
+/// Animations run: trim (`lead_trim`, where the input couldn't seek) →
+/// speed → frame-rate cap → turn, mirror and shrink → reverse or boomerang.
+/// Speeding up before the cap means 2× also makes the file smaller, and
+/// reversing last means `reverse` buffers the smallest frames.
+fn animation_filters(
+    input: &MediaInfo,
+    options: &ConvertOptions,
+    lead_trim: Option<f64>,
+) -> Vec<String> {
     if !options.format.animates(input.kind) {
         return video_filters(input, options, None, false);
     }
-    let mut filters = video_filters(input, options, Some(ANIMATED_JXL_MAX_SIZE), false);
-    if options.fps.is_none() && input.fps.is_none_or(|fps| fps > ANIMATED_JXL_FPS + 0.01) {
-        filters.push(format!("fps={}", format_secs(ANIMATED_JXL_FPS)));
+    let (default_max, default_fps) = animation_defaults(options.format);
+    let mut filters = Vec::new();
+    if let Some(start) = lead_trim {
+        filters.push(format!(
+            "trim=start={},setpts=PTS-STARTPTS",
+            format_secs(start)
+        ));
+    }
+    let speed = options.speed;
+    if (speed - 1.0).abs() > 1e-9 {
+        filters.push(format!("setpts=(PTS-STARTPTS)/{}", format_secs(speed)));
+    }
+    let source_fps = input.fps.map(|fps| fps * speed);
+    if let Some(fps) = fps_filter(options.fps.or(default_fps), source_fps) {
+        filters.push(fps);
+    }
+    filters.extend(picture_filters(input, options, default_max, false));
+    match options.direction {
+        Direction::Forward => {}
+        Direction::Reverse => filters.push("reverse".to_owned()),
+        // The way back skips both turnaround frames (the last one, and the
+        // first, which the loop shows next), or the loop visibly stutters.
+        Direction::Boomerang => filters.push(
+            "split[fwd][back];[back]trim=start_frame=1,reverse,trim=start_frame=1,setpts=PTS-STARTPTS[rev];[fwd][rev]concat=n=2:v=1:a=0".to_owned(),
+        ),
     }
     filters
 }
 
 /// Whether the options leave the picture exactly as it is: no trim, turn,
-/// mirror, crop, downscale or frame-rate change.
+/// mirror, crop, downscale, frame-rate change or (for animations) new speed
+/// or direction.
 fn is_untouched(input: &MediaInfo, options: &ConvertOptions) -> bool {
     let untrimmed = options.trim_start.is_none_or(|s| s <= 0.0) && options.trim_end.is_none();
+    let replayed = options.format.animates(input.kind) && options.changes_playback();
     (input.kind == MediaKind::Image || untrimmed)
+        && !replayed
         && video_filters(input, options, None, false).is_empty()
 }
 
-/// Rough size of every decoded frame of an animation at 4 bytes per pixel,
-/// or `None` if the size, rate or length is unknown.
+/// Rough size of every decoded frame of one pass through an animation at 4
+/// bytes per pixel, or `None` if the size, rate or length is unknown.
 fn animation_bytes(
     input: &MediaInfo,
     options: &ConvertOptions,
-    default_max: Option<u32>,
-    default_fps: Option<f64>,
+    (default_max, default_fps): (Option<u32>, Option<f64>),
     (start, end): (f64, Option<f64>),
 ) -> Option<f64> {
     let (w, h) = output_dims(input, options, default_max)?;
-    let source_fps = input.fps?;
+    let speed = options.speed;
+    let source_fps = input.fps? * speed;
     let fps = options
         .fps
         .or(default_fps)
         .map_or(source_fps, |fps| fps.min(source_fps));
-    let length = end.or(input.duration_secs)? - start;
+    let length = (end.or(input.duration_secs)? - start) / speed;
     Some(f64::from(w) * f64::from(h) * 4.0 * fps * length.max(0.0))
 }
 
@@ -1149,9 +1252,29 @@ fn crop_expression(crop: &Crop) -> Option<String> {
 
 /// Rotate, flip, crop, downscale and frame-rate filters, in that order.
 ///
-/// `default_max` caps the short side when the user picked no size (GIFs).
+/// `default_max` caps the short side when the user picked no size.
 /// `even` forces even dimensions, which yuv420p encoders require.
 fn video_filters(
+    input: &MediaInfo,
+    options: &ConvertOptions,
+    default_max: Option<u32>,
+    even: bool,
+) -> Vec<String> {
+    let mut filters = picture_filters(input, options, default_max, even);
+    filters.extend(fps_filter(options.fps, input.fps));
+    filters
+}
+
+/// An `fps` filter for `target`, unless that wouldn't lower `source`.
+fn fps_filter(target: Option<f64>, source: Option<f64>) -> Option<String> {
+    target
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .filter(|&fps| source.is_none_or(|source| fps < source - 0.01))
+        .map(|fps| format!("fps={}", format_secs(fps)))
+}
+
+/// Rotate, flip, crop and downscale filters, in that order.
+fn picture_filters(
     input: &MediaInfo,
     options: &ConvertOptions,
     default_max: Option<u32>,
@@ -1202,11 +1325,6 @@ fn video_filters(
             filters.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_owned());
         }
         None => {}
-    }
-
-    let fps = options.fps.filter(|f| f.is_finite() && *f > 0.0);
-    if let Some(fps) = fps.filter(|&fps| input.fps.is_none_or(|source| fps < source - 0.01)) {
-        filters.push(format!("fps={}", format_secs(fps)));
     }
     filters
 }
@@ -1470,7 +1588,7 @@ mod tests {
         };
         let cmd = command(&video("a.mov"), &options, "/clips/a.gif");
         assert!(
-            cmd.contains("-vf 'crop=608:1080:656:0,scale=480:-2:flags=lanczos,fps=15,"),
+            cmd.contains("-vf 'fps=15,crop=608:1080:656:0,scale=480:-2:flags=lanczos,split"),
             "{cmd}"
         );
     }
@@ -1545,13 +1663,158 @@ mod tests {
         };
         let cmd = command(&video("loop.mov"), &options, "/clips/loop.gif");
         assert!(
-            cmd.contains("scale=-2:480:flags=lanczos,fps=15,split[a][b]"),
+            cmd.contains("-vf 'fps=15,scale=-2:480:flags=lanczos,split[a][b]"),
             "{cmd}"
         );
         assert!(cmd.contains("palettegen=max_colors=166"), "{cmd}");
         assert!(
             cmd.ends_with("-loop 0 -an -sn -dn /clips/loop.gif"),
             "{cmd}"
+        );
+    }
+
+    fn gif(patch: ConvertOptions) -> ConvertOptions {
+        ConvertOptions {
+            format: OutputFormat::Gif,
+            ..patch
+        }
+    }
+
+    #[test]
+    fn fast_boomerang_gif() {
+        let options = gif(ConvertOptions {
+            trim_start: Some(2.0),
+            trim_end: Some(8.0),
+            speed: 2.0,
+            direction: Direction::Boomerang,
+            ..ConvertOptions::default()
+        });
+        let plan = plan(
+            &video("cat.mov"),
+            &options,
+            Path::new("/clips/cat.gif"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let cmd = plan.command_line();
+        // The range is cut on the input, since the output is retimed.
+        assert!(
+            cmd.starts_with("ffmpeg -ss 2 -t 6 -i /clips/cat.mov -map 0:v:0 -vf "),
+            "{cmd}"
+        );
+        // Speed → fps cap → shrink → boomerang → palette.
+        assert!(
+            cmd.contains(
+                "'setpts=(PTS-STARTPTS)/2,fps=15,scale=-2:480:flags=lanczos,\
+                 split[fwd][back];[back]trim=start_frame=1,reverse,trim=start_frame=1,setpts=PTS-STARTPTS[rev];\
+                 [fwd][rev]concat=n=2:v=1:a=0,split[a][b];"
+            ),
+            "{cmd}"
+        );
+        // 6 s at 2× is 3 s, played there and back.
+        assert_eq!(plan.duration_secs(), Some(6.0));
+    }
+
+    #[test]
+    fn slow_reversed_gif_keeps_the_source_rate() {
+        // At 0.5× a 24 fps clip plays at 12 fps, under the 15 fps cap.
+        let input = MediaInfo {
+            fps: Some(24.0),
+            ..video("cat.mov")
+        };
+        let options = gif(ConvertOptions {
+            speed: 0.5,
+            direction: Direction::Reverse,
+            ..ConvertOptions::default()
+        });
+        let plan = plan(
+            &input,
+            &options,
+            Path::new("/clips/cat.gif"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let cmd = plan.command_line();
+        assert!(
+            cmd.contains("-vf 'setpts=(PTS-STARTPTS)/0.5,scale=-2:480:flags=lanczos,reverse,split"),
+            "{cmd}"
+        );
+        assert_eq!(plan.duration_secs(), Some(84.0));
+    }
+
+    #[test]
+    fn playback_is_ignored_for_videos_and_checked_for_animations() {
+        let options = ConvertOptions {
+            speed: 2.0,
+            direction: Direction::Reverse,
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &options, "/clips/a.mp4");
+        assert!(!cmd.contains("setpts") && !cmd.contains("reverse"), "{cmd}");
+
+        for speed in [0.1, 8.0, f64::NAN] {
+            let err = plan_err(
+                &video("a.mov"),
+                &gif(ConvertOptions {
+                    speed,
+                    ..ConvertOptions::default()
+                }),
+                JxlSupport::default(),
+            );
+            assert!(err.contains("speed"), "{err}");
+        }
+    }
+
+    #[test]
+    fn long_clips_are_refused_backwards() {
+        let input = MediaInfo {
+            duration_secs: Some(3600.0),
+            ..video("long.mov")
+        };
+        let backwards = gif(ConvertOptions {
+            direction: Direction::Reverse,
+            ..ConvertOptions::default()
+        });
+        let err = plan_err(&input, &backwards, JxlSupport::default());
+        assert!(err.contains("backwards"), "{err}");
+
+        // Trimmed, or sped up enough, it fits.
+        let trimmed = ConvertOptions {
+            trim_end: Some(60.0),
+            ..backwards.clone()
+        };
+        assert!(
+            plan(
+                &input,
+                &trimmed,
+                Path::new("/clips/a.gif"),
+                JxlSupport::default()
+            )
+            .is_ok()
+        );
+        let fast = ConvertOptions {
+            trim_end: Some(600.0),
+            speed: 4.0,
+            ..backwards
+        };
+        assert!(
+            plan(
+                &input,
+                &fast,
+                Path::new("/clips/a.gif"),
+                JxlSupport::default()
+            )
+            .is_ok()
+        );
+        // Forward needs no buffer.
+        assert!(
+            plan(
+                &input,
+                &gif(ConvertOptions::default()),
+                Path::new("/clips/a.gif"),
+                JxlSupport::default()
+            )
+            .is_ok()
         );
     }
 
@@ -1723,6 +1986,13 @@ mod tests {
         assert_eq!(options.trim_start, Some(1.5));
         assert_eq!(options.quality, 60);
         assert!(options.keep_audio);
+        assert!((options.speed - 1.0).abs() < f64::EPSILON);
+        assert_eq!(options.direction, Direction::Forward);
+
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"speed": 0.5, "direction": "boomerang"}))
+                .expect("parse");
+        assert_eq!(options.direction, Direction::Boomerang);
     }
 
     // -----------------------------------------------------------------------
@@ -2046,7 +2316,7 @@ mod tests {
         let cmd = plan.command_line();
         assert!(
             cmd.starts_with(
-                "ffmpeg -ss 1 -i /clips/clip.mov -t 3 -map 0:v:0 -vf scale=-2:720:flags=lanczos,fps=30 \
+                "ffmpeg -ss 1 -i /clips/clip.mov -t 3 -map 0:v:0 -vf fps=30,scale=-2:720:flags=lanczos \
                  -c:v apng -compression_level 1 -plays 0 -an -sn -dn -f apng /clips/.clip.jxl.frames.apng"
             ),
             "{cmd}"
@@ -2106,6 +2376,69 @@ mod tests {
             command_with(&gif, &options, "/clips/loop.jxl", LIBJXL),
             "cjxl /clips/loop.gif /clips/loop.jxl -d 0 -e 7 --quiet"
         );
+    }
+
+    #[test]
+    fn retimed_gifs_skip_the_cjxl_shortcut_and_trim_unseekable_jxl_in_the_graph() {
+        let loop_gif = MediaInfo {
+            extension: Some("gif".into()),
+            width: Some(320),
+            height: Some(240),
+            fps: Some(10.0),
+            duration_secs: Some(2.0),
+            audio_codec: None,
+            ..video("loop.gif")
+        };
+        let reversed = jxl(ConvertOptions {
+            direction: Direction::Reverse,
+            ..ConvertOptions::default()
+        });
+        let plan = plan(&loop_gif, &reversed, Path::new("/clips/loop.jxl"), LIBJXL).expect("plan");
+        assert_eq!(tools(&plan), [Tool::Ffmpeg, Tool::Cjxl]);
+        assert!(
+            plan.command_line().contains("-vf reverse "),
+            "{}",
+            plan.command_line()
+        );
+
+        // ffmpeg's animated JPEG XL decoder can't seek: read up to the end,
+        // cut the start in the graph.
+        let anim = MediaInfo {
+            extension: Some("jxl".into()),
+            video_codec: Some("jpegxl_anim".into()),
+            audio_codec: None,
+            ..video("loop.jxl")
+        };
+        let fast = gif(ConvertOptions {
+            trim_start: Some(1.0),
+            trim_end: Some(3.0),
+            speed: 2.0,
+            ..ConvertOptions::default()
+        });
+        let cmd = command_with(&anim, &fast, "/clips/loop.gif", FFMPEG_JXL);
+        assert!(
+            cmd.starts_with(
+                "ffmpeg -t 3 -i /clips/loop.jxl -map 0:v:0 \
+                 -vf 'trim=start=1,setpts=PTS-STARTPTS,setpts=(PTS-STARTPTS)/2,fps=15,"
+            ),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn boomerangs_count_twice_against_the_cjxl_budget() {
+        let input = MediaInfo {
+            duration_secs: Some(30.0),
+            ..video("clip.mov")
+        };
+        let forward = jxl(ConvertOptions::default());
+        assert!(plan(&input, &forward, Path::new("/clips/c.jxl"), LIBJXL).is_ok());
+        let boomerang = jxl(ConvertOptions {
+            direction: Direction::Boomerang,
+            ..ConvertOptions::default()
+        });
+        let err = plan_err(&input, &boomerang, LIBJXL);
+        assert!(err.contains("too long"), "{err}");
     }
 
     #[test]

@@ -2,7 +2,7 @@
  * What the UI knows about output formats, edit defaults and recipes. The
  * backend validates everything again; this only decides what to offer.
  */
-import type { ConvertOptions, MediaInfo, MediaKind, OutputFormat } from "./api";
+import type { ConvertOptions, Direction, MediaInfo, MediaKind, OutputFormat } from "./api";
 import { aspectText, cropBox, cropForOtherFile, pictureSize, turnedSize } from "./crop";
 
 export type Tone = "pink" | "green" | "yellow" | "lavender";
@@ -69,6 +69,37 @@ export function groupsFor(kind: MediaKind): FormatGroup[] {
   }
 }
 
+/** Speed choices for animations. */
+export const SPEEDS = [0.5, 1, 2, 4] as const;
+
+export const DIRECTIONS: readonly { direction: Direction; label: string }[] = [
+  { direction: "forward", label: "Forward" },
+  { direction: "reverse", label: "Reverse" },
+  { direction: "boomerang", label: "Boomerang" },
+];
+
+export const speedLabel = (speed: number) => `${speed}×`;
+
+/** Whether the speed or direction change how this output plays. */
+export function changesPlayback(info: MediaInfo, options: ConvertOptions): boolean {
+  return (
+    isAnimatedImage(options.format, info.kind) &&
+    (options.speed !== 1 || options.direction !== "forward")
+  );
+}
+
+/**
+ * Length of the output in seconds: the kept range, and for animations its
+ * speed and direction (a boomerang plays it twice). `null` if unknown.
+ */
+export function outputSeconds(info: MediaInfo, options: ConvertOptions): number | null {
+  const end = options.trimEnd ?? info.durationSecs;
+  if (end === null) return null;
+  const kept = Math.max(0, end - (options.trimStart ?? 0));
+  if (!isAnimatedImage(options.format, info.kind)) return kept;
+  return (kept / options.speed) * (options.direction === "boomerang" ? 2 : 1);
+}
+
 /** Formats whose quality setting changes nothing. */
 export const LOSSLESS: ReadonlySet<OutputFormat> = new Set(["wav", "flac", "png"]);
 
@@ -91,14 +122,15 @@ const LOSSLESS_BY_DEFAULT = new Set(["jpg", "jpeg", "png", "apng", "gif"]);
 
 /**
  * Whether the options leave the file as it is: no trim, turn, mirror, crop,
- * resize or new rate, and metadata kept (libjxl's tools can't drop it, see
- * convert.rs).
+ * resize, new rate, speed or direction, and metadata kept (libjxl's tools
+ * can't drop it, see convert.rs).
  */
 export function isUntouched(info: MediaInfo, options: ConvertOptions): boolean {
   const untrimmed =
     info.kind === "image" || (options.trimStart === null && options.trimEnd === null);
   return (
     untrimmed &&
+    !changesPlayback(info, options) &&
     options.keepMetadata &&
     options.rotate === 0 &&
     !options.flip &&
@@ -161,6 +193,8 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     jxl: { lossless: false, effort: 7, progressive: false },
     sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
     keepMetadata: true,
+    speed: 1,
+    direction: "forward",
   };
 }
 
@@ -376,6 +410,10 @@ export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
     parts.push(`${aspectText(options.crop.aspect)} crop`);
   if (out !== "audio" && options.maxSize !== null) parts.push(sizeLabel(options.maxSize, out));
   if (out === "video" && options.fps !== null) parts.push(`${options.fps} fps`);
+  if (isAnimatedImage(options.format, info.kind)) {
+    if (options.speed !== 1) parts.push(speedLabel(options.speed));
+    if (options.direction !== "forward") parts.push(options.direction);
+  }
   const video = out === "video" && !isAnimatedImage(options.format, info.kind);
   if (video && !options.keepAudio) parts.push("no sound");
   parts.push(isLossless(options) ? "lossless" : qualityStep(options.quality).toLowerCase());

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use catconvert_core::{
-    ConvertOptions, Crop, Ffmpeg, JxlOptions, OutputFormat, RunOutcome, SoundOptions,
+    ConvertOptions, Crop, Direction, Ffmpeg, JxlOptions, OutputFormat, RunOutcome, SoundOptions,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -87,10 +87,34 @@ enum Command {
         /// Drop dates, location, titles and other tags.
         #[arg(long)]
         strip_metadata: bool,
+        /// GIF and animated JPEG XL: playback speed, 0.25 to 4 (e.g. 2 for 2×).
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// GIF and animated JPEG XL: play forward, reversed, or forward then back.
+        #[arg(long, value_enum, default_value_t = Playback::Forward)]
+        direction: Playback,
         /// Print the command(s) instead of running them.
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// CLI mirror of [`Direction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Playback {
+    Forward,
+    Reverse,
+    Boomerang,
+}
+
+impl From<Playback> for Direction {
+    fn from(playback: Playback) -> Self {
+        match playback {
+            Playback::Forward => Self::Forward,
+            Playback::Reverse => Self::Reverse,
+            Playback::Boomerang => Self::Boomerang,
+        }
+    }
 }
 
 /// CLI mirror of [`OutputFormat`].
@@ -221,6 +245,8 @@ fn main() -> ExitCode {
             effort,
             progressive,
             strip_metadata,
+            speed,
+            direction,
             dry_run,
         } => {
             let options = ConvertOptions {
@@ -248,6 +274,8 @@ fn main() -> ExitCode {
                     fade_out,
                 },
                 keep_metadata: !strip_metadata,
+                speed,
+                direction: direction.into(),
             };
             match convert(&file, &options, dry_run) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -294,6 +322,10 @@ mod tests {
             "1.5",
             "--size",
             "480",
+            "--speed",
+            "2",
+            "--direction",
+            "boomerang",
         ])
         .expect("parse");
         let Command::Convert {
@@ -301,6 +333,8 @@ mod tests {
             start,
             size,
             quality,
+            speed,
+            direction,
             ..
         } = cli.command
         else {
@@ -310,6 +344,8 @@ mod tests {
         assert_eq!(start, Some(1.5));
         assert_eq!(size, Some(480));
         assert_eq!(quality, 60);
+        assert!((speed - 2.0).abs() < f64::EPSILON);
+        assert_eq!(Direction::from(direction), Direction::Boomerang);
         let cli = Cli::try_parse_from([
             "catconvert",
             "convert",

@@ -61,6 +61,9 @@ export type OutputFormat =
 
 export type Rotation = 0 | 90 | 180 | 270;
 
+/** Which way an animation plays; a boomerang plays forward, then back. */
+export type Direction = "forward" | "reverse" | "boomerang";
+
 /** Width to height, e.g. `[9, 16]`. */
 export type Aspect = [number, number];
 
@@ -122,6 +125,10 @@ export type ConvertOptions = {
   sound: SoundOptions;
   /** Carry over dates, location and other tags where the format can hold them. */
   keepMetadata: boolean;
+  /** Playback speed of animations (GIF, animated JPEG XL), 0.25–4. Ignored otherwise. */
+  speed: number;
+  /** Playback direction of animations. Ignored otherwise. */
+  direction: Direction;
 };
 
 export type JobId = number;

@@ -29,6 +29,8 @@ import { describeEstimate } from "../lib/estimate";
 import { baseName, formatBytes, formatClock, formatSpan, parseClock } from "../lib/format";
 import {
   autoLimits,
+  changesPlayback,
+  DIRECTIONS,
   FADE_CHOICES,
   fadeSpans,
   formatKind,
@@ -39,13 +41,16 @@ import {
   JXL_EFFORTS,
   label,
   outputHasSound,
+  outputSeconds,
   QUALITY_STEPS,
   qualityStep,
   repacksJpeg,
   restoresJpeg,
+  SPEEDS,
   shortSide,
   sizeChoices,
   sizeLabel,
+  speedLabel,
 } from "../lib/formats";
 import { createFilmstrip, createFrame, createWaveform } from "../lib/preview";
 import {
@@ -262,9 +267,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     const limit = auto()?.size;
     return limit !== undefined && (shortSide(info(), options()) ?? 0) > limit ? limit : null;
   };
+  // Speeding an animation up packs more source frames into each second.
+  const playedFps = () => (info().fps ?? 30) * (animatedImage() ? options().speed : 1);
   const autoFps = () => {
     const limit = auto()?.fps;
-    return limit !== undefined && (info().fps ?? 30) > limit + 0.01 ? limit : null;
+    return limit !== undefined && playedFps() > limit + 0.01 ? limit : null;
   };
   const canKeepAudio = () =>
     info().audioCodec !== null && outKind() === "video" && !animatedImage();
@@ -299,7 +306,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
         | "clock"
         | "sparkle"
         | "sliders"
-        | "fade";
+        | "fade"
+        | "play";
       text: string;
     }[] = [];
     if (timed() && trimmed()) {
@@ -314,6 +322,16 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       if (cropped) items.push({ icon: "crop", text: cropped });
       const fps = o.fps ?? (outKind() === "video" ? autoFps() : null);
       if (outKind() === "video" && fps !== null) items.push({ icon: "clock", text: `${fps} fps` });
+    }
+    if (changesPlayback(info(), o)) {
+      // The preview is a still, so spell out how the animation will play.
+      const parts: string[] = [];
+      if (o.speed !== 1) parts.push(speedLabel(o.speed));
+      const way = DIRECTIONS.find((d) => d.direction === o.direction);
+      if (way && o.direction !== "forward") parts.push(way.label);
+      const seconds = outputSeconds(info(), o);
+      if (seconds !== null) parts.push(formatSpan(seconds));
+      items.push({ icon: "play", text: parts.join(" · ") });
     }
     if (canKeepAudio() && !o.keepAudio) items.push({ icon: "music", text: "No sound" });
     if (hasSound()) {
@@ -747,6 +765,52 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 </label>
               </Show>
             </div>
+          </Show>
+
+          <Show when={animatedImage()}>
+            <fieldset class="field">
+              <legend class="field-label">Playback</legend>
+              <div class="format-groups playback" data-tone="pink">
+                <fieldset class="format-group" aria-labelledby="playback-speed">
+                  <span class="format-group-label" id="playback-speed">
+                    Speed
+                  </span>
+                  <div class="format-chips">
+                    <For each={SPEEDS}>
+                      {(speed) => (
+                        <button
+                          type="button"
+                          class="format-chip"
+                          aria-pressed={options().speed === speed}
+                          onClick={() => updateOptions({ speed })}
+                        >
+                          {speedLabel(speed)}
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </fieldset>
+                <fieldset class="format-group" aria-labelledby="playback-direction">
+                  <span class="format-group-label" id="playback-direction">
+                    Direction
+                  </span>
+                  <div class="format-chips">
+                    <For each={DIRECTIONS}>
+                      {(way) => (
+                        <button
+                          type="button"
+                          class="format-chip"
+                          aria-pressed={options().direction === way.direction}
+                          onClick={() => updateOptions({ direction: way.direction })}
+                        >
+                          {way.label}
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </fieldset>
+              </div>
+            </fieldset>
           </Show>
 
           <Show when={canKeepAudio()}>

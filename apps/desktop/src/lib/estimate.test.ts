@@ -104,6 +104,17 @@ describe("estimateBytes", () => {
     expect(vertical).toBeLessThan(size(clip, "mp4", { keepAudio: false }) / 2);
   });
 
+  it("follows the speed and direction of animations, not of videos", () => {
+    const gif = size(clip, "gif");
+    // 2× halves the length; the 15 fps cap keeps the frame rate.
+    expect(size(clip, "gif", { speed: 2 })).toBeCloseTo(gif / 2);
+    expect(size(clip, "gif", { speed: 2, direction: "boomerang" })).toBeCloseTo(gif);
+    expect(size(clip, "gif", { direction: "reverse" })).toBeCloseTo(gif);
+    // At 0.25× a 30 fps clip plays at 7.5 fps for four times as long.
+    expect(size(clip, "gif", { speed: 0.25 })).toBeCloseTo(gif * 2);
+    expect(size(clip, "mp4", { speed: 2, direction: "boomerang" })).toBeCloseTo(size(clip, "mp4"));
+  });
+
   it("uses the source for lossless sound", () => {
     expect(size(song, "wav")).toBeCloseTo(song.sizeBytes);
     expect(size(song, "flac")).toBeCloseTo(song.sizeBytes * 0.6);

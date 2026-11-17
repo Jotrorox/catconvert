@@ -2091,6 +2091,16 @@ button.format-chip:not(:disabled):active {
   font-variant-numeric: tabular-nums;
 }
 
+/* Playback (animations) */
+
+.playback .format-group {
+  grid-template-columns: 82px minmax(0, 1fr);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
 /* JPEG XL */
 
 .jxl-settings {

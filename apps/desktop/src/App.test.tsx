@@ -244,6 +244,8 @@ describe("CatConvert", () => {
       jxl: { lossless: false, effort: 7, progressive: false },
       sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
       keepMetadata: true,
+      speed: 1,
+      direction: "forward",
     });
 
     applyProgress({
@@ -425,6 +427,44 @@ describe("CatConvert", () => {
       "720p",
       "Animated",
     ]);
+  });
+
+  it("changes how a GIF plays and says so, since the preview is a still", async () => {
+    await openVideo();
+    // Videos keep their own pace for now.
+    expect(screen.queryByRole("group", { name: "Speed" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "GIF" }));
+    const speed = within(screen.getByRole("group", { name: "Speed" }));
+    const direction = within(screen.getByRole("group", { name: "Direction" }));
+    expect(speed.getByRole("button", { name: "1×" })).toHaveAttribute("aria-pressed", "true");
+    expect(direction.getByRole("button", { name: "Forward" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const before = screen.getByText(/^About /).textContent;
+
+    fireEvent.click(speed.getByRole("button", { name: "2×" }));
+    fireEvent.click(direction.getByRole("button", { name: "Boomerang" }));
+    const changes = within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "480p",
+      "15 fps",
+      "2× · Boomerang · 42 s",
+    ]);
+    // Same length and frame rate, so about the same size.
+    expect(screen.getByText(/^About /).textContent).toBe(before);
+
+    fireEvent.click(speed.getByRole("button", { name: "4×" }));
+    fireEvent.click(direction.getByRole("button", { name: "Reverse" }));
+    expect(changes.getAllByRole("listitem").at(-1)?.textContent).toBe("4× · Reverse · 10.5 s");
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ format: "gif", speed: 4, direction: "reverse" }),
+    );
   });
 
   it("restores the original JPEG from a repacked JPEG XL", async () => {
