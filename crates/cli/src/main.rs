@@ -220,7 +220,7 @@ fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<()
     }
     let info = ffmpeg.probe(file).map_err(|e| e.to_string())?;
     let output = catconvert_core::output_path(&info.path, options.format, |_| false);
-    let plan = catconvert_core::plan(&info, options, &output, ffmpeg.jxl_support())
+    let plan = catconvert_core::plan(&info, options, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
     if dry_run {
         println!("{}", plan.command_line());

@@ -72,6 +72,10 @@ pub struct MediaInfo {
     /// original JPEG can be restored bit for bit.
     #[serde(default)]
     pub reconstructs_jpeg: bool,
+    /// The video uses an HDR transfer (PQ or HLG; iPhones record HLG by
+    /// default). Pictures and GIFs made from it are tone-mapped to SDR.
+    #[serde(default)]
+    pub hdr: bool,
     /// The file records where it was made: GPS coordinates in a photo's EXIF
     /// or XMP, or a location tag in a video or song.
     #[serde(default)]
@@ -167,6 +171,7 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         audio_codec: None,
         sample_rate: None,
         reconstructs_jpeg: false,
+        hdr: false,
         has_location: false,
         location_tags: Vec::new(),
         tile_grid: None,
@@ -198,6 +203,7 @@ pub(crate) mod tests {
             audio_codec: None,
             sample_rate: None,
             reconstructs_jpeg: false,
+            hdr: false,
             has_location: false,
             location_tags: Vec::new(),
             tile_grid: None,

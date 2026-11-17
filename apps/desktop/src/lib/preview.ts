@@ -17,13 +17,15 @@ function createUrlSlot() {
 }
 
 /**
- * A frame of `path` at `time()` seconds. While a grab is running, newer times
- * replace the pending one, so dragging a handle never piles up ffmpeg runs.
+ * A frame of `path` at `time()` seconds, tone-mapped when `hdr` is set. While
+ * a grab is running, newer times replace the pending one, so dragging a handle
+ * never piles up ffmpeg runs.
  */
 export function createFrame(
   path: Accessor<string | null>,
   time: Accessor<number>,
   height: number,
+  hdr = false,
 ): Accessor<string | null> {
   const [url, setUrl] = createUrlSlot();
   let busy = false;
@@ -40,7 +42,7 @@ export function createFrame(
       const job = wanted;
       wanted = null;
       try {
-        const next = await api.previewFrame(job.path, job.time, height);
+        const next = await api.previewFrame(job.path, job.time, height, hdr);
         if (alive) setUrl(next);
         else URL.revokeObjectURL(next);
       } catch {
@@ -53,8 +55,8 @@ export function createFrame(
   createEffect(() => {
     const p = path();
     if (!p) return;
-    // Round to tenths so tiny drags don't refetch.
-    wanted = { path: p, time: Math.max(0, Math.round(time() * 10) / 10) };
+    // Milliseconds, as ffmpeg is given them: stepping one frame must show it.
+    wanted = { path: p, time: Math.max(0, Math.round(time() * 1000) / 1000) };
     void pump();
   });
   return url;
@@ -66,6 +68,7 @@ export function createFilmstrip(
   duration: Accessor<number | null>,
   count: number,
   height: number,
+  hdr = false,
 ): Accessor<(string | null)[]> {
   const [frames, setFrames] = createSignal<(string | null)[]>([]);
   let generation = 0;
@@ -88,7 +91,7 @@ export function createFilmstrip(
         const t = times[i];
         if (t === undefined) return;
         try {
-          const url = await api.previewFrame(p, t, height);
+          const url = await api.previewFrame(p, t, height, hdr);
           if (mine !== generation) {
             URL.revokeObjectURL(url);
             return;

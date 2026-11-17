@@ -357,6 +357,31 @@ impl JxlSupport {
     }
 }
 
+/// What the installed tools can do, as far as [`plan`] cares.
+/// [`crate::Ffmpeg::support`] fills this in; the default assumes the least.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Support {
+    /// Which JPEG XL code paths are installed.
+    pub jxl: JxlSupport,
+    /// ffmpeg's `scale` filter converts between transfer functions (ffmpeg
+    /// 8 and later), so HDR video can be tone-mapped for pictures and GIFs.
+    pub tone_map: bool,
+}
+
+impl From<JxlSupport> for Support {
+    fn from(jxl: JxlSupport) -> Self {
+        Self {
+            jxl,
+            ..Self::default()
+        }
+    }
+}
+
+/// HDR (PQ or HLG) to SDR BT.709 with swscale's colour management. Without
+/// it, pictures from iPhone videos come out flat and washed out.
+pub(crate) const TONE_MAP_FILTER: &str =
+    "scale=out_transfer=bt709:out_primaries=bt709:out_color_matrix=bt709";
+
 /// A program a [`Step`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tool {
@@ -454,8 +479,9 @@ const CJXL_INPUTS: [&str; 6] = ["png", "apng", "gif", "jpg", "jpeg", "jxl"];
 
 /// Validate `options` for `input` and plan the steps that write `output`.
 ///
-/// `jxl` says which JPEG XL tools are installed; it only matters when the
-/// input or output is JPEG XL.
+/// `support` says what the installed tools can do: which JPEG XL tools there
+/// are (only matters when the input or output is JPEG XL), and whether HDR
+/// video can be tone-mapped for pictures and GIFs.
 ///
 /// # Errors
 ///
@@ -466,8 +492,9 @@ pub fn plan(
     input: &MediaInfo,
     options: &ConvertOptions,
     output: &Path,
-    jxl: JxlSupport,
+    support: impl Into<Support>,
 ) -> Result<Plan> {
+    let Support { jxl, tone_map } = support.into();
     let format = options.format;
     if !format.accepts(input.kind) {
         return Err(Error::unsupported(format!(
@@ -609,6 +636,8 @@ pub fn plan(
         source.path = decoded.clone();
         source.extension = Some(ext.into());
         source.video_codec = Some(ext.into());
+        // Whether djxl's PNG keeps HDR tags is up to libjxl; don't guess.
+        source.hdr = false;
         source.tile_grid = None;
         scratch.push(decoded);
     }
@@ -640,6 +669,7 @@ pub fn plan(
                 trim,
                 Sink::Frames { animated },
                 &frames,
+                tone_map,
             ));
             scratch.push(frames.clone());
             let frames = match scrub.filter(|_| !animated) {
@@ -663,6 +693,7 @@ pub fn plan(
                 trim,
                 Sink::Frames { animated: false },
                 &frames,
+                tone_map,
             ));
             steps.push(scrub_step(&frames, &cleaned, metadata));
             let (width, height) = output_dims(input, options, None).unzip();
@@ -674,8 +705,9 @@ pub fn plan(
                 video_codec: Some("png".into()),
                 has_location: false,
                 location_tags: Vec::new(),
-                // Already stitched together by the first pass.
+                // Already stitched together and tone-mapped by the first pass.
                 tile_grid: None,
+                hdr: false,
                 ..source.clone()
             };
             let as_is = ConvertOptions {
@@ -689,12 +721,19 @@ pub fn plan(
                 metadata: Metadata::Keep,
                 ..options.clone()
             };
-            let mut encode = ffmpeg_step(&edited, &as_is, (0.0, None), Sink::Output, output);
+            let mut encode = ffmpeg_step(&edited, &as_is, (0.0, None), Sink::Output, output, false);
             encode.weight = 0.6;
             steps.push(encode);
             scratch.extend([frames, cleaned]);
         } else if ffmpeg_can {
-            steps.push(ffmpeg_step(&source, options, trim, Sink::Output, output));
+            steps.push(ffmpeg_step(
+                &source,
+                options,
+                trim,
+                Sink::Output,
+                output,
+                tone_map,
+            ));
         } else if animated {
             return Err(Error::unsupported(
                 "animated JPEG XL needs cjxl from libjxl or an ffmpeg with the libjxl_anim encoder",
@@ -707,11 +746,25 @@ pub fn plan(
     } else if let (OutputFormat::Png, Some(metadata)) = (format, scrub) {
         // ffmpeg's PNG encoder writes the EXIF it decoded.
         let encoded = scratch_path(output, "encoded", "png");
-        steps.push(ffmpeg_step(&source, options, trim, Sink::Output, &encoded));
+        steps.push(ffmpeg_step(
+            &source,
+            options,
+            trim,
+            Sink::Output,
+            &encoded,
+            tone_map,
+        ));
         steps.push(scrub_step(&encoded, output, metadata));
         scratch.push(encoded);
     } else {
-        steps.push(ffmpeg_step(&source, options, trim, Sink::Output, output));
+        steps.push(ffmpeg_step(
+            &source,
+            options,
+            trim,
+            Sink::Output,
+            output,
+            tone_map,
+        ));
     }
 
     Ok(Plan {
@@ -731,12 +784,16 @@ enum Sink {
 }
 
 /// The ffmpeg call that applies the edits in `options` to `input` and writes `out`.
+///
+/// `tone_map` says whether this ffmpeg can turn HDR into SDR; it is used for
+/// HDR input written as pictures or GIFs, which can't hold HDR.
 fn ffmpeg_step(
     input: &MediaInfo,
     options: &ConvertOptions,
     (start, end): (f64, Option<f64>),
     sink: Sink,
     out: &Path,
+    tone_map: bool,
 ) -> Step {
     let format = options.format;
     let animated = format.animates(input.kind);
@@ -744,6 +801,14 @@ fn ffmpeg_step(
         MediaKind::Video
     } else {
         format.kind()
+    };
+    let tone_map =
+        tone_map && input.hdr && (format == OutputFormat::Gif || format.kind() == MediaKind::Image);
+    let tone_mapped = |mut filters: Vec<String>| {
+        if tone_map {
+            filters.insert(0, TONE_MAP_FILTER.to_owned());
+        }
+        filters
     };
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |items: &[&str]| args.extend(items.iter().map(OsString::from));
@@ -804,7 +869,7 @@ fn ffmpeg_step(
 
     match (format, sink) {
         (OutputFormat::Jxl, Sink::Frames { animated }) => {
-            let filters = animation_filters(input, options, lead_trim);
+            let filters = tone_mapped(animation_filters(input, options, lead_trim));
             if animated {
                 push_video(&mut push, input, &[], &filters);
                 // Fast zlib: this file only lives until cjxl has read it.
@@ -856,7 +921,7 @@ fn ffmpeg_step(
             }
         }
         (OutputFormat::Gif, _) => {
-            let mut filters = animation_filters(input, options, lead_trim);
+            let mut filters = tone_mapped(animation_filters(input, options, lead_trim));
             let colors = lerp(q, 32.0, 256.0);
             filters.push(format!(
                 "split[a][b];[a]palettegen=max_colors={colors}:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4"
@@ -867,7 +932,7 @@ fn ffmpeg_step(
         (OutputFormat::Jxl, Sink::Output) if animated => {
             // ffmpeg's libjxl_anim emits the codestream frame by frame; the
             // data muxer writes the packets back to back as one file.
-            let filters = animation_filters(input, options, lead_trim);
+            let filters = tone_mapped(animation_filters(input, options, lead_trim));
             push_video(&mut push, input, &[], &filters);
             push(&["-c:v", "libjxl_anim"]);
             push_ffmpeg_jxl(&mut push, options);
@@ -909,7 +974,7 @@ fn ffmpeg_step(
             Sink::Output,
         ) => {
             let needs_even = format == OutputFormat::Avif;
-            let filters = video_filters(input, options, None, needs_even);
+            let filters = tone_mapped(video_filters(input, options, None, needs_even));
             push_video(&mut push, input, &["-frames:v", "1"], &filters);
             match format {
                 OutputFormat::Png => push(&["-c:v", "png"]),
@@ -1241,11 +1306,84 @@ fn scratch_path(output: &Path, tag: &str, ext: &str) -> PathBuf {
 /// `taken` lets the caller rule out paths that are reserved but not yet on disk.
 #[must_use]
 pub fn output_path(input: &Path, format: OutputFormat, taken: impl Fn(&Path) -> bool) -> PathBuf {
-    let dir = input.parent().unwrap_or_else(|| Path::new(""));
-    let stem = input
+    free_path(input, &file_stem(input), format.extension(), taken)
+}
+
+/// Frame rate assumed for a video that doesn't say.
+const FALLBACK_FPS: f64 = 30.0;
+
+/// Plan saving the frame of `input` at `at_secs` as a PNG, with the crop,
+/// turn, mirror, size and metadata choices of `options`. Their trim, frame
+/// rate, speed, direction, sound and format don't apply.
+///
+/// ffmpeg takes the first frame at or after `at_secs`, as
+/// [`crate::Ffmpeg::frame`] does for the preview, so the saved frame is the
+/// one on screen. A time past the last frame saves the last frame.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] if `input` is not a video, `at_secs` is not a
+/// positive number, or the options are invalid (see [`plan`]).
+pub fn frame_plan(
+    input: &MediaInfo,
+    options: &ConvertOptions,
+    at_secs: f64,
+    output: &Path,
+    support: impl Into<Support>,
+) -> Result<Plan> {
+    if input.kind != MediaKind::Video {
+        return Err(Error::unsupported("only videos have frames to save"));
+    }
+    if !at_secs.is_finite() || at_secs < 0.0 {
+        return Err(Error::unsupported(
+            "the frame time must be a positive number",
+        ));
+    }
+    // Seeking to the very end finds no frame to grab.
+    let last = input
+        .duration_secs
+        .map(|d| (d - 1.0 / input.fps.unwrap_or(FALLBACK_FPS)).max(0.0));
+    let at = last.map_or(at_secs, |last| at_secs.min(last));
+    let still = ConvertOptions {
+        format: OutputFormat::Png,
+        trim_start: (at > 0.0).then_some(at),
+        trim_end: None,
+        fps: None,
+        keep_audio: false,
+        sound: SoundOptions::default(),
+        speed: 1.0,
+        direction: Direction::Forward,
+        ..options.clone()
+    };
+    plan(input, &still, output, support)
+}
+
+/// Pick a free name for the frame at `at_secs` next to `input`:
+/// `clip-frame-0m12s.png`, then `clip-frame-0m12s 2.png`, …
+#[must_use]
+pub fn frame_output_path(input: &Path, at_secs: f64, taken: impl Fn(&Path) -> bool) -> PathBuf {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let whole = at_secs.max(0.0).floor() as u64;
+    let (h, m, s) = (whole / 3600, whole / 60 % 60, whole % 60);
+    let stamp = if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else {
+        format!("{m}m{s:02}s")
+    };
+    let stem = format!("{}-frame-{stamp}", file_stem(input));
+    free_path(input, &stem, OutputFormat::Png.extension(), taken)
+}
+
+fn file_stem(input: &Path) -> String {
+    input
         .file_stem()
-        .map_or_else(|| "converted".into(), |s| s.to_string_lossy().into_owned());
-    let ext = format.extension();
+        .map_or_else(|| "converted".into(), |s| s.to_string_lossy().into_owned())
+}
+
+/// `{stem}.{ext}` next to `input`, or `{stem} 2.{ext}`, `{stem} 3.{ext}`, …,
+/// whichever is first neither `input`, on disk, nor `taken`.
+fn free_path(input: &Path, stem: &str, ext: &str, taken: impl Fn(&Path) -> bool) -> PathBuf {
+    let dir = input.parent().unwrap_or_else(|| Path::new(""));
     (1..)
         .map(|n| {
             let name = if n == 1 {
@@ -1514,6 +1652,7 @@ mod tests {
             audio_codec: Some("aac".into()),
             sample_rate: Some(44_100),
             reconstructs_jpeg: false,
+            hdr: false,
             has_location: false,
             location_tags: Vec::new(),
             tile_grid: None,
@@ -2870,6 +3009,191 @@ mod tests {
         assert!(options.jxl.lossless);
         assert_eq!(options.jxl.effort, 7);
         assert!(!options.jxl.progressive);
+    }
+
+    const TONE_MAP: Support = Support {
+        jxl: JxlSupport {
+            cjxl: false,
+            djxl: false,
+            ffmpeg_encoder: false,
+            ffmpeg_anim_encoder: false,
+            ffmpeg_decoder: false,
+            ffmpeg_anim_decoder: false,
+        },
+        tone_map: true,
+    };
+
+    #[test]
+    fn frame_plan_grabs_one_edited_frame_as_png() {
+        let options = ConvertOptions {
+            format: OutputFormat::Gif,
+            trim_start: Some(2.0),
+            trim_end: Some(8.0),
+            fps: Some(10.0),
+            max_size: Some(720),
+            rotate: 90,
+            flip: true,
+            ..ConvertOptions::default()
+        };
+        let plan = frame_plan(
+            &video("garden.mov"),
+            &options,
+            12.5,
+            Path::new("/clips/garden-frame-0m12s.png"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        // The trim, frame rate and GIF format belong to the conversion, not the frame.
+        assert_eq!(
+            plan.command_line(),
+            "ffmpeg -ss 12.5 -i /clips/garden.mov -map 0:v:0 -frames:v 1 \
+             -vf transpose=clock,hflip,scale=720:-2:flags=lanczos -c:v png -update 1 -an -sn -dn \
+             /clips/garden-frame-0m12s.png"
+        );
+        assert_eq!(plan.duration_secs(), None);
+    }
+
+    #[test]
+    fn frame_plan_at_start_or_past_the_end() {
+        let out = Path::new("/clips/a.png");
+        let first = frame_plan(
+            &video("a.mov"),
+            &ConvertOptions::default(),
+            0.0,
+            out,
+            TONE_MAP,
+        )
+        .expect("plan");
+        assert!(!first.steps[0].args.iter().any(|a| a == "-ss"));
+        // 42 s at 30 fps: the last frame starts a frame's length before the end.
+        let last = frame_plan(
+            &video("a.mov"),
+            &ConvertOptions::default(),
+            99.0,
+            out,
+            TONE_MAP,
+        )
+        .expect("plan")
+        .command_line();
+        assert!(last.starts_with("ffmpeg -ss 41.967 -i"), "{last}");
+    }
+
+    #[test]
+    fn frame_plan_needs_a_video() {
+        let out = Path::new("/clips/a.png");
+        let photo = image("photo.jpg", 4000, 3000);
+        let err = frame_plan(&photo, &ConvertOptions::default(), 1.0, out, TONE_MAP)
+            .expect_err("still image");
+        assert!(err.to_string().contains("only videos"), "{err}");
+        let err = frame_plan(
+            &video("a.mov"),
+            &ConvertOptions::default(),
+            f64::NAN,
+            out,
+            TONE_MAP,
+        )
+        .expect_err("bad time");
+        assert!(err.to_string().contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn hdr_is_tone_mapped_for_pictures_and_gifs_only() {
+        let hdr = MediaInfo {
+            hdr: true,
+            ..video("iphone.mov")
+        };
+        let run = |format, support: Support| {
+            let options = ConvertOptions {
+                format,
+                ..ConvertOptions::default()
+            };
+            plan(&hdr, &options, Path::new("/clips/out"), support)
+                .expect("plan")
+                .command_line()
+        };
+        let png = run(OutputFormat::Png, TONE_MAP);
+        assert!(png.contains(&format!("-vf {TONE_MAP_FILTER} ")), "{png}");
+        let gif = run(OutputFormat::Gif, TONE_MAP);
+        assert!(
+            gif.contains(&format!(
+                "-vf '{TONE_MAP_FILTER},fps=15,scale=-2:480:flags=lanczos,"
+            )),
+            "{gif}"
+        );
+        // Videos keep their HDR tags; older ffmpegs can't tone-map at all.
+        assert!(!run(OutputFormat::Mp4, TONE_MAP).contains("out_transfer"));
+        assert!(!run(OutputFormat::Png, Support::default()).contains("out_transfer"));
+        // SDR sources are left alone.
+        let sdr = plan(
+            &video("garden.mov"),
+            &ConvertOptions {
+                format: OutputFormat::Png,
+                ..ConvertOptions::default()
+            },
+            Path::new("/clips/out.png"),
+            TONE_MAP,
+        )
+        .expect("plan");
+        assert!(!sdr.command_line().contains("out_transfer"));
+    }
+
+    #[test]
+    fn hdr_photo_is_tone_mapped_once_when_cleaned() {
+        let photo = MediaInfo {
+            hdr: true,
+            has_location: true,
+            ..image("sunset.avif", 4000, 3000)
+        };
+        let ffmpeg_jxl = Support {
+            jxl: JxlSupport {
+                ffmpeg_encoder: true,
+                ..JxlSupport::default()
+            },
+            tone_map: true,
+        };
+        for (format, support) in [
+            (OutputFormat::Png, TONE_MAP),
+            (OutputFormat::Jxl, ffmpeg_jxl),
+        ] {
+            let options = ConvertOptions {
+                format,
+                metadata: Metadata::NoLocation,
+                ..ConvertOptions::default()
+            };
+            let plan = plan(&photo, &options, Path::new("/photos/out"), support).expect("plan");
+            let mapped: Vec<bool> = plan
+                .steps
+                .iter()
+                .filter(|step| step.tool == Tool::Ffmpeg)
+                .map(|step| {
+                    step.args
+                        .iter()
+                        .any(|a| a.to_string_lossy().contains("out_transfer"))
+                })
+                .collect();
+            // The edit pass reads the HDR source; a re-encode of its PNG must not map again.
+            assert_eq!(mapped.first(), Some(&true), "{format:?}");
+            assert_eq!(mapped.iter().filter(|m| **m).count(), 1, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn frame_names_carry_the_time() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("clip.mov");
+        let at = |secs| {
+            frame_output_path(&input, secs, |_| false)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        assert_eq!(at(12.4), "clip-frame-0m12s.png");
+        assert_eq!(at(0.0), "clip-frame-0m00s.png");
+        assert_eq!(at(605.9), "clip-frame-10m05s.png");
+        assert_eq!(at(3723.0), "clip-frame-1h02m03s.png");
+        // A second frame in the same second gets a number.
+        std::fs::write(dir.path().join("clip-frame-0m12s.png"), b"x").expect("write");
+        assert_eq!(at(12.6), "clip-frame-0m12s 2.png");
     }
 
     #[test]

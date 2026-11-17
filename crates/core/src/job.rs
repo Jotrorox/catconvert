@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::convert::{self, ConvertOptions, Plan};
+use crate::convert::{self, ConvertOptions, OutputFormat, Plan};
 use crate::ffmpeg::{Ffmpeg, RunOutcome};
 use crate::{Error, MediaInfo, Result};
 
@@ -89,6 +89,14 @@ pub struct JobTicket {
     pub input: MediaInfo,
     /// The exact command(s) that will run.
     pub command: String,
+}
+
+/// What [`Queue::save_frame`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedFrame {
+    pub output: PathBuf,
+    pub output_bytes: u64,
 }
 
 type Emit = dyn Fn(JobProgress) + Send + Sync;
@@ -173,7 +181,7 @@ impl Queue {
         let (plan, id, cancel) = {
             let mut reserved = lock(&self.shared.reserved);
             let output = convert::output_path(&info.path, options.format, |p| reserved.contains(p));
-            let plan = convert::plan(&info, options, &output, ffmpeg.jxl_support())?;
+            let plan = convert::plan(&info, options, &output, ffmpeg.support())?;
             reserved.insert(output);
             (plan, JobId::next(), Arc::new(AtomicBool::new(false)))
         };
@@ -195,6 +203,44 @@ impl Queue {
             });
         }
         Ok(ticket)
+    }
+
+    /// Save the frame of `input` at `at_secs` as a PNG next to it (see
+    /// [`convert::frame_plan`]), right away rather than in turn: one frame
+    /// takes a moment. Blocks until the file is written. The name is kept
+    /// clear of outputs that queued jobs will write.
+    ///
+    /// # Errors
+    ///
+    /// Probe errors, [`Error::Unsupported`] if `input` is not a video or this
+    /// ffmpeg can't write PNG, and [`Error::Ffmpeg`] if the grab fails.
+    pub fn save_frame(
+        &self,
+        input: impl AsRef<Path>,
+        options: &ConvertOptions,
+        at_secs: f64,
+    ) -> Result<SavedFrame> {
+        let ffmpeg = &self.shared.ffmpeg;
+        if let Some(message) = ffmpeg.missing(OutputFormat::Png) {
+            return Err(Error::Unsupported { message });
+        }
+        let info = ffmpeg.probe(input)?;
+        let plan = {
+            let mut reserved = lock(&self.shared.reserved);
+            let output = convert::frame_output_path(&info.path, at_secs, |p| reserved.contains(p));
+            let plan = convert::frame_plan(&info, options, at_secs, &output, ffmpeg.support())?;
+            reserved.insert(output);
+            plan
+        };
+        let result = ffmpeg.run(&plan, &AtomicBool::new(false), |_| {});
+        lock(&self.shared.reserved).remove(&plan.output);
+        match result? {
+            RunOutcome::Done { output_bytes } => Ok(SavedFrame {
+                output: plan.output,
+                output_bytes,
+            }),
+            RunOutcome::Cancelled => unreachable!("nothing raises the cancel flag"),
+        }
     }
 
     /// Cancel a queued or running job. Returns `false` if it already finished.
@@ -391,13 +437,28 @@ mod tests {
         }
 
         // Preview helpers.
-        let frame = ffmpeg.frame(&input, 1.0, 90).expect("frame");
+        let frame = ffmpeg.frame(&input, 1.0, 90, false).expect("frame");
         assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
         let wave = ffmpeg
             .waveform(&input, 200, 40, "#c93b63")
             .expect("waveform");
         assert_eq!(&wave[1..4], b"PNG");
         assert!(ffmpeg.waveform(&input, 200, 40, "red;rm").is_err());
+
+        // Saving a frame runs right away, with the turn and size but not the trim.
+        if ffmpeg.supports(OutputFormat::Png) {
+            let saved = queue.save_frame(&input, &options, 1.2).expect("save frame");
+            assert_eq!(
+                saved.output.file_name().and_then(|n| n.to_str()),
+                Some("test clip-frame-0m01s.png")
+            );
+            assert!(saved.output_bytes > 0);
+            let still = ffmpeg.probe(&saved.output).expect("probe frame");
+            assert_eq!(still.kind, crate::MediaKind::Image);
+            assert_eq!((still.width, still.height), (Some(120), Some(160)));
+            let again = queue.save_frame(&input, &options, 1.4).expect("save again");
+            assert!(again.output.ends_with("test clip-frame-0m01s 2.png"));
+        }
     }
 
     /// Wait for the final event of `id`.
@@ -641,7 +702,7 @@ mod tests {
         let back = ffmpeg.probe(&ticket2.output).expect("probe gif");
         assert_eq!(back.kind, crate::MediaKind::Video);
         assert!((back.duration_secs.expect("duration") - 1.0).abs() < 0.15);
-        let frame = ffmpeg.frame(&ticket.output, 0.8, 90).expect("frame");
+        let frame = ffmpeg.frame(&ticket.output, 0.8, 90, false).expect("frame");
         assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
 
         // No scratch files left behind.
@@ -692,7 +753,7 @@ mod tests {
         }
         assert_eq!((info.width, info.height), (Some(1200), Some(900)));
 
-        let frame = ffmpeg.frame(&heic, 0.0, 90).expect("frame");
+        let frame = ffmpeg.frame(&heic, 0.0, 90, false).expect("frame");
         assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
 
         let (tx, rx) = mpsc::channel();

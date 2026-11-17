@@ -36,6 +36,7 @@ const clip: MediaInfo = {
   audioCodec: "aac",
   sampleRate: 48000,
   reconstructsJpeg: false,
+  hdr: false,
   hasLocation: false,
   locationTags: [],
   tileGrid: null,
