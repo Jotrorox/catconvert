@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use catconvert_core::{
-    ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat, Queue,
-    SavedFrame, SequenceOptions, VideoCodec,
+    ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat,
+    QualitySummary, Queue, SavedFrame, SequenceOptions, VideoCodec,
 };
 use serde::Serialize;
 use tauri::ipc::Response;
@@ -298,6 +298,13 @@ fn preview_command(
         .map_err(|err| err.to_string())
 }
 
+/// The audio bitrate and video CRF (or exact bitrate) a conversion would
+/// use, for the line under the quality slider.
+#[tauri::command]
+fn quality_summary(info: MediaInfo, options: ConvertOptions) -> QualitySummary {
+    catconvert_core::quality_summary(&info, &options)
+}
+
 /// The plan a conversion of `info` with `options` would run, for previews.
 /// The output name skips names queued jobs will write, as submitting does.
 fn preview_plan(
@@ -505,6 +512,7 @@ pub fn run() {
             playback_source,
             loudness,
             preview_command,
+            quality_summary,
             check_command,
             fill_command,
             command_template,

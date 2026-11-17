@@ -30,9 +30,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::convert::{
-    ANIMATED_JXL_MAX_SIZE, ANIMATED_WEBP_MAX_SIZE, FRAME_MEMORY_BUDGET, GIF_MAX_SIZE, cjxl_step,
-    free_path, lerp, push_animated_webp, push_ffmpeg_jxl, push_video_encoder, scratch_path,
-    turn_filters,
+    ANIMATED_JXL_MAX_SIZE, ANIMATED_WEBP_MAX_SIZE, FRAME_MEMORY_BUDGET, GIF_MAX_SIZE, VideoRate,
+    cjxl_step, free_path, lerp, push_animated_webp, push_ffmpeg_jxl, push_video_encoder,
+    scratch_path, turn_filters,
 };
 use crate::ffmpeg::format_secs;
 use crate::jxl::is_jxl;
@@ -345,7 +345,9 @@ pub fn plan_sequence(
         }
         _ => {
             let codec = options.codec().unwrap_or(VideoCodec::H264);
-            push_video_encoder(&mut push, codec, q);
+            // A slideshow is mostly still: constant quality suits it, and
+            // an exact bitrate would mostly go to the first frame.
+            push_video_encoder(&mut push, VideoRate::constant(codec, q), None);
             if codec == VideoCodec::H264 {
                 push(&["-tune", "stillimage"]);
             }

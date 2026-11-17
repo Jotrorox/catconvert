@@ -817,6 +817,68 @@ mod tests {
         assert!(queue.submit(&input, &mov).is_err());
     }
 
+    /// An exact bitrate: H.264 in two passes lands near the target, the
+    /// first pass's log files are cleaned up, and the probe reads the
+    /// bitrates back. Skipped (passes) without ffmpeg.
+    #[test]
+    fn exact_bitrate_end_to_end() {
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping exact-bitrate test");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("noise.mkv");
+        let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=3:r=25",
+            ])
+            .args(["-f", "lavfi", "-i", "sine=d=3", "-shortest"])
+            .args(["-c:v", "ffv1", "-c:a", "pcm_s16le", "-ac", "2"])
+            .arg(&input)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+        let probed = ffmpeg.probe(&input).expect("probe");
+        assert_eq!(probed.audio_channels, Some(2));
+        assert!(probed.bitrate.is_some());
+
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let options = ConvertOptions {
+            video_bitrate: Some(400),
+            ..ConvertOptions::default()
+        };
+        let ticket = queue.submit(&input, &options).expect("submit");
+        assert!(ticket.command.contains("-pass 2"), "{}", ticket.command);
+        let done = finish_of(&rx, ticket.id);
+        assert_eq!(done.stage, JobStage::Done, "{done:?}");
+
+        let out = ffmpeg.probe(&ticket.output).expect("probe output");
+        let kbps = out.video_bitrate.expect("MP4 records the video bitrate") / 1000;
+        assert!(
+            (200..=600).contains(&kbps),
+            "aimed for 400 kbps, got {kbps}"
+        );
+        assert_eq!(
+            out.audio_bitrate.map(|b| b / 16_000),
+            Some(128 / 16),
+            "{out:?}"
+        );
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["noise.mkv", "noise.mp4"], "pass logs are cleaned up");
+    }
+
     /// Wait for the final event of `id`.
     fn finish_of(rx: &mpsc::Receiver<JobProgress>, id: JobId) -> JobProgress {
         loop {

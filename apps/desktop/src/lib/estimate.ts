@@ -7,9 +7,16 @@
  * is usual for its codec). Content still matters more than any of this, so
  * the UI calls it "about".
  */
-import type { ConvertOptions, MediaInfo } from "./api";
+import type {
+  AudioRate,
+  ConvertOptions,
+  MediaInfo,
+  QualitySummary,
+  SequenceOptions,
+  VideoRate,
+} from "./api";
 import { pictureSize } from "./crop";
-import { formatBytes } from "./format";
+import { formatBitrate, formatBytes } from "./format";
 import {
   autoLimits,
   codecOf,
@@ -141,7 +148,7 @@ function complexity(info: MediaInfo, sourceAudioRate: number): number {
   if (info.kind !== "video" || !info.durationSecs || !info.fps) return 1;
   const typical = TYPICAL_VIDEO_BPP[info.videoCodec ?? ""];
   if (typical === undefined) return 1;
-  const videoRate = (info.sizeBytes * 8) / info.durationSecs - sourceAudioRate;
+  const videoRate = info.videoBitrate ?? (info.sizeBytes * 8) / info.durationSecs - sourceAudioRate;
   if (videoRate <= 0) return 1;
   return clamp(videoRate / (pixels * info.fps) / (typical * resolutionFactor(pixels)));
 }
@@ -170,6 +177,28 @@ function imageBpp(options: ConvertOptions): number {
       // PNG of a photo.
       return 12;
   }
+}
+
+/** Bits per second of the source's sound: what the file says, or a typical 128 kbps. */
+function sourceAudioRate(info: MediaInfo): number {
+  return info.audioCodec === null ? 0 : (info.audioBitrate ?? kbps(128));
+}
+
+/**
+ * Estimated average bitrate of the picture in bit/s when writing a video file
+ * (MP4, MOV, MKV or WebM), or `null` for other outputs or when too little is
+ * known. An exact bitrate is simply that.
+ */
+export function estimateVideoBitrate(info: MediaInfo, options: ConvertOptions): number | null {
+  if (info.kind !== "video" || formatKind(options.format, info.kind) !== "video") return null;
+  if (isAnimatedImage(options.format, info.kind) || codecOf(options) === null) return null;
+  if (options.videoBitrate) return options.videoBitrate * 1000;
+  const pixels = outputPixels(info, options, options.maxSize);
+  if (pixels === null) return null;
+  const sourceFps = info.fps ?? 30;
+  const fps = Math.min(sourceFps, options.fps ?? sourceFps);
+  const busy = complexity(info, sourceAudioRate(info));
+  return pixels * fps * videoBpp(options) * resolutionFactor(pixels) * (fps / 30) ** -0.3 * busy;
 }
 
 /** Estimated output size in bytes, or `null` when too little is known to guess. */
@@ -209,8 +238,13 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
     return (audioRate(info, options, info.kind === "audio" ? sourceRate : null) * seconds) / 8;
   }
 
-  // Video, GIF or animated JPEG XL.
-  const sourceAudio = info.audioCodec === null ? 0 : kbps(128);
+  const keepAudio = options.keepAudio && info.audioCodec !== null;
+  const audioBits = keepAudio ? audioRate(info, options, null) * seconds : 0;
+  const videoRate = estimateVideoBitrate(info, options);
+  if (videoRate !== null) return (videoRate * seconds + audioBits) / 8;
+
+  // GIF or animated WebP and JPEG XL.
+  const sourceAudio = sourceAudioRate(info);
   const limits = autoLimits(options.format, info.kind);
   const pixels = outputPixels(info, options, options.maxSize ?? limits?.size ?? null);
   if (pixels === null) return null;
@@ -221,20 +255,12 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
   const busy = complexity(info, sourceAudio);
   const frames = pixels * fps * seconds;
 
-  if (isAnimatedImage(options.format, info.kind)) {
-    if (options.format === "gif") {
-      // LZW over a dithered palette: more colours, more bits.
-      const colors = lerp(q, 32, 256);
-      return (frames * 0.35 * Math.log2(colors) * busy) / 8;
-    }
-    return (frames * jxlBpp(options) * busy) / 8;
+  if (options.format === "gif") {
+    // LZW over a dithered palette: more colours, more bits.
+    const colors = lerp(q, 32, 256);
+    return (frames * 0.35 * Math.log2(colors) * busy) / 8;
   }
-
-  const videoBits =
-    frames * videoBpp(options) * resolutionFactor(pixels) * (fps / 30) ** -0.3 * busy;
-  const keepAudio = options.keepAudio && info.audioCodec !== null;
-  const audioBits = keepAudio ? audioRate(info, options, null) * seconds : 0;
-  return (videoBits + audioBits) / 8;
+  return (frames * jxlBpp(options) * busy) / 8;
 }
 
 /** Round to two significant digits so the number doesn't promise precision. */
@@ -279,6 +305,63 @@ export function estimateSequenceBytes(
       bpp = 10 * videoBpp(options) * resolutionFactor(pixels) * busy;
   }
   return (shown * pixels * bpp) / 8;
+}
+
+/**
+ * Estimated average bitrate of a video slideshow made from `pictures` in
+ * bit/s, or `null` for GIFs and other animations.
+ */
+export function estimateSequenceVideoBitrate(
+  pictures: readonly MediaInfo[],
+  options: ConvertOptions,
+  sequence: SequenceOptions,
+): number | null {
+  if (codecOf(options) === null) return null;
+  const bytes = estimateSequenceBytes(pictures, options);
+  const seconds = playbackOrder(pictures.length, options.direction).length * sequence.frameSecs;
+  return bytes === null || seconds <= 0 ? null : (bytes * 8) / seconds;
+}
+
+/** The sound's part of {@link describeQuality}, e.g. "128 kbps". */
+function audioText(rate: AudioRate): string {
+  switch (rate.mode) {
+    case "bitrate":
+      return formatBitrate(rate.kbps * 1000);
+    case "vbr":
+      return `~${formatBitrate(rate.kbps * 1000)} (VBR V${rate.level})`;
+    case "lossless":
+      return "lossless";
+    case "pcm":
+      return rate.kbps === null ? "uncompressed" : `${formatBitrate(rate.kbps * 1000)} (PCM)`;
+  }
+}
+
+/** The picture's part of {@link describeQuality}, e.g. "~3.8 Mbps (CRF 24)". */
+function videoText(rate: VideoRate, estimate: number | null): string {
+  if (rate.kbps !== null) {
+    return `${formatBitrate(rate.kbps * 1000)} (${rate.passes > 1 ? `${rate.passes}-pass` : "average"})`;
+  }
+  const crf = `CRF ${rate.crf ?? "?"}`;
+  return estimate === null || !Number.isFinite(estimate)
+    ? crf
+    : `~${formatBitrate(estimate, true)} (${crf})`;
+}
+
+/**
+ * The quality setting in numbers, e.g. "Audio 128 kbps · Video ~3.8 Mbps (CRF 24)".
+ * The audio bitrate and CRF come from the core, exactly as the command uses
+ * them; a CRF's bitrate depends on the picture, so `videoEstimate` (bit/s) is
+ * shown as an estimate. `null` when there is nothing to say (stills, GIFs).
+ */
+export function describeQuality(
+  summary: QualitySummary | null,
+  videoEstimate: number | null,
+): string | null {
+  if (!summary) return null;
+  const parts: string[] = [];
+  if (summary.audio) parts.push(`Audio ${audioText(summary.audio)}`);
+  if (summary.video) parts.push(`Video ${videoText(summary.video, videoEstimate)}`);
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 /** The animation estimate as one line, compared with the pictures' total size. */

@@ -68,6 +68,22 @@ pub struct MediaInfo {
     /// Sample rate of the primary audio stream in Hz, e.g. `48000`.
     #[serde(default)]
     pub sample_rate: Option<u32>,
+    /// Channel count of the primary audio stream, e.g. `2` for stereo.
+    #[serde(default)]
+    pub audio_channels: Option<u32>,
+    /// Average bitrate of the whole file in bit/s, as the container says.
+    #[serde(default)]
+    pub bitrate: Option<u64>,
+    /// Average bitrate of the primary video stream in bit/s. Containers
+    /// that don't record it per stream (MKV, WebM) leave it to be worked
+    /// out from the file's bitrate, which is only possible when the sound's
+    /// bitrate is known or there is none.
+    #[serde(default)]
+    pub video_bitrate: Option<u64>,
+    /// Average bitrate of the primary audio stream in bit/s; for files with
+    /// only sound, the file's bitrate when the stream doesn't say.
+    #[serde(default)]
+    pub audio_bitrate: Option<u64>,
     /// JPEG XL only: the file is a losslessly recompressed JPEG, so the
     /// original JPEG can be restored bit for bit.
     #[serde(default)]
@@ -175,6 +191,10 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         video_codec: None,
         audio_codec: None,
         sample_rate: None,
+        audio_channels: None,
+        bitrate: None,
+        video_bitrate: None,
+        audio_bitrate: None,
         reconstructs_jpeg: false,
         hdr: false,
         has_location: false,
@@ -290,6 +310,10 @@ pub(crate) mod tests {
             video_codec: None,
             audio_codec: None,
             sample_rate: None,
+            audio_channels: None,
+            bitrate: None,
+            video_bitrate: None,
+            audio_bitrate: None,
             reconstructs_jpeg: false,
             hdr: false,
             has_location: false,

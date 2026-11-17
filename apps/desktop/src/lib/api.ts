@@ -36,6 +36,14 @@ export type MediaInfo = {
   audioCodec: string | null;
   /** Sample rate of the sound in Hz. */
   sampleRate: number | null;
+  /** Channel count of the sound, e.g. 2 for stereo. */
+  audioChannels?: number | null;
+  /** Average bitrate of the whole file in bit/s. */
+  bitrate?: number | null;
+  /** Average bitrate of the picture in bit/s, when the file says or it can be worked out. */
+  videoBitrate?: number | null;
+  /** Average bitrate of the sound in bit/s, when the file says or it can be worked out. */
+  audioBitrate?: number | null;
   /** JPEG XL only: a losslessly recompressed JPEG whose original can be restored. */
   reconstructsJpeg: boolean;
   /** HDR video (PQ or HLG, as iPhones record); pictures made from it are tone-mapped. */
@@ -137,6 +145,11 @@ export type ConvertOptions = {
   keepAudio: boolean;
   /** Codec of MP4, MOV, MKV and WebM files; `null` is the format's usual one. Ignored otherwise. */
   videoCodec: VideoCodec | null;
+  /**
+   * Exact average video bitrate in kbit/s instead of the CRF `quality` picks
+   * (MP4, MOV, MKV, WebM); `null` uses `quality`. H.264 and VP9 take two passes.
+   */
+  videoBitrate: number | null;
   jxl: JxlOptions;
   sound: SoundOptions;
   /** Which dates, places and other tags to carry over, where the format can hold them. */
@@ -145,6 +158,36 @@ export type ConvertOptions = {
   speed: number;
   /** Playback direction of animations. Ignored otherwise. */
   direction: Direction;
+};
+
+/** How the sound is encoded: what the quality setting becomes for it. */
+export type AudioRate =
+  /** AAC or Opus aiming for this bitrate. */
+  | { mode: "bitrate"; kbps: number }
+  /** MP3 at LAME's VBR level (0 best to 7 smallest), averaging about `kbps`. */
+  | { mode: "vbr"; level: number; kbps: number }
+  /** FLAC. */
+  | { mode: "lossless" }
+  /** WAV: 16-bit PCM; `kbps` is `null` when the sample rate or channels are unknown. */
+  | { mode: "pcm"; kbps: number | null };
+
+/** How the picture of a video file is encoded. */
+export type VideoRate = {
+  codec: VideoCodec;
+  /** Constant rate factor; `null` with an exact bitrate. */
+  crf: number | null;
+  /** Exact average bitrate in kbit/s; `null` with a CRF. */
+  kbps: number | null;
+  /** 2 for an exact H.264 or VP9 bitrate, otherwise 1. */
+  passes: number;
+};
+
+/** The numbers behind the quality setting, exactly as the planned command uses them. */
+export type QualitySummary = {
+  /** `null` when the output has no sound. */
+  audio: AudioRate | null;
+  /** `null` for outputs without a video codec: stills, GIFs, other animations, sound. */
+  video: VideoRate | null;
 };
 
 /** How pictures of another shape fit an animation's frame (the first picture's size). */
@@ -244,6 +287,7 @@ type Commands = {
   playback_source: { args: { path: string; decode: boolean }; result: string };
   loudness: { args: { path: string }; result: number | null };
   preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
+  quality_summary: { args: { info: MediaInfo; options: ConvertOptions }; result: QualitySummary };
   check_command: {
     args: { info: MediaInfo; options: ConvertOptions; command: string };
     result: string;
@@ -388,6 +432,11 @@ export function loudness(path: string): Promise<number | null> {
 /** The command(s) a conversion would run. */
 export function previewCommand(info: MediaInfo, options: ConvertOptions): Promise<string> {
   return command("preview_command", { info, options });
+}
+
+/** The audio bitrate and video CRF (or exact bitrate) a conversion would use. */
+export function qualitySummary(info: MediaInfo, options: ConvertOptions): Promise<QualitySummary> {
+  return command("quality_summary", { info, options });
 }
 
 /** Queue a conversion; progress arrives via {@link onJobProgress}. */

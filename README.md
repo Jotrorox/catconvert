@@ -130,6 +130,7 @@ mise run cli -- convert clip.mov --to jxl --size 480 --effort 9    # animated JP
 mise run cli -- convert clip.mov --to mp3            # pull the audio
 mise run cli -- convert clip.mov --to mp4 --crop 9:16 --size 1080  # vertical, centred
 mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print the ffmpeg command
+mise run cli -- convert clip.mov --to mp4 --bitrate 4M          # exact video bitrate, two passes
 mise run cli -- animate cat*.jpg --to gif --frame 0.25 --direction boomerang  # pictures → animation
 ```
 

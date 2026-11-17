@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { ConvertOptions, MediaInfo, OutputFormat } from "./api";
-import { describeEstimate, estimateBytes } from "./estimate";
+import {
+  describeEstimate,
+  describeQuality,
+  estimateBytes,
+  estimateSequenceVideoBitrate,
+  estimateVideoBitrate,
+} from "./estimate";
 import { defaultOptions } from "./formats";
 
 const clip: MediaInfo = {
@@ -158,5 +164,89 @@ describe("describeEstimate", () => {
       /^About 1\.4 MB · 22× smaller$/,
     );
     expect(describeEstimate(photo, opts("png"))).toMatch(/× bigger$/);
+  });
+});
+
+describe("estimateVideoBitrate", () => {
+  it("is the picture's share of the size estimate", () => {
+    for (const quality of [0, 60, 100]) {
+      const silent = opts("mp4", { quality, keepAudio: false });
+      const rate = estimateVideoBitrate(clip, silent) ?? Number.NaN;
+      expect((rate * 42) / 8).toBeCloseTo(estimateBytes(clip, silent) ?? Number.NaN);
+    }
+    expect(estimateVideoBitrate(clip, opts("mp4", { quality: 90 }))).toBeGreaterThan(
+      estimateVideoBitrate(clip, opts("mp4", { quality: 30 })) ?? Number.POSITIVE_INFINITY,
+    );
+  });
+
+  it("is exact with an exact bitrate, which sizes the file too", () => {
+    const exact = opts("mp4", { videoBitrate: 2500, keepAudio: false });
+    expect(estimateVideoBitrate(clip, exact)).toBe(2_500_000);
+    expect(estimateBytes(clip, exact)).toBeCloseTo((2_500_000 * 42) / 8);
+  });
+
+  it("only applies to video files", () => {
+    expect(estimateVideoBitrate(clip, opts("gif"))).toBeNull();
+    expect(estimateVideoBitrate(clip, opts("mp3"))).toBeNull();
+    expect(estimateVideoBitrate(photo, opts("png"))).toBeNull();
+  });
+
+  it("reads how busy the source is from its own video bitrate when known", () => {
+    const busy = { ...clip, videoBitrate: 30_000_000 };
+    const calm = { ...clip, videoBitrate: 1_000_000 };
+    const at = (info: MediaInfo) => estimateVideoBitrate(info, opts("mp4")) ?? Number.NaN;
+    expect(at(busy)).toBeGreaterThan(at(clip));
+    expect(at(calm)).toBeLessThan(at(clip));
+  });
+
+  it("averages a slideshow over how long it plays", () => {
+    const slideshow = opts("mp4");
+    const rate = estimateSequenceVideoBitrate([photo, photo], slideshow, {
+      frameSecs: 0.5,
+      fit: "pad",
+    });
+    expect(rate).toBeGreaterThan(0);
+    expect(
+      estimateSequenceVideoBitrate([photo, photo], slideshow, { frameSecs: 1, fit: "pad" }),
+    ).toBeCloseTo((rate ?? 0) / 2);
+    expect(
+      estimateSequenceVideoBitrate([photo], opts("gif"), { frameSecs: 1, fit: "pad" }),
+    ).toBeNull();
+  });
+});
+
+describe("describeQuality", () => {
+  const h264 = { codec: "h264", crf: 24, kbps: null, passes: 1 } as const;
+
+  it("puts the core's numbers and the estimate in one line", () => {
+    expect(describeQuality({ audio: { mode: "bitrate", kbps: 128 }, video: h264 }, 3_840_000)).toBe(
+      "Audio 128 kbps · Video ~3.8 Mbps (CRF 24)",
+    );
+    expect(describeQuality({ audio: null, video: h264 }, null)).toBe("Video CRF 24");
+    expect(
+      describeQuality(
+        { audio: null, video: { ...h264, crf: null, kbps: 4000, passes: 2 } },
+        4_000_000,
+      ),
+    ).toBe("Video 4 Mbps (2-pass)");
+    expect(
+      describeQuality(
+        { audio: null, video: { codec: "av1", crf: null, kbps: 2500, passes: 1 } },
+        null,
+      ),
+    ).toBe("Video 2.5 Mbps (average)");
+  });
+
+  it("names what lossless and uncompressed sound come to", () => {
+    const audio = (rate: Parameters<typeof describeQuality>[0] & object) =>
+      describeQuality(rate, null);
+    expect(audio({ audio: { mode: "vbr", level: 3, kbps: 175 }, video: null })).toBe(
+      "Audio ~175 kbps (VBR V3)",
+    );
+    expect(audio({ audio: { mode: "lossless" }, video: null })).toBe("Audio lossless");
+    expect(audio({ audio: { mode: "pcm", kbps: 1536 }, video: null })).toBe("Audio 1.5 Mbps (PCM)");
+    expect(audio({ audio: { mode: "pcm", kbps: null }, video: null })).toBe("Audio uncompressed");
+    expect(audio({ audio: null, video: null })).toBeNull();
+    expect(describeQuality(null, 1)).toBeNull();
   });
 });

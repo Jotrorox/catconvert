@@ -2281,9 +2281,66 @@ button.format-chip:not(:disabled):active {
   font-weight: 600;
 }
 
+.lossless-numbers {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .warning-note {
   background: var(--pink-bg);
   color: var(--pink-ink);
+}
+
+.quality-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.quality-head .field-label {
+  margin-bottom: 0;
+}
+
+.quality-modes {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.quality-modes .format-chip {
+  min-width: 0;
+  padding: 4px 10px;
+  font-size: 12.5px;
+}
+
+.bitrate-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0 8px;
+}
+
+.bitrate-input {
+  width: 110px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bitrate-unit {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.quality-numbers {
+  margin: 10px 0 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 .estimate {

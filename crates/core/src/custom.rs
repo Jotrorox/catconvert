@@ -82,6 +82,7 @@ pub fn custom_plan(
         }
         let written_files = outputs(call)?;
         for written in &written_files {
+            let written = written.as_str();
             let path = Path::new(written);
             if path == input.path {
                 return Err(invalid(format!(
@@ -415,8 +416,7 @@ fn refused_ffmpeg_option(name: &str) -> Option<&'static str> {
     Some(match name {
         "-y" => "-y lets ffmpeg overwrite files, and CatConvert never does that",
         "-progress" => "CatConvert sets -progress itself to show how far along the conversion is",
-        "-report" | "-vstats" | "-vstats_file" | "-pass" | "-passlogfile" | "-sdp_file"
-        | "-dump_attachment" => {
+        "-report" | "-vstats" | "-vstats_file" | "-sdp_file" | "-dump_attachment" => {
             return Some(
                 "This option makes ffmpeg write extra files; a command may only write the output",
             );
@@ -432,36 +432,75 @@ fn ffmpeg_takes_value(name: &str) -> bool {
     !(FFMPEG_FLAGS.contains(&name) || negated)
 }
 
+/// The log files ffmpeg writes for a two-pass encode with `-passlogfile
+/// prefix`: libvpx's `prefix-0.log`, plus x264's `.mbtree`, each as a
+/// `.temp` file until it is done. Two-pass plans list them all as scratch.
+pub(crate) const PASSLOG_SUFFIXES: [&str; 4] = [
+    "-0.log",
+    "-0.log.temp",
+    "-0.log.mbtree",
+    "-0.log.mbtree.temp",
+];
+
 /// The files a call writes, as written. Inputs aren't limited: reading a
 /// watermark or a subtitle file is fine.
-fn outputs(call: &Call) -> Result<Vec<&str>> {
+fn outputs(call: &Call) -> Result<Vec<String>> {
     let mut outputs = Vec::new();
     match call.tool {
         Tool::Ffmpeg => {
             let mut args = call.args.iter();
+            let mut format = None;
+            let mut pass = false;
+            let mut passlog = None;
             while let Some(arg) = args.next() {
                 if arg == "-i" {
                     args.next()
                         .ok_or_else(|| invalid("ffmpeg's -i needs a file after it"))?;
+                    // Options before an input apply to that input.
+                    format = None;
                 } else if arg.len() > 1 && arg.starts_with('-') {
                     // Stream specifiers as in -c:v or -pass:v.
                     let name = arg.split(':').next().unwrap_or(arg);
                     if let Some(reason) = refused_ffmpeg_option(name) {
                         return Err(invalid(format!("{arg} isn't allowed: {reason}")));
                     }
-                    if ffmpeg_takes_value(name) {
-                        args.next();
+                    let value = if ffmpeg_takes_value(name) {
+                        args.next()
+                    } else {
+                        None
+                    };
+                    match name {
+                        "-f" => format = value.map(String::as_str),
+                        "-pass" => pass = true,
+                        "-passlogfile" => passlog = value,
+                        _ => {}
                     }
+                } else if arg == "-" && format == Some("null") {
+                    // The analysis pass of a two-pass encode writes nothing.
                 } else {
-                    outputs.push(arg.as_str());
+                    outputs.push(arg.clone());
                 }
+            }
+            match passlog {
+                // The pass logs come first: the last file is what a step makes.
+                Some(prefix) => {
+                    let logs = PASSLOG_SUFFIXES.map(|suffix| format!("{prefix}{suffix}"));
+                    outputs.splice(0..0, logs);
+                }
+                None if pass => {
+                    return Err(invalid(
+                        "-pass needs a -passlogfile next to the output, or ffmpeg writes its \
+                         log where CatConvert can't clean it up",
+                    ));
+                }
+                None => {}
             }
         }
         Tool::Cjxl | Tool::Djxl => {
             let name = call.tool.name();
             match call.args.as_slice() {
                 [input, output, ..] if !input.starts_with('-') && !output.starts_with('-') => {
-                    outputs.push(output.as_str());
+                    outputs.push(output.clone());
                 }
                 _ => {
                     return Err(invalid(format!(
@@ -474,7 +513,7 @@ fn outputs(call: &Call) -> Result<Vec<&str>> {
             [_, output, flag, what]
                 if flag == "--drop" && matches!(what.as_str(), "location" | "all") =>
             {
-                outputs.push(output.as_str());
+                outputs.push(output.clone());
             }
             _ => {
                 return Err(invalid(
@@ -662,6 +701,10 @@ mod tests {
             video_codec: Some("h264".into()),
             audio_codec: Some("aac".into()),
             sample_rate: Some(44_100),
+            audio_channels: Some(2),
+            bitrate: None,
+            video_bitrate: None,
+            audio_bitrate: None,
             reconstructs_jpeg: false,
             hdr: false,
             has_location: false,
@@ -956,7 +999,8 @@ mod tests {
             "ffmpeg -i /clips/garden.mov -f null -",
             all_tools(),
         ));
-        assert!(none.contains("- isn't where"), "{none}");
+        // Writing nothing is fine for a first pass, but not for the last step.
+        assert!(none.contains("The last step has to write"), "{none}");
         let last = error(custom_plan(&clip, &planned, "ffmpeg -version", all_tools()));
         assert!(
             last.contains("The last step has to write /clips/garden.mp4"),
@@ -972,8 +1016,8 @@ mod tests {
         for (option, expected) in [
             ("-y", "overwrite"),
             ("-progress pipe:2", "-progress"),
-            ("-pass 1", "extra files"),
-            ("-pass:v 1", "extra files"),
+            ("-pass 1", "-passlogfile"),
+            ("-pass:v 1", "-passlogfile"),
             ("-report", "extra files"),
             ("-vstats_file /tmp/v", "extra files"),
         ] {
@@ -1099,6 +1143,54 @@ mod tests {
                 &theirs.output
             ))
             .contains("placeholder")
+        );
+    }
+
+    #[test]
+    fn two_pass_commands_write_only_their_logs() {
+        let clip = video("/clips/garden.mov");
+        let exact = ConvertOptions {
+            video_bitrate: Some(4000),
+            ..mp4(false)
+        };
+        let planned = generated(&clip, &exact, "/clips/garden.mp4");
+        let text = planned.command_line();
+        assert!(
+            text.contains("-pass 1") && text.contains("-f null -"),
+            "{text}"
+        );
+
+        // Unedited, or with another bitrate in both passes.
+        let same = custom_plan(&clip, &planned, &text, all_tools()).expect("unedited");
+        assert_eq!(same, planned);
+        let edited = text.replace("-b:v 4000k", "-b:v 2500k");
+        let custom = custom_plan(&clip, &planned, &edited, all_tools()).expect("edited");
+        assert_eq!(custom.steps.len(), 2);
+        assert_eq!(custom.scratch, planned.scratch);
+
+        // The logs must be the plan's own, and "-" only means nothing with -f null.
+        let elsewhere = text.replace(
+            "-passlogfile /clips/.garden.mp4.passlog.stats",
+            "-passlogfile /tmp/stats",
+        );
+        assert!(
+            error(custom_plan(&clip, &planned, &elsewhere, all_tools()))
+                .contains("/tmp/stats-0.log")
+        );
+        let no_log = text.replacen(" -passlogfile /clips/.garden.mp4.passlog.stats", "", 1);
+        assert!(error(custom_plan(&clip, &planned, &no_log, all_tools())).contains("-passlogfile"));
+        let stdout = text.replacen("-f null -", "-f mp4 -", 1);
+        assert!(error(custom_plan(&clip, &planned, &stdout, all_tools())).contains("- isn't"));
+
+        // Recipes keep the logs next to whichever file they convert.
+        let template = command_template(&clip.path, &edited).expect("template");
+        assert!(template.contains("'{scratch:passlog.stats}'"), "{template}");
+        let other = video("/other/dog.mov");
+        let theirs = generated(&other, &exact, "/other/dog.mp4");
+        let filled = fill_command(&template, &other.path, &theirs.output).expect("fill");
+        assert_eq!(
+            filled,
+            theirs.command_line().replace("-b:v 4000k", "-b:v 2500k")
         );
     }
 }

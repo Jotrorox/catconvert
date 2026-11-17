@@ -11,7 +11,8 @@
 //!
 //! 1. [`Ffmpeg::probe`] reads duration, size and codecs of a file.
 //! 2. [`plan`] turns [`ConvertOptions`] (format, trim, size, rotation, crop, …) into
-//!    one or more command lines ([`Step`]s).
+//!    one or more command lines ([`Step`]s). [`quality_summary`] tells what its
+//!    quality setting means in bitrates and CRF.
 //! 3. [`Queue`] runs planned conversions one after another and reports
 //!    [`JobProgress`] events.
 //!
@@ -32,9 +33,9 @@ mod scrub;
 mod sequence;
 
 pub use convert::{
-    ConvertOptions, Crop, CropArea, Direction, JxlOptions, JxlSupport, Metadata, OutputFormat,
-    Plan, SoundOptions, Step, Support, Tool, VideoCodec, frame_output_path, frame_plan,
-    output_path, plan,
+    AudioRate, ConvertOptions, Crop, CropArea, Direction, JxlOptions, JxlSupport, Metadata,
+    OutputFormat, Plan, QualitySummary, SoundOptions, Step, Support, Tool, VIDEO_KBPS, VideoCodec,
+    VideoRate, crf_range, frame_output_path, frame_plan, output_path, plan, quality_summary,
 };
 pub use custom::{
     INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER, command_template, custom_plan, fill_command,

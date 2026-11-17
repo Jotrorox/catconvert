@@ -24,6 +24,8 @@ import {
   loudness,
   type MediaInfo,
   previewCommand,
+  type QualitySummary,
+  qualitySummary,
 } from "../lib/api";
 import {
   ASPECTS,
@@ -36,14 +38,22 @@ import {
   turnCrop,
   turnedSize,
 } from "../lib/crop";
-import { describeEstimate } from "../lib/estimate";
-import { baseName, formatBytes, formatClock, formatSpan, parseClock } from "../lib/format";
+import { describeEstimate, describeQuality, estimateVideoBitrate } from "../lib/estimate";
+import {
+  baseName,
+  formatBitrate,
+  formatBytes,
+  formatClock,
+  formatSpan,
+  parseClock,
+} from "../lib/format";
 import {
   autoLimits,
   CODEC_LABELS,
   changesPlayback,
   codecOf,
   DIRECTIONS,
+  describeStreams,
   FADE_CHOICES,
   fadeSpans,
   formatKind,
@@ -102,8 +112,11 @@ function describe(info: MediaInfo): string {
   if (info.width && info.height) parts.push(`${info.width}×${info.height}`);
   if (info.durationSecs) parts.push(formatClock(info.durationSecs));
   if (info.videoCodec?.startsWith("jpegxl")) parts.push("JPEG XL");
-  else if (info.videoCodec && info.kind === "video") parts.push(info.videoCodec.toUpperCase());
-  else if (info.audioCodec && info.kind === "audio") parts.push(info.audioCodec.toUpperCase());
+  else {
+    // Codecs with their bitrates, to compare with the quality setting.
+    const streams = describeStreams(info);
+    if (streams) parts.push(streams);
+  }
   parts.push(formatBytes(info.sizeBytes));
   return parts.join(" · ");
 }
@@ -524,6 +537,39 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   // A guess from the options means nothing once the command is edited.
   const estimate = createMemo(() => (custom() ? null : describeEstimate(info(), options())));
   const codec = () => (animatedImage() ? null : codecOf(options()));
+
+  // The quality in numbers: the core says which audio bitrate and CRF the
+  // command uses, the estimate adds what a CRF comes to for this picture.
+  const [encoding, setEncoding] = createSignal<QualitySummary | null>(null);
+  let encodingAsked = 0;
+  createEffect(
+    on(
+      () => [info(), JSON.stringify(options())] as const,
+      () => {
+        const asked = ++encodingAsked;
+        const snapshot = { ...options() };
+        Promise.resolve()
+          .then(() => qualitySummary(info(), snapshot))
+          .then(
+            (summary) => asked === encodingAsked && setEncoding(summary ?? null),
+            () => asked === encodingAsked && setEncoding(null),
+          );
+      },
+    ),
+  );
+  // Like the size estimate, these numbers stop applying once the command is edited.
+  const qualityNumbers = createMemo(() =>
+    custom() ? null : describeQuality(encoding(), estimateVideoBitrate(info(), options())),
+  );
+  /** The exact bitrate in kbit/s while that mode is on for a video file. */
+  const exactBitrate = () => (codec() === null ? null : (options().videoBitrate ?? null));
+  /** About what the quality level gives now, as a starting point for an exact bitrate. */
+  const suggestedBitrate = () => {
+    const estimated = estimateVideoBitrate(info(), { ...options(), videoBitrate: null });
+    const bps = estimated ?? info().videoBitrate ?? 4_000_000;
+    const scale = 10 ** Math.max(0, Math.floor(Math.log10(bps)) - 1);
+    return (Math.round(bps / scale) * scale) / 1000;
+  };
   const readable = () => canRead(info());
   const ready = () => {
     const chosen = codec();
@@ -588,6 +634,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     }
     const chosen = codec();
     if (chosen === "av1") items.push({ icon: "sparkle", text: CODEC_LABELS[chosen] });
+    const exact = exactBitrate();
+    if (exact !== null) items.push({ icon: "sliders", text: formatBitrate(exact * 1000) });
     if (isJxl() && info().kind === "video") items.push({ icon: "sparkle", text: "Animated" });
     if (isJxl() && o.jxl.lossless) items.push({ icon: "sparkle", text: "Lossless" });
     if (info().hasLocation && !keepsLocation(info(), o)) {
@@ -1062,13 +1110,22 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                     : repacking()
                       ? `Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly${leftOut() ? `, minus ${leftOut()}` : ""}.`
                       : "Lossless: every pixel and sample stays put."}
+                  <Show when={!restoring() && !repacking() && qualityNumbers()}>
+                    {(text) => <span class="lossless-numbers">{text()}</span>}
+                  </Show>
                 </p>
               }
             >
               <QualityField
                 quality={options().quality}
+                numbers={qualityNumbers()}
                 describedBy={estimate() ? "size-estimate" : undefined}
                 onChange={(quality) => updateOptions({ quality })}
+                bitrate={exactBitrate()}
+                onBitrate={
+                  codec() === null ? undefined : (videoBitrate) => updateOptions({ videoBitrate })
+                }
+                suggestedBitrate={suggestedBitrate}
               />
             </Show>
 

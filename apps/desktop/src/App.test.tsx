@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { FfmpegStatus, MediaInfo, OutputFormat } from "./lib/api";
+import type { ConvertOptions, FfmpegStatus, MediaInfo, OutputFormat } from "./lib/api";
 import * as api from "./lib/api";
 import { applyProgress, navigate, openPaths, resetStore, state } from "./lib/store";
 import { FakeAudio, installFakeAudio } from "./test/audio";
@@ -16,6 +16,18 @@ vi.mock("./lib/api", () => ({
   playbackUrl: vi.fn(async (path: string) => `asset://localhost${path}`),
   loudness: vi.fn(async () => -22),
   previewCommand: vi.fn(async () => "ffmpeg -i clip.mov clip.mp4"),
+  // The core's numbers for H.264 with AAC: CRF 34 → 18, AAC 96/128/192 kbps.
+  qualitySummary: vi.fn(async (info: MediaInfo, options: ConvertOptions) => {
+    if (options.format === "gif") return { audio: null, video: null };
+    const q = options.quality;
+    const kbps = q < 34 ? 96 : q < 67 ? 128 : 192;
+    return {
+      audio: info.audioCodec ? { mode: "bitrate", kbps } : null,
+      video: options.videoBitrate
+        ? { codec: "h264", crf: null, kbps: options.videoBitrate, passes: 2 }
+        : { codec: "h264", crf: Math.round(34 - (16 * q) / 100), kbps: null, passes: 1 },
+    };
+  }),
   previewSequenceCommand: vi.fn(async () => "ffmpeg -f concat -i list.txt cat.gif"),
   saveFrame: vi.fn(),
   checkCommand: vi.fn(async (_info: unknown, _options: unknown, text: string) => text),
@@ -87,6 +99,10 @@ const VIDEO: MediaInfo = {
   videoCodec: "h264",
   audioCodec: "aac",
   sampleRate: 48000,
+  audioChannels: 2,
+  bitrate: 9_142_857,
+  videoBitrate: 9_014_857,
+  audioBitrate: 128_000,
   reconstructsJpeg: false,
   hdr: false,
   hasLocation: false,
@@ -325,6 +341,7 @@ describe("CatConvert", () => {
       quality: 60,
       keepAudio: false,
       videoCodec: null,
+      videoBitrate: null,
       jxl: { lossless: false, effort: 7, progressive: false },
       sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
       metadata: "noLocation",
@@ -382,6 +399,78 @@ describe("CatConvert", () => {
     expect(api.startJob).toHaveBeenCalledWith(
       VIDEO.path,
       expect.objectContaining({ format: "mkv", videoCodec: "av1" }),
+    );
+  });
+
+  it("shows the quality in bitrates, updating as the slider moves", async () => {
+    await openVideo();
+    // The source's bitrates, to compare with.
+    expect(screen.getByText(/H264 9 Mbps · AAC 128 kbps/)).toBeInTheDocument();
+    const slider = screen.getByRole("slider", { name: "Quality" });
+    const numbers = await screen.findByText(/^Audio 128 kbps · Video ~[\d.]+ Mbps \(CRF 24\)$/);
+    expect(slider.getAttribute("aria-describedby")).toContain(numbers.id);
+    const before = numbers.textContent;
+
+    fireEvent.input(slider, { target: { value: "90" } });
+    await waitFor(() =>
+      expect(
+        screen.getByText(/^Audio 192 kbps · Video ~[\d.]+ Mbps \(CRF 20\)$/),
+      ).toBeInTheDocument(),
+    );
+    expect(numbers.textContent).not.toBe(before);
+    const mbps = (text: string | null) => Number(text?.match(/~([\d.]+) Mbps/)?.[1]);
+    expect(mbps(numbers.textContent)).toBeGreaterThan(mbps(before));
+    expect(api.qualitySummary).toHaveBeenLastCalledWith(
+      expect.objectContaining({ path: VIDEO.path }),
+      expect.objectContaining({ format: "mp4", quality: 90 }),
+    );
+
+    // GIFs have no bitrate to speak of.
+    fireEvent.click(screen.getByRole("button", { name: "GIF" }));
+    await waitFor(() => expect(document.querySelector(".quality-numbers")).toBeNull());
+  });
+
+  it("aims for an exact video bitrate instead of a quality level", async () => {
+    await openVideo();
+    const modes = () => within(screen.getByRole("group", { name: "Set quality by" }));
+    expect(modes().getByRole("button", { name: "Level" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(modes().getByRole("button", { name: "Bitrate" }));
+
+    // It starts at about what the level gave, then takes what is typed.
+    const field = screen.getByRole("textbox", { name: "Video bitrate" }) as HTMLInputElement;
+    expect(Number(field.value)).toBeGreaterThan(0);
+    expect(screen.queryByRole("slider", { name: "Quality" })).not.toBeInTheDocument();
+    fireEvent.change(field, { target: { value: "2.5" } });
+    expect(await screen.findByText("Audio 128 kbps · Video 2.5 Mbps (2-pass)")).toBeInTheDocument();
+    const changes = within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes.getByText("2.5 Mbps")).toBeInTheDocument();
+    // Out of range is pulled back in.
+    fireEvent.change(field, { target: { value: "900" } });
+    expect(field.value).toBe("200");
+    fireEvent.change(field, { target: { value: "2.5" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ format: "mp4", videoBitrate: 2500 }),
+    );
+  });
+
+  it("goes back from an exact bitrate to quality levels", async () => {
+    await openVideo();
+    const modes = () => within(screen.getByRole("group", { name: "Set quality by" }));
+    fireEvent.click(modes().getByRole("button", { name: "Bitrate" }));
+    fireEvent.click(modes().getByRole("button", { name: "Level" }));
+    expect(screen.getByRole("slider", { name: "Quality" })).toBeInTheDocument();
+    // Sound files have no picture to aim for.
+    fireEvent.click(screen.getByRole("button", { name: "MP3" }));
+    expect(screen.queryByRole("group", { name: "Set quality by" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ format: "mp3", videoBitrate: null }),
     );
   });
 
@@ -1208,6 +1297,15 @@ describe("CatConvert", () => {
       );
       fireEvent.click(screen.getByRole("button", { name: "History" }));
       expect(await screen.findByText("2 pictures → cat.gif")).toBeInTheDocument();
+    });
+
+    it("shows a slideshow's CRF and average bitrate", async () => {
+      await openAnimation();
+      expect(document.querySelector(".quality-numbers")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "MP4" }));
+      expect(await screen.findByText(/^Video ~[\d.]+ (k|M)bps \(CRF 24\)$/)).toBeInTheDocument();
+      // Slideshows stay at constant quality: no exact-bitrate mode.
+      expect(screen.queryByRole("group", { name: "Set quality by" })).not.toBeInTheDocument();
     });
 
     it("converts each picture on its own when asked", async () => {
