@@ -39,7 +39,11 @@ import {
   isAnimatedImage,
   isLossless,
   JXL_EFFORTS,
+  keepsLocation,
+  keepsMetadata,
   label,
+  locationLine,
+  METADATA_CHOICES,
   outputHasSound,
   outputSeconds,
   QUALITY_STEPS,
@@ -290,6 +294,29 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     format === "jxl"
       ? "Install libjxl (brew install jpeg-xl) or an ffmpeg with libjxl to write JXL"
       : `Your ffmpeg can't write ${label(format)}`;
+  const canKeepMetadata = () => keepsMetadata(options().format, info().kind);
+  /** What the JPEG repack or restore leaves out, if anything. */
+  const leftOut = () =>
+    options().metadata === "none"
+      ? "its metadata"
+      : options().metadata === "noLocation" && info().hasLocation
+        ? "its location"
+        : null;
+  const metadataHint = () => {
+    if (!canKeepMetadata()) {
+      if (animatedImage()) return "Animations come out without any tags.";
+      if (info().kind !== "image") return "Stills taken from a video carry no tags.";
+      return `${label(options().format)} files come out without dates, place or camera details.`;
+    }
+    switch (options().metadata) {
+      case "keep":
+        return "Dates, place and camera details, where the format allows";
+      case "noLocation":
+        return "Dates and camera details stay, GPS coordinates go";
+      default:
+        return "Dates, place, camera details and titles all go";
+    }
+  };
   const estimate = createMemo(() => describeEstimate(info(), options()));
   const ready = () => state.ffmpeg?.found === true && isAvailable(options().format);
 
@@ -307,7 +334,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
         | "sparkle"
         | "sliders"
         | "fade"
-        | "play";
+        | "play"
+        | "pin";
       text: string;
     }[] = [];
     if (timed() && trimmed()) {
@@ -342,6 +370,9 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     }
     if (isJxl() && info().kind === "video") items.push({ icon: "sparkle", text: "Animated" });
     if (isJxl() && o.jxl.lossless) items.push({ icon: "sparkle", text: "Lossless" });
+    if (info().hasLocation && !keepsLocation(info(), o)) {
+      items.push({ icon: "pin", text: "No location" });
+    }
     return items;
   });
 
@@ -670,9 +701,9 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               <p class="lossless-note">
                 <Icon name="sparkle" size={16} />
                 {restoring()
-                  ? "Restores the original JPEG, bit for bit."
+                  ? `Restores the original JPEG, bit for bit${leftOut() ? ` apart from ${leftOut()}` : ""}.`
                   : repacking()
-                    ? "Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly."
+                    ? `Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly${leftOut() ? `, minus ${leftOut()}` : ""}.`
                     : "Lossless: every pixel and sample stays put."}
               </p>
             }
@@ -897,24 +928,39 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
             </section>
           </Show>
 
-          <div class="toggle-row">
-            <div>
-              <span class="toggle-title" id="keep-metadata">
-                Keep metadata
-              </span>
-              <span class="item-meta">
-                Dates, place and camera details, where the format allows
-              </span>
-            </div>
-            <button
-              type="button"
-              class="switch"
-              role="switch"
-              aria-checked={options().keepMetadata}
-              aria-labelledby="keep-metadata"
-              onClick={() => updateOptions({ keepMetadata: !options().keepMetadata })}
-            />
-          </div>
+          <fieldset class="field metadata-field">
+            <legend class="field-label">Metadata</legend>
+            <Show when={locationLine(info())}>
+              {(line) => (
+                <p class="location-line">
+                  <span aria-hidden="true">📍</span>
+                  <span>
+                    {line()}.{" "}
+                    <span class="location-fate">
+                      {keepsLocation(info(), options()) ? "The copy will too." : "The copy won't."}
+                    </span>
+                  </span>
+                </p>
+              )}
+            </Show>
+            <Show when={canKeepMetadata()}>
+              <div class="format-chips">
+                <For each={METADATA_CHOICES}>
+                  {(choice) => (
+                    <button
+                      type="button"
+                      class="format-chip"
+                      aria-pressed={options().metadata === choice.mode}
+                      onClick={() => updateOptions({ metadata: choice.mode })}
+                    >
+                      {choice.label}
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
+            <span class="item-meta">{metadataHint()}</span>
+          </fieldset>
 
           <Show when={isJxl()}>
             <div class="jxl-settings">

@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::convert::{JxlSupport, OutputFormat, Plan, Step, Tool};
 use crate::jxl::{self, JxlTools};
 use crate::media::{self, MediaInfo, MediaKind};
+use crate::scrub;
 use crate::{Error, Result};
 
 /// Environment variable pointing at an ffmpeg binary, checked before `PATH`.
@@ -289,6 +290,10 @@ impl Ffmpeg {
                 jxl::apply_jxlinfo(&mut info, &parsed);
             }
         }
+        // ffprobe doesn't reliably show GPS in EXIF, so photos are read here.
+        if info.kind == MediaKind::Image && scrub::has_location(path) {
+            info.has_location = true;
+        }
         Ok(info)
     }
 
@@ -471,6 +476,8 @@ impl Ffmpeg {
                         speed: sample.speed.filter(|_| !several),
                     });
                 }),
+                Tool::Scrub if cancel.load(Ordering::Relaxed) => Ok(false),
+                Tool::Scrub => scrub::run_step(&step.args).map(|()| true),
                 tool => self.run_tool(tool, step, cancel),
             };
             if !matches!(outcome, Ok(true)) {
@@ -506,6 +513,7 @@ impl Ffmpeg {
             Tool::Ffmpeg => Some(self.ffmpeg.as_path()),
             Tool::Cjxl => self.jxl.cjxl.as_deref(),
             Tool::Djxl => self.jxl.djxl.as_deref(),
+            Tool::Scrub => return Err(Error::unsupported("metadata cleaning runs in-process")),
         };
         path.ok_or_else(|| {
             Error::unsupported(format!("{} from libjxl is not installed", tool.name()))
@@ -940,6 +948,16 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
         };
     }
     info.audio_codec = audio.and_then(|a| a["codec_name"].as_str().map(str::to_owned));
+    info.location_tags = format["tags"]
+        .as_object()
+        .map(|tags| {
+            tags.keys()
+                .filter(|key| is_location_tag(key))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    info.has_location = !info.location_tags.is_empty();
     info.sample_rate = audio
         .and_then(|a| as_f64(&a["sample_rate"]))
         .filter(|rate| rate.is_finite() && *rate >= 1.0 && *rate <= f64::from(u32::MAX))
@@ -953,6 +971,13 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
     } else {
         duration
     };
+}
+
+/// Container tags that say where a recording was made: QuickTime's `©xyz`
+/// (read as `location`, plus `location-eng` and the like), Apple's
+/// `com.apple.quicktime.location.*` keys and Matroska's `LOCATION`.
+fn is_location_tag(key: &str) -> bool {
+    key.to_ascii_lowercase().contains("location")
 }
 
 /// The tile grid ffmpeg would show by default, as its stream group index and
@@ -1086,6 +1111,8 @@ mod tests {
             audio_codec: None,
             sample_rate: None,
             reconstructs_jpeg: false,
+            has_location: false,
+            location_tags: Vec::new(),
             tile_grid: None,
         }
     }
@@ -1145,6 +1172,7 @@ mod tests {
         assert!((info.fps.unwrap() - 29.97).abs() < 0.01);
         assert_eq!(info.video_codec.as_deref(), Some("hevc"));
         assert!(info.has_audio());
+        assert!(!info.has_location);
         assert_eq!(info.sample_rate, Some(48_000));
     }
 
@@ -1196,6 +1224,35 @@ mod tests {
         assert_eq!(info.kind, MediaKind::Image);
         assert_eq!(info.tile_grid, None);
         assert_eq!((info.width, info.height), (Some(400), Some(300)));
+    }
+
+    #[test]
+    fn probe_json_finds_location_tags() {
+        let mut info = base("clip.mov");
+        apply_probe(
+            &mut info,
+            &json!({
+                "streams": [{"codec_type": "video", "codec_name": "hevc"}],
+                "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "tags": {
+                    "title": "Cat",
+                    "location": "+52.5200+013.4050/",
+                    "location-eng": "+52.5200+013.4050/",
+                    "com.apple.quicktime.location.ISO6709": "+52.5200+013.4050+034.000/",
+                    "com.apple.quicktime.make": "Apple"
+                }}
+            }),
+        );
+        assert!(info.has_location);
+        let mut tags = info.location_tags.clone();
+        tags.sort();
+        assert_eq!(
+            tags,
+            [
+                "com.apple.quicktime.location.ISO6709",
+                "location",
+                "location-eng"
+            ]
+        );
     }
 
     #[test]
