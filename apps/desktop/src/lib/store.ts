@@ -8,7 +8,7 @@
  * exported here.
  */
 import { batch } from "solid-js";
-import { createStore, produce } from "solid-js/store";
+import { createStore, produce, unwrap } from "solid-js/store";
 import type {
   ConvertOptions,
   FfmpegStatus,
@@ -74,6 +74,8 @@ export type JobEntry = {
   command: string;
   /** `command` was edited by hand rather than made from `options`. */
   custom: boolean;
+  /** Title of the recipe the settings started from, if any. */
+  recipe: string | null;
   stage: JobStage;
   progress: number;
   speed: number | null;
@@ -94,7 +96,28 @@ export type HistoryItem = {
   finishedAt: number;
   /** How many pictures an animation was made from. */
   pictures?: number;
+  /**
+   * What was converted: the file, or an animation's pictures in the order
+   * they played. Entries from before version 2 of the history lack it (and
+   * `options`), so they can't be converted again.
+   */
+  inputs?: string[];
+  /** The settings used. */
+  options?: ConvertOptions;
+  /** An animation's frame time and fit. */
+  sequence?: SequenceOptions;
+  /** The command edited by hand that ran instead of the generated one. */
+  command?: string;
+  /** Title of the recipe the settings started from. */
+  recipe?: string;
 };
+
+/**
+ * What "Convert again" would open for a history entry: the original file(s),
+ * the converted file standing in for them, or nothing because both are gone.
+ * `null` for entries that don't know their inputs and settings.
+ */
+export type ReconvertSource = "original" | "output" | "none" | null;
 
 export type Toast = {
   id: number;
@@ -136,6 +159,8 @@ type State = {
   history: HistoryItem[];
   /** History outputs that are no longer where we wrote them (moved or deleted). */
   missing: string[];
+  /** History inputs that are no longer where they were. */
+  missingInputs: string[];
   /** Starting settings for freshly opened files. */
   settings: Defaults;
   /** Recipes the user saved from the editor. */
@@ -147,7 +172,9 @@ type State = {
   toasts: Toast[];
 };
 
-const HISTORY_KEY = "catconvert.history.v1";
+const HISTORY_KEY = "catconvert.history.v2";
+/** Earlier history keys, newest first; read once and moved to `HISTORY_KEY`. */
+const OLD_HISTORY_KEYS = ["catconvert.history.v1"];
 const SETTINGS_KEY = "catconvert.settings.v1";
 const RECIPES_KEY = "catconvert.recipes.v1";
 const HISTORY_LIMIT = 50;
@@ -171,9 +198,58 @@ function save(key: string, value: unknown) {
   }
 }
 
+function forget(key: string) {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // See above.
+  }
+}
+
+/**
+ * A stored history entry, or `null` if it isn't one. Settings that don't look
+ * right are dropped along with the inputs, so the entry still shows but isn't
+ * offered to convert again.
+ */
+function historyItemFrom(raw: unknown): HistoryItem | null {
+  if (!raw || typeof raw !== "object") return null;
+  const item = raw as HistoryItem;
+  if (typeof item.id !== "string" || typeof item.output !== "string") return null;
+  const { inputs, options, sequence, command, ...rest } = item;
+  const usable =
+    Array.isArray(inputs) &&
+    inputs.length > 0 &&
+    inputs.every((p) => typeof p === "string") &&
+    typeof options?.format === "string";
+  if (!usable) return rest;
+  return {
+    ...rest,
+    inputs,
+    options,
+    ...(sequence && typeof sequence.frameSecs === "number" ? { sequence } : {}),
+    ...(typeof command === "string" ? { command } : {}),
+  };
+}
+
+/**
+ * The history, moving entries kept under an older key over. Version 1
+ * entries carry no inputs or settings; they show as before, just without
+ * "Convert again".
+ */
 function loadHistory(): HistoryItem[] {
-  const parsed = load(HISTORY_KEY);
-  return Array.isArray(parsed) ? (parsed as HistoryItem[]) : [];
+  let parsed = load(HISTORY_KEY);
+  if (parsed === null) {
+    for (const key of OLD_HISTORY_KEYS) {
+      const old = load(key);
+      if (!Array.isArray(old)) continue;
+      parsed = old;
+      save(HISTORY_KEY, old);
+      break;
+    }
+    for (const key of OLD_HISTORY_KEYS) forget(key);
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed.flatMap((raw) => historyItemFrom(raw) ?? []);
 }
 
 function saveHistory(items: HistoryItem[]) {
@@ -221,6 +297,7 @@ const [state, setState] = createStore<State>({
   jobs: [],
   history: loadHistory(),
   missing: [],
+  missingInputs: [],
   settings: loadSettings(),
   recipes: loadRecipes(),
   batch: null,
@@ -508,6 +585,11 @@ function currentRecipe(): Recipe | null {
   return allRecipes().find((r) => r.id === state.recipe) ?? null;
 }
 
+/** Title of the recipe being applied, kept with the jobs it makes. */
+function recipeTitle(): string | null {
+  return currentRecipe()?.title ?? null;
+}
+
 /** Probe the next inbox file and open it in the editor. */
 export async function openNext(): Promise<void> {
   const path = state.inbox[0];
@@ -651,7 +733,7 @@ export async function convertSequence() {
       options,
       sequence,
     );
-    addJob(ticket, options, sequence);
+    addJob(ticket, options, sequence, false, recipeTitle());
     setState("sequence", null);
     if (state.inbox.length > 0) {
       toast("The animation is in the queue", {
@@ -710,7 +792,7 @@ export async function convertDraft() {
       custom === null
         ? await api.startJob(draft.info.path, options)
         : await api.startCustomJob(draft.info.path, options, custom);
-    addJob(ticket, options, null, custom !== null);
+    addJob(ticket, options, null, custom !== null, recipeTitle());
     if (state.inbox.length > 0) {
       toast(`${draft.info.fileName} is in the queue`, {
         action: { label: "View", run: () => navigate("queue") },
@@ -745,12 +827,19 @@ export async function convertAll() {
   };
   const paths = [...state.inbox];
   const custom = draft.command;
+  const recipe = recipeTitle();
   let template: string | null = null;
   try {
     if (custom === null) {
-      addJob(await api.startJob(draft.info.path, options), options);
+      addJob(await api.startJob(draft.info.path, options), options, null, false, recipe);
     } else {
-      addJob(await api.startCustomJob(draft.info.path, options, custom), options, null, true);
+      addJob(
+        await api.startCustomJob(draft.info.path, options, custom),
+        options,
+        null,
+        true,
+        recipe,
+      );
       template = await api.commandTemplate(draft.info.path, custom);
     }
   } catch (error) {
@@ -772,8 +861,8 @@ export async function convertAll() {
       // The command only fits files that keep its format.
       if (!fitted || (template !== null && fitted.format !== options.format)) leftovers.push(path);
       else if (template !== null)
-        addJob(await api.startCustomJob(path, fitted, template), fitted, null, true);
-      else addJob(await api.startJob(path, fitted), fitted);
+        addJob(await api.startCustomJob(path, fitted, template), fitted, null, true, recipe);
+      else addJob(await api.startJob(path, fitted), fitted, null, false, recipe);
     } catch (error) {
       toast(`${baseName(path)}: ${errorText(error)}`, { tone: "error" });
     }
@@ -797,6 +886,7 @@ function addJob(
   options: ConvertOptions,
   sequence: SequenceOptions | null = null,
   custom = false,
+  recipe: string | null = null,
 ) {
   const input = ticket.inputs[0];
   if (!input) return;
@@ -810,6 +900,7 @@ function addJob(
     sequence,
     command: ticket.command,
     custom,
+    recipe,
     stage: "queued",
     progress: 0,
     speed: null,
@@ -861,6 +952,11 @@ export function applyProgress(event: JobProgress) {
       outputBytes: event.outputBytes ?? 0,
       finishedAt: Date.now(),
       ...(job.sequence ? { pictures: job.inputs.length } : {}),
+      inputs: job.inputs.map((p) => p.path),
+      options: plain(job.options),
+      ...(job.sequence ? { sequence: plain(job.sequence) } : {}),
+      ...(job.custom ? { command: job.command } : {}),
+      ...(job.recipe ? { recipe: job.recipe } : {}),
     });
   } else if (event.stage === "failed" && state.screen !== "queue") {
     toast(`${job.name} didn't convert`, {
@@ -873,6 +969,11 @@ export function applyProgress(event: JobProgress) {
 /** Size of everything a job reads. */
 export function inputBytes(job: JobEntry): number {
   return job.inputs.reduce((sum, info) => sum + info.sizeBytes, 0);
+}
+
+/** A copy of `value` free of the store's proxies, safe to keep and save. */
+function plain<T>(value: T): T {
+  return structuredClone(unwrap(value));
 }
 
 function remember(item: HistoryItem) {
@@ -902,6 +1003,8 @@ export async function saveFrame(at: number) {
       inputBytes: info.sizeBytes,
       outputBytes: saved.outputBytes,
       finishedAt: Date.now(),
+      inputs: [info.path],
+      options: plain(draft.options),
     });
     toast("Saved frame", {
       action: { label: "Show in folder", run: () => void reveal(saved.output) },
@@ -978,7 +1081,7 @@ export async function retryJob(id: JobId) {
     }
     batch(() => {
       removeJob(id);
-      addJob(ticket, options, sequence, job.custom);
+      addJob(ticket, options, sequence, job.custom, job.recipe);
     });
   } catch (error) {
     toast(errorText(error), { tone: "error" });
@@ -995,16 +1098,21 @@ export function clearFinished() {
 
 export function clearHistory() {
   batch(() => {
-    setState({ history: [], missing: [] });
+    setState({ history: [], missing: [], missingInputs: [] });
     saveHistory([]);
   });
 }
 
-/** Note which history outputs have been moved or deleted since. */
+/** Note which history outputs and inputs have been moved or deleted since. */
 export async function checkHistory() {
+  const outputs = state.history.map((item) => item.output);
+  const inputs = state.history.flatMap((item) => item.inputs ?? []);
   try {
-    const missing = await api.missingFiles(state.history.map((item) => item.output));
-    setState("missing", missing);
+    const gone = new Set(await api.missingFiles([...new Set([...outputs, ...inputs])]));
+    batch(() => {
+      setState("missing", [...new Set(outputs.filter((p) => gone.has(p)))]);
+      setState("missingInputs", [...new Set(inputs.filter((p) => gone.has(p)))]);
+    });
   } catch {
     // Best effort: rows simply stay as they are.
   }
@@ -1021,6 +1129,164 @@ export function forgetMissing() {
     });
     setState("missing", []);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Convert again from History
+// ---------------------------------------------------------------------------
+
+/** What "Convert again" would open for `item`, going by the last `checkHistory`. */
+export function reconvertSource(item: HistoryItem): ReconvertSource {
+  if (!item.inputs?.length || !item.options) return null;
+  const left = item.inputs.filter((p) => !state.missingInputs.includes(p)).length;
+  if (item.sequence ? left >= 2 : left === item.inputs.length) return "original";
+  return state.missing.includes(item.output) ? "none" : "output";
+}
+
+/** Stored settings on top of today's defaults, so fields added since get a value. */
+function restoredOptions(info: MediaInfo, stored: ConvertOptions): ConvertOptions {
+  const base = initialOptions(info, isAvailable, null, state.settings);
+  const options = structuredClone(unwrap(stored));
+  return {
+    ...base,
+    ...options,
+    jxl: { ...base.jxl, ...options.jxl },
+    sound: { ...base.sound, ...options.sound },
+  };
+}
+
+/**
+ * Settings for converting a finished file again in place of its original:
+ * the format, quality and codecs carry over, while the trim, crop, turn,
+ * fades and playback changes are already in the file and would apply twice.
+ */
+function outputOptions(info: MediaInfo, stored: ConvertOptions): ConvertOptions {
+  const options = restoredOptions(info, stored);
+  const fresh = {
+    ...options,
+    rotate: 0,
+    flip: false,
+    crop: null,
+    speed: 1,
+    direction: "forward",
+    sound: { ...options.sound, fadeIn: 0, fadeOut: 0 },
+  } satisfies ConvertOptions;
+  return (
+    fitOptions(info, fresh, isAvailable) ?? initialOptions(info, isAvailable, null, state.settings)
+  );
+}
+
+/**
+ * Open a history entry's file in the editor (an animation's pictures in the
+ * sequence editor) with the settings it was converted with, or with `recipeId`'s.
+ *
+ * When the original is gone, the converted file opens in its place, saying
+ * so; when both are gone it says that instead.
+ */
+export async function convertAgain(id: string, recipeId: RecipeId | null = null) {
+  const item = state.history.find((i) => i.id === id);
+  const stored = item?.options;
+  if (!item?.inputs?.length || !stored) return;
+  if (busyEditing() || state.choice) {
+    toast("Finish what's open in the editor first", {
+      tone: "error",
+      action: { label: "Open editor", run: () => navigate("edit") },
+    });
+    return;
+  }
+  const inputs = [...item.inputs];
+  const sequence = item.sequence ? { ...item.sequence } : null;
+  const recipe = recipeId ? (allRecipes().find((r) => r.id === recipeId) ?? null) : null;
+  const command = item.command ?? null;
+  let missing: string[] = [];
+  try {
+    missing = await api.missingFiles([...inputs, item.output]);
+  } catch {
+    // Best effort: probing below says what's gone.
+  }
+  batch(() => {
+    setState({
+      opening: sequence ? `${inputs.length} pictures` : (inputs[0] ?? item.name),
+      draft: null,
+      sequence: null,
+    });
+    navigate("edit");
+  });
+  const giveUp = (message: string) => {
+    batch(() => {
+      setState("opening", null);
+      navigate("history");
+    });
+    toast(message, { tone: "error" });
+    void checkHistory();
+  };
+
+  if (sequence && !recipe) {
+    const left = inputs.filter((p) => !missing.includes(p));
+    const results = left.length >= 2 ? await probeAll(left) : [];
+    const pictures = results.flatMap((r) =>
+      r.status === "fulfilled" && r.value.kind === "image" ? [r.value] : [],
+    );
+    if (pictures.length >= 2) {
+      const gone = inputs.length - pictures.length;
+      if (gone > 0) {
+        const what = gone === 1 ? "1 picture was" : `${gone} pictures were`;
+        toast(`${what} moved or deleted, so it's made from the other ${pictures.length}`);
+      }
+      setState({
+        opening: null,
+        sequence: {
+          pictures,
+          options: restoredOptions(pictures[0] as MediaInfo, stored),
+          sequence,
+        },
+      });
+      return;
+    }
+  }
+
+  const original = sequence ? null : (inputs[0] ?? null);
+  const fromOutput = original === null || missing.includes(original);
+  if (fromOutput && missing.includes(item.output)) {
+    giveUp(
+      sequence
+        ? "The pictures and the animation made from them are gone"
+        : "The original and the converted file are both gone",
+    );
+    return;
+  }
+  const path = fromOutput ? item.output : original;
+  try {
+    const info = await api.probeFile(path);
+    if (info.kind === "unknown") throw new Error("That doesn't look like a photo, video or song.");
+    let options: ConvertOptions;
+    let custom: string | null = null;
+    if (recipe) {
+      options = initialOptions(info, isAvailable, recipe, state.settings);
+      custom = await recipeCommand(recipe, info, options);
+      if (!recipe.accepts.includes(info.kind)) {
+        toast(
+          `“${recipe.title}” doesn't fit ${info.fileName}, so it opens with your usual settings`,
+        );
+      }
+    } else if (fromOutput) {
+      options = outputOptions(info, stored);
+    } else {
+      options = restoredOptions(info, stored);
+      custom = command;
+    }
+    setState({
+      draft: { info, options, command: custom },
+      opening: null,
+      recipe: recipe?.id ?? null,
+    });
+    if (fromOutput) {
+      const gone = sequence ? "The pictures are" : `${baseName(original ?? "")} is`;
+      toast(`${gone} gone, so the converted ${info.fileName} opens instead`);
+    }
+  } catch (error) {
+    giveUp(`${baseName(path)}: ${errorText(error)}`);
+  }
 }
 
 export async function reveal(path: string) {
@@ -1159,6 +1425,7 @@ export function resetStore() {
     jobs: [],
     history: loadHistory(),
     missing: [],
+    missingInputs: [],
     settings: loadSettings(),
     recipes: loadRecipes(),
     batch: null,

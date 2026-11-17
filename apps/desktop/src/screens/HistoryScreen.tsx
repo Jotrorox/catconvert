@@ -37,7 +37,7 @@ export const HistoryScreen: Component = () => {
       >
         <section class="card recent">
           <ul class="recent-list">
-            <For each={state.history}>{(item) => <RecentRow item={item} />}</For>
+            <For each={state.history}>{(item) => <RecentRow item={item} actions />}</For>
           </ul>
         </section>
       </Show>
