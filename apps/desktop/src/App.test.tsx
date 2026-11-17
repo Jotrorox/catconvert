@@ -29,6 +29,14 @@ vi.mock("./lib/api", () => ({
     };
   }),
   previewSequenceCommand: vi.fn(async () => "ffmpeg -f concat -i list.txt cat.gif"),
+  outputPreview: vi.fn(),
+  sequenceOutputPreview: vi.fn(async (_pictures: MediaInfo[], options: ConvertOptions) => ({
+    path: `/photos/cat.${options.format}`,
+    exists: false,
+  })),
+  chooseSavePath: vi.fn(async () => null),
+  chooseFolder: vi.fn(async () => null),
+  askReplace: vi.fn(async () => "cancel"),
   saveFrame: vi.fn(),
   checkCommand: vi.fn(async (_info: unknown, _options: unknown, text: string) => text),
   fillCommand: vi.fn(),
@@ -52,7 +60,15 @@ vi.mock("./lib/api", () => ({
   setQuickAction: vi.fn(),
   dragFiles: vi.fn(async () => {}),
   NO_JXL: {},
+  NEXT_TO_ORIGINAL: { folder: null, name: null, collision: "keepBoth" },
+  NAME_PLACEHOLDERS: [
+    { token: "{name}", meaning: "the original's name" },
+    { token: "{format}", meaning: "the new extension" },
+  ],
 }));
+
+/** Next to the original under the usual name, as the backend gets it by default. */
+const USUAL = { folder: null, name: null, collision: "keepBoth" };
 
 const ALL: OutputFormat[] = [
   ...["mp4", "webm", "mov", "mkv", "gif"],
@@ -165,6 +181,13 @@ beforeEach(() => {
           ? PACKED
           : { ...VIDEO, path, fileName: path.split("/").pop() ?? path },
   );
+  vi.mocked(api.outputPreview).mockImplementation(async (info, options) => ({
+    path: info.path.replace(/\.\w+$/, `.${options.format}`),
+    exists: false,
+  }));
+  vi.mocked(api.chooseSavePath).mockResolvedValue(null);
+  vi.mocked(api.chooseFolder).mockResolvedValue(null);
+  vi.mocked(api.askReplace).mockResolvedValue("cancel");
   vi.mocked(api.startJob).mockImplementation(async (path, options) => ({
     id: 7,
     output: path.replace(/\.\w+$/, `.${options.format}`),
@@ -297,6 +320,7 @@ describe("CatConvert", () => {
     expect(api.startJob).toHaveBeenCalledWith(
       VIDEO.path,
       expect.objectContaining({ sound: { normalize: true, fadeIn: 1, fadeOut: 3 } }),
+      USUAL,
     );
   });
 
@@ -325,29 +349,37 @@ describe("CatConvert", () => {
       "Turned 90°",
       "No sound",
     ]);
-    expect(screen.getByText("clip.webm")).toBeInTheDocument();
+    expect(await screen.findByText("Saved as clip.webm next to the original.")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "File name" })).toHaveAttribute(
+      "placeholder",
+      "clip",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
     await screen.findByRole("heading", { name: "Queue" });
-    expect(api.startJob).toHaveBeenCalledWith(VIDEO.path, {
-      format: "webm",
-      trimStart: 2,
-      trimEnd: null,
-      maxSize: 720,
-      fps: null,
-      rotate: 90,
-      flip: false,
-      crop: null,
-      quality: 60,
-      keepAudio: false,
-      videoCodec: null,
-      videoBitrate: null,
-      jxl: { lossless: false, effort: 7, progressive: false },
-      sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
-      metadata: "noLocation",
-      speed: 1,
-      direction: "forward",
-    });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      {
+        format: "webm",
+        trimStart: 2,
+        trimEnd: null,
+        maxSize: 720,
+        fps: null,
+        rotate: 90,
+        flip: false,
+        crop: null,
+        quality: 60,
+        keepAudio: false,
+        videoCodec: null,
+        videoBitrate: null,
+        jxl: { lossless: false, effort: 7, progressive: false },
+        sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
+        metadata: "noLocation",
+        speed: 1,
+        direction: "forward",
+      },
+      USUAL,
+    );
 
     applyProgress({
       jobId: 7,
@@ -399,6 +431,7 @@ describe("CatConvert", () => {
     expect(api.startJob).toHaveBeenCalledWith(
       VIDEO.path,
       expect.objectContaining({ format: "mkv", videoCodec: "av1" }),
+      USUAL,
     );
   });
 
@@ -454,6 +487,7 @@ describe("CatConvert", () => {
     expect(api.startJob).toHaveBeenCalledWith(
       VIDEO.path,
       expect.objectContaining({ format: "mp4", videoBitrate: 2500 }),
+      USUAL,
     );
   });
 
@@ -471,6 +505,7 @@ describe("CatConvert", () => {
     expect(api.startJob).toHaveBeenCalledWith(
       VIDEO.path,
       expect.objectContaining({ format: "mp3", videoBitrate: null }),
+      USUAL,
     );
   });
 
@@ -518,6 +553,7 @@ describe("CatConvert", () => {
     expect(api.startJob).toHaveBeenCalledWith(
       VIDEO.path,
       expect.objectContaining({ rotate: 90, crop: { aspect: [1, 1], area: null } }),
+      USUAL,
     );
   });
 
@@ -611,7 +647,7 @@ describe("CatConvert", () => {
     expect(screen.getByRole("slider", { name: "Quality" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Thorough" }));
     fireEvent.click(screen.getByRole("switch", { name: "Progressive" }));
-    expect(screen.getByText("cat.jxl")).toBeInTheDocument();
+    expect(await screen.findByText("Saved as cat.jxl next to the original.")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
     await screen.findByRole("heading", { name: "Queue" });
@@ -622,6 +658,7 @@ describe("CatConvert", () => {
         rotate: 90,
         jxl: { lossless: false, effort: 9, progressive: true },
       }),
+      USUAL,
     );
   });
 
@@ -672,6 +709,7 @@ describe("CatConvert", () => {
     expect(api.startJob).toHaveBeenCalledWith(
       VIDEO.path,
       expect.objectContaining({ format: "gif", speed: 4, direction: "reverse" }),
+      USUAL,
     );
   });
 
@@ -968,6 +1006,7 @@ describe("CatConvert", () => {
     expect(api.startJob).toHaveBeenCalledWith(
       PHOTO.path,
       expect.objectContaining({ format: "jxl", metadata: "noLocation" }),
+      USUAL,
     );
   });
 
@@ -1019,12 +1058,165 @@ describe("CatConvert", () => {
       1,
       "/clips/a.mov",
       expect.objectContaining({ format: "webm", trimStart: 1 }),
+      USUAL,
     );
     expect(api.startJob).toHaveBeenNthCalledWith(
       2,
       "/clips/b.mov",
       expect.objectContaining({ format: "webm", trimStart: null }),
+      USUAL,
     );
+  });
+
+  describe("where it's saved", () => {
+    const nameField = () => screen.getByRole("textbox", { name: "File name" });
+
+    it("saves one file in a chosen folder under a chosen name", async () => {
+      vi.mocked(api.chooseSavePath).mockResolvedValue("/exports/Holiday.mov");
+      await openVideo();
+      expect(
+        await screen.findByText("Saved as clip.mp4 next to the original."),
+      ).toBeInTheDocument();
+
+      // Change… starts the save dialog at the suggested path.
+      fireEvent.click(screen.getByRole("button", { name: "Change…" }));
+      await waitFor(() => expect(nameField()).toHaveValue("Holiday"));
+      expect(api.chooseSavePath).toHaveBeenCalledWith("/clips/clip.mp4", "mp4", "MP4");
+      expect(await screen.findByText(/in exports/)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      // The system's save dialog already asked before replacing anything.
+      await waitFor(() =>
+        expect(api.startJob).toHaveBeenCalledWith(VIDEO.path, expect.anything(), {
+          folder: "/exports",
+          name: "Holiday",
+          collision: "overwrite",
+        }),
+      );
+      expect(api.askReplace).not.toHaveBeenCalled();
+    });
+
+    it("asks before replacing a file with the typed name", async () => {
+      vi.mocked(api.outputPreview).mockImplementation(async (_info, _options, target) =>
+        target.name === "taken"
+          ? {
+              path: `/clips/taken${target.collision === "overwrite" ? "" : " 2"}.mp4`,
+              exists: true,
+            }
+          : { path: "/clips/clip.mp4", exists: false },
+      );
+      await openVideo();
+      fireEvent.input(nameField(), { target: { value: "taken" } });
+      expect(
+        await screen.findByText(/Saved as taken 2\.mp4 next to the original\. The name is taken/),
+      ).toBeInTheDocument();
+
+      // Cancel converts nothing.
+      vi.mocked(api.askReplace).mockResolvedValueOnce("cancel");
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await waitFor(() => expect(api.askReplace).toHaveBeenCalledWith("taken.mp4", "/clips"));
+      expect(api.startJob).not.toHaveBeenCalled();
+      expect(screen.getByRole("heading", { name: "clip.mov" })).toBeInTheDocument();
+
+      // Keep both numbers the new file.
+      vi.mocked(api.askReplace).mockResolvedValueOnce("keepBoth");
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await waitFor(() =>
+        expect(api.startJob).toHaveBeenCalledWith(VIDEO.path, expect.anything(), {
+          folder: null,
+          name: "taken",
+          collision: "keepBoth",
+        }),
+      );
+    });
+
+    it("explains names that won't work", async () => {
+      vi.mocked(api.outputPreview).mockImplementation(async (_info, _options, target) => {
+        if (target.name?.includes(":"))
+          throw "file names can't contain : (nor any of < > : \" / \\ | ? *)";
+        return { path: `/clips/${target.name ?? "clip"}.mp4`, exists: false };
+      });
+      await openVideo();
+      const start = screen.getByRole("button", { name: /Start converting/ });
+
+      fireEvent.input(nameField(), { target: { value: "holiday.mov" } });
+      expect(
+        screen.getByText("The format decides the extension, so it's saved as .mp4, not .mov."),
+      ).toBeInTheDocument();
+
+      fireEvent.input(nameField(), { target: { value: "a:b" } });
+      expect(await screen.findByRole("alert")).toHaveTextContent("file names can't contain :");
+      expect(nameField()).toHaveAttribute("aria-invalid", "true");
+      expect(start).toBeDisabled();
+
+      fireEvent.input(nameField(), { target: { value: "ab" } });
+      await waitFor(() => expect(start).toBeEnabled());
+    });
+
+    it("names a batch with a pattern in one folder, never replacing", async () => {
+      vi.mocked(api.chooseFolder).mockResolvedValue("/exports");
+      render(() => <App />);
+      await ffmpegFound();
+      openPaths(["/clips/a.mov", "/clips/b.mov"]);
+      await screen.findByRole("heading", { name: "a.mov" });
+
+      const pattern = screen.getByRole("textbox", { name: "File name pattern" });
+      expect(pattern).toHaveAttribute("placeholder", "{name}");
+      fireEvent.input(pattern, { target: { value: "{name}-" } });
+      fireEvent.click(screen.getByRole("button", { name: "{format}" }));
+      expect(pattern).toHaveValue("{name}-{format}");
+
+      expect(
+        await screen.findByText("Saved next to the original; this one as a.mp4."),
+      ).toBeInTheDocument();
+
+      // Only the folder is picked: each file gets its own name.
+      fireEvent.click(screen.getByRole("button", { name: "Change…" }));
+      await waitFor(() => expect(state.draft?.output.folder).toBe("/exports"));
+      expect(api.chooseFolder).toHaveBeenCalledWith("/clips");
+      expect(api.chooseSavePath).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: /Convert all 2 like this/ }));
+      await waitFor(() => expect(api.startJob).toHaveBeenCalledTimes(2));
+      const target = { folder: "/exports", name: "{name}-{format}", collision: "keepBoth" };
+      expect(api.startJob).toHaveBeenNthCalledWith(1, "/clips/a.mov", expect.anything(), target);
+      expect(api.startJob).toHaveBeenNthCalledWith(2, "/clips/b.mov", expect.anything(), target);
+    });
+
+    it("keeps the chosen folder for frames and the next files", async () => {
+      vi.mocked(api.chooseSavePath).mockResolvedValue("/exports/clip.mp4");
+      vi.mocked(api.saveFrame).mockResolvedValue({
+        output: "/exports/clip-frame-0m01s.png",
+        outputBytes: 1,
+      });
+      render(() => <App />);
+      await ffmpegFound();
+      openPaths([VIDEO.path]);
+      await screen.findByRole("heading", { name: "clip.mov" });
+      fireEvent.click(screen.getByRole("button", { name: "Change…" }));
+      await waitFor(() => expect(state.draft?.output.folder).toBe("/exports"));
+
+      // Frames go to the folder under their own name.
+      fireEvent.click(screen.getByRole("button", { name: "Save this frame" }));
+      await screen.findByText("Saved frame");
+      expect(vi.mocked(api.saveFrame).mock.calls[0]?.[3]).toEqual({
+        folder: "/exports",
+        name: null,
+        collision: "keepBoth",
+      });
+
+      // The next file starts in the same folder, under its usual name.
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await waitFor(() => expect(api.startJob).toHaveBeenCalledTimes(1));
+      openPaths(["/clips/next.mov"]);
+      await screen.findByRole("heading", { name: "next.mov" });
+      expect(state.draft?.output).toEqual({ folder: "/exports", name: null, collision: null });
+
+      // Reset goes back next to the original, for later files too.
+      fireEvent.click(screen.getByRole("button", { name: "Reset" }));
+      expect(state.draft?.output).toEqual({ folder: null, name: null, collision: null });
+      expect(state.lastFolder).toBeNull();
+    });
   });
 
   describe("editing the command", () => {
@@ -1098,6 +1290,7 @@ describe("CatConvert", () => {
         VIDEO.path,
         expect.objectContaining({ format: "mp4" }),
         edited,
+        USUAL,
       );
       expect(api.startJob).not.toHaveBeenCalled();
 
@@ -1121,7 +1314,12 @@ describe("CatConvert", () => {
       });
       fireEvent.click(await screen.findByRole("button", { name: /Retry/ }));
       await waitFor(() => expect(api.startCustomJob).toHaveBeenCalledTimes(2));
-      expect(api.startCustomJob).toHaveBeenLastCalledWith(VIDEO.path, expect.anything(), edited);
+      expect(api.startCustomJob).toHaveBeenLastCalledWith(
+        VIDEO.path,
+        expect.anything(),
+        edited,
+        USUAL,
+      );
     });
 
     it("goes back to the generated command", async () => {
@@ -1189,12 +1387,14 @@ describe("CatConvert", () => {
         "/clips/a.mov",
         expect.anything(),
         edited,
+        USUAL,
       );
       expect(api.startCustomJob).toHaveBeenNthCalledWith(
         2,
         "/clips/b.mov",
         expect.anything(),
         template,
+        USUAL,
       );
       expect(api.startJob).not.toHaveBeenCalled();
     });
@@ -1242,7 +1442,13 @@ describe("CatConvert", () => {
       expect(screen.getByRole("button", { name: "GIF" })).toHaveAttribute("aria-pressed", "true");
       expect(screen.getByRole("button", { name: "WEBP" })).toBeDisabled();
       expect(screen.getByRole("button", { name: "0.5 s" })).toHaveAttribute("aria-pressed", "true");
-      expect(screen.getByText("cat.gif")).toBeInTheDocument();
+      expect(
+        await screen.findByText("Saved as cat.gif next to the first picture."),
+      ).toBeInTheDocument();
+      expect(screen.getByRole("textbox", { name: "File name" })).toHaveAttribute(
+        "placeholder",
+        "cat",
+      );
       expect(screen.getByRole("combobox", { name: "Size" })).toHaveDisplayValue("Auto (480 px)");
 
       fireEvent.click(screen.getByRole("button", { name: "0.25 s" }));
@@ -1281,6 +1487,7 @@ describe("CatConvert", () => {
           direction: "boomerang",
         }),
         { frameSecs: 0.25, fit: "crop" },
+        USUAL,
       );
       expect(screen.getByText("2 PICTURES → GIF · Waiting")).toBeInTheDocument();
 
@@ -1326,6 +1533,34 @@ describe("CatConvert", () => {
       expect(screen.queryByRole("button", { name: /Make an animation/ })).not.toBeInTheDocument();
     });
 
+    it("names the animation and asks before replacing a file", async () => {
+      vi.mocked(api.sequenceOutputPreview).mockImplementation(
+        async (_pictures, options, target) => ({
+          path: `/pics/${target.name ?? "cat"}.${options.format}`,
+          exists: target.name === "flipbook",
+        }),
+      );
+      vi.mocked(api.askReplace).mockResolvedValueOnce("replace");
+      await openAnimation();
+      fireEvent.input(screen.getByRole("textbox", { name: "File name" }), {
+        target: { value: "flipbook" },
+      });
+      expect(await screen.findByText(/The name is taken/)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /Make animation/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.askReplace).toHaveBeenCalledWith("flipbook.gif", "/pics");
+      expect(api.startSequence).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        {
+          folder: null,
+          name: "flipbook",
+          collision: "overwrite",
+        },
+      );
+    });
+
     it("retries without pictures that were moved since", async () => {
       await openAnimation();
       fireEvent.click(screen.getByRole("button", { name: /Make animation/ }));
@@ -1345,6 +1580,7 @@ describe("CatConvert", () => {
         ["/pics/cat 1.jpg", "/pics/cat 10.jpg"],
         expect.objectContaining({ format: "gif", direction: "forward" }),
         { frameSecs: 0.5, fit: "pad" },
+        USUAL,
       );
       expect(
         screen.getByText("1 picture was moved or deleted, so it's made from the other 2"),

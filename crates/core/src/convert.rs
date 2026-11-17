@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ffmpeg::format_secs;
 use crate::jxl::is_jxl;
+pub(crate) use crate::output::file_stem;
+use crate::output::{frame_stamp, free_in};
 use crate::{Error, MediaInfo, MediaKind, Result};
 
 /// A file type CatConvert can write.
@@ -1692,10 +1694,25 @@ pub(crate) fn scratch_path(output: &Path, tag: &str, ext: &str) -> PathBuf {
 
 /// Pick a free output path next to `input`: `clip.mp4`, then `clip 2.mp4`, `clip 3.mp4`, …
 ///
-/// `taken` lets the caller rule out paths that are reserved but not yet on disk.
+/// `taken` lets the caller rule out paths that are reserved but not yet on
+/// disk. See [`crate::Naming`] to save elsewhere or under another name.
 #[must_use]
 pub fn output_path(input: &Path, format: OutputFormat, taken: impl Fn(&Path) -> bool) -> PathBuf {
     free_path(input, &file_stem(input), format.extension(), taken)
+}
+
+/// Size of the picture a conversion writes, after rotation, cropping and
+/// downscaling (including an animation's default size cap), if known.
+pub(crate) fn result_dims(input: &MediaInfo, options: &ConvertOptions) -> Option<(u32, u32)> {
+    if options.format.kind() == MediaKind::Audio {
+        return None;
+    }
+    let default_max = if options.format.animates(input.kind) {
+        animation_defaults(options.format).0
+    } else {
+        None
+    };
+    output_dims(input, options, default_max)
 }
 
 /// Frame rate assumed for a video that doesn't say.
@@ -1751,22 +1768,8 @@ pub fn frame_plan(
 /// `clip-frame-0m12s.png`, then `clip-frame-0m12s 2.png`, …
 #[must_use]
 pub fn frame_output_path(input: &Path, at_secs: f64, taken: impl Fn(&Path) -> bool) -> PathBuf {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let whole = at_secs.max(0.0).floor() as u64;
-    let (h, m, s) = (whole / 3600, whole / 60 % 60, whole % 60);
-    let stamp = if h > 0 {
-        format!("{h}h{m:02}m{s:02}s")
-    } else {
-        format!("{m}m{s:02}s")
-    };
-    let stem = format!("{}-frame-{stamp}", file_stem(input));
+    let stem = format!("{}-frame-{}", file_stem(input), frame_stamp(at_secs));
     free_path(input, &stem, OutputFormat::Png.extension(), taken)
-}
-
-pub(crate) fn file_stem(input: &Path) -> String {
-    input
-        .file_stem()
-        .map_or_else(|| "converted".into(), |s| s.to_string_lossy().into_owned())
 }
 
 /// `{stem}.{ext}` next to `input`, or `{stem} 2.{ext}`, `{stem} 3.{ext}`, …,
@@ -1778,17 +1781,9 @@ pub(crate) fn free_path(
     taken: impl Fn(&Path) -> bool,
 ) -> PathBuf {
     let dir = input.parent().unwrap_or_else(|| Path::new(""));
-    (1..)
-        .map(|n| {
-            let name = if n == 1 {
-                format!("{stem}.{ext}")
-            } else {
-                format!("{stem} {n}.{ext}")
-            };
-            dir.join(name)
-        })
-        .find(|candidate| candidate != input && !candidate.exists() && !taken(candidate))
-        .expect("an unbounded range always yields a free name")
+    free_in(dir, stem, ext, |candidate| {
+        candidate == input || taken(candidate)
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import { CatPeek } from "../components/Cat";
 import { CodecField } from "../components/CodecField";
 import { CropOverlay } from "../components/CropOverlay";
 import { Icon } from "../components/Icon";
+import { OutputField } from "../components/OutputField";
 import { QualityField } from "../components/QualityField";
 import { TrimBar } from "../components/TrimBar";
 import {
@@ -23,6 +24,8 @@ import {
   checkCommand,
   loudness,
   type MediaInfo,
+  type OutputPreview,
+  outputPreview,
   previewCommand,
   type QualitySummary,
   qualitySummary,
@@ -78,6 +81,7 @@ import {
   speedLabel,
 } from "../lib/formats";
 import { FALLBACK_FPS, stepFrame } from "../lib/frames";
+import { targetOf } from "../lib/output";
 import {
   createPlayer,
   normalizeGain,
@@ -121,10 +125,11 @@ function describe(info: MediaInfo): string {
   return parts.join(" · ");
 }
 
-function outputName(info: MediaInfo, options: ConvertOptions): string {
+/** The file name without its extension: `clip.mov` → `clip`. */
+function stemOf(info: MediaInfo): string {
   const name = info.fileName;
   const dot = name.lastIndexOf(".");
-  return `${dot > 0 ? name.slice(0, dot) : name}.${options.format}`;
+  return dot > 0 ? name.slice(0, dot) : name;
 }
 
 /** Waiting screen while a file is being probed. */
@@ -387,6 +392,39 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   window.addEventListener("keydown", onKey);
   onCleanup(() => window.removeEventListener("keydown", onKey));
 
+  // Where it's saved ----------------------------------------------------------
+
+  const target = () => targetOf({ ...props.draft.output });
+  const [saveAt, setSaveAt] = createSignal<OutputPreview | null>(null);
+  const [outputError, setOutputError] = createSignal<string | null>(null);
+  let outputTimer: ReturnType<typeof setTimeout> | undefined;
+  let outputChecks = 0;
+  createEffect(
+    on(
+      () => JSON.stringify([target(), options()]),
+      () => {
+        clearTimeout(outputTimer);
+        const check = ++outputChecks;
+        const snapshot = { options: { ...options() }, target: target() };
+        outputTimer = setTimeout(() => {
+          outputPreview(info(), snapshot.options, snapshot.target).then(
+            (found) => {
+              if (check !== outputChecks) return;
+              setSaveAt(found);
+              setOutputError(null);
+            },
+            (error) => {
+              if (check !== outputChecks) return;
+              setSaveAt(null);
+              setOutputError(String(error));
+            },
+          );
+        }, 150);
+      },
+    ),
+  );
+  onCleanup(() => clearTimeout(outputTimer));
+
   // Command preview ---------------------------------------------------------
 
   const [command, setCommand] = createSignal("");
@@ -395,13 +433,15 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   let commandTimer: ReturnType<typeof setTimeout> | undefined;
   createEffect(
     on(
-      () => JSON.stringify(options()),
+      () => JSON.stringify([options(), target()]),
       () => {
         clearTimeout(commandTimer);
         if (!showCommand()) return;
-        const snapshot = { ...options() };
+        const snapshot = { options: { ...options() }, target: target() };
         commandTimer = setTimeout(() => {
-          previewCommand(info(), snapshot).then(setCommand, (error) => setCommand(`# ${error}`));
+          previewCommand(info(), snapshot.options, snapshot.target).then(setCommand, (error) =>
+            setCommand(`# ${error}`),
+          );
         }, 150);
       },
     ),
@@ -409,7 +449,9 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   createEffect(
     on(showCommand, (open) => {
       if (open)
-        previewCommand(info(), { ...options() }).then(setCommand, (e) => setCommand(`# ${e}`));
+        previewCommand(info(), { ...options() }, target()).then(setCommand, (e) =>
+          setCommand(`# ${e}`),
+        );
     }),
   );
   onCleanup(() => clearTimeout(commandTimer));
@@ -425,7 +467,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   // Checked as it's typed, so mistakes show up before converting.
   createEffect(
     on(
-      () => [props.draft.command, JSON.stringify(options())] as const,
+      () => [props.draft.command, JSON.stringify([options(), target()])] as const,
       ([text]) => {
         clearTimeout(checkTimer);
         const check = ++checks;
@@ -434,8 +476,9 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
           return;
         }
         const snapshot = { ...options() };
+        const to = target();
         checkTimer = setTimeout(() => {
-          checkCommand(info(), snapshot, text).then(
+          checkCommand(info(), snapshot, text, to).then(
             () => check === checks && setCommandError(null),
             // As written: messages can start with a program name, like "rm isn't …".
             (error) => check === checks && setCommandError(String(error)),
@@ -578,7 +621,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       readable() &&
       isAvailable(options().format) &&
       (chosen === null || isCodecAvailable(chosen)) &&
-      !(custom() && commandError() !== null)
+      !(custom() && commandError() !== null) &&
+      outputError() === null
     );
   };
 
@@ -842,7 +886,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                   <button
                     type="button"
                     class="frame-pill frame-save"
-                    title="Save this frame as a PNG next to the video (S)"
+                    title={`Save this frame as a PNG ${
+                      props.draft.output.folder === null
+                        ? "next to the video"
+                        : "in the chosen folder"
+                    } (S)`}
                     aria-busy={savingFrame()}
                     disabled={savingFrame()}
                     onClick={() => void saveThisFrame()}
@@ -1423,10 +1471,16 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
           </fieldset>
 
           <div class="outcome">
-            <div class="outcome-name">
-              <Icon name="arrow-right" size={18} />
-              <span class="item-name">{outputName(info(), options())}</span>
-            </div>
+            <OutputField
+              choice={props.draft.output}
+              preview={saveAt()}
+              error={outputError()}
+              format={options().format}
+              formatLabel={label(options().format)}
+              usualName={stemOf(info())}
+              usualPlace="next to the original"
+              files={state.inbox.length + 1}
+            />
             <Show
               when={summary().length > 0}
               fallback={<p class="item-meta">Same picture and length, fresh format.</p>}
@@ -1442,7 +1496,6 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 </For>
               </ul>
             </Show>
-            <p class="item-meta">Saved next to the original.</p>
           </div>
 
           <Show
@@ -1536,8 +1589,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 )}
               </Show>
               <p id="command-hint" class="item-meta">
-                Runs ffmpeg, cjxl and djxl directly, never through a shell. The output stays{" "}
-                {outputName(info(), options())} next to the original.
+                Runs ffmpeg, cjxl and djxl directly, never through a shell. It can only write the
+                file shown above, {saveAt() ? baseName(saveAt()?.path ?? "") : "the output"}.
               </p>
               <div class="command-actions">
                 <button type="button" class="link-btn" onClick={resetCommand}>

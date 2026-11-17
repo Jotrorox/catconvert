@@ -5,8 +5,9 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use catconvert_core::{
-    AudioRate, ConvertOptions, Crop, Direction, Ffmpeg, Fit, JxlOptions, Metadata, OutputFormat,
-    Plan, QualitySummary, RunOutcome, SequenceOptions, SoundOptions, VIDEO_KBPS, VideoCodec,
+    AudioRate, ConvertOptions, Crop, Direction, Ffmpeg, Fit, JxlOptions, Metadata, Naming,
+    OutputFormat, OutputTarget, Plan, QualitySummary, RunOutcome, SequenceOptions, SoundOptions,
+    VIDEO_KBPS, VideoCodec,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -32,7 +33,8 @@ enum Command {
         compact: bool,
     },
     /// Convert a file with ffmpeg (and libjxl's tools for JPEG XL). The result
-    /// is written next to the input.
+    /// is written next to the input unless `--out-dir` or `--name` say
+    /// otherwise, and never over an existing file.
     Convert {
         /// File to convert.
         file: PathBuf,
@@ -106,13 +108,16 @@ enum Command {
         /// GIF and animated JPEG XL: play forward, reversed, or forward then back.
         #[arg(long, value_enum, default_value_t = Playback::Forward)]
         direction: Playback,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Print the command(s) instead of running them.
         #[arg(long)]
         dry_run: bool,
     },
     /// Make one animation (GIF, WebP, JPEG XL or a video slideshow) from
     /// several pictures, in the order given. It takes the size of the first
-    /// picture and is written next to it.
+    /// picture and is written next to it unless `--out-dir` or `--name` say
+    /// otherwise.
     Animate {
         /// Pictures, in order.
         #[arg(required = true, num_args = 2..)]
@@ -151,6 +156,8 @@ enum Command {
         /// JPEG XL: encoder effort, 1 (fast) to 10 (smallest).
         #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(1..=10))]
         effort: u8,
+        #[command(flatten)]
+        output: OutputArgs,
         /// Print the command(s) instead of running them.
         #[arg(long)]
         dry_run: bool,
@@ -167,6 +174,30 @@ enum Command {
         #[arg(long, value_enum)]
         drop: Strip,
     },
+}
+
+/// Where the result goes (see [`OutputTarget`]).
+#[derive(Debug, clap::Args)]
+struct OutputArgs {
+    /// Folder to save the result in (it must exist); defaults to the
+    /// input's folder.
+    #[arg(long, value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+    /// File name without the extension, which follows the format. Can use
+    /// {name}, {format}, {width}, {height} and {date}, e.g. "{name}-{width}p".
+    /// Taken names get a number.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+}
+
+impl From<OutputArgs> for OutputTarget {
+    fn from(args: OutputArgs) -> Self {
+        Self {
+            folder: args.out_dir,
+            name: args.name,
+            ..Self::default()
+        }
+    }
 }
 
 /// CLI mirror of [`Metadata`].
@@ -285,7 +316,12 @@ fn parse_aspect(text: &str) -> Result<[u32; 2], String> {
         .ok_or_else(|| format!("expected a shape like 1:1 or 9:16, got `{text}`"))
 }
 
-fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<(), String> {
+fn convert(
+    file: &PathBuf,
+    options: &ConvertOptions,
+    target: &OutputTarget,
+    dry_run: bool,
+) -> Result<(), String> {
     let ffmpeg = Ffmpeg::locate().map_err(|e| e.to_string())?;
     if let Some(reason) = ffmpeg.missing_output(options) {
         return Err(reason);
@@ -294,7 +330,9 @@ fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<()
     if let Some(reason) = ffmpeg.unreadable(&info) {
         return Err(reason);
     }
-    let output = catconvert_core::output_path(&info.path, options.format, |_| false);
+    let output = Naming::conversion(&info, options)
+        .resolve(target, |_| false)
+        .map_err(|e| e.to_string())?;
     let plan = catconvert_core::plan(&info, options, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
     if let Some(line) = describe_quality(catconvert_core::quality_summary(&info, options)) {
@@ -363,6 +401,7 @@ fn animate(
     pictures: &[PathBuf],
     options: &ConvertOptions,
     sequence: &SequenceOptions,
+    target: &OutputTarget,
     dry_run: bool,
 ) -> Result<(), String> {
     let ffmpeg = Ffmpeg::locate().map_err(|e| e.to_string())?;
@@ -380,7 +419,9 @@ fn animate(
     if let Some(reason) = infos.iter().find_map(|info| ffmpeg.unreadable(info)) {
         return Err(reason);
     }
-    let output = catconvert_core::sequence_output_path(&infos, options.format, |_| false);
+    let output = catconvert_core::sequence_naming(&infos, options)
+        .resolve(target, |_| false)
+        .map_err(|e| e.to_string())?;
     let plan = catconvert_core::plan_sequence(&infos, options, sequence, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
     run(&ffmpeg, &plan, dry_run)
@@ -462,6 +503,7 @@ fn main() -> ExitCode {
             strip_metadata,
             speed,
             direction,
+            output,
             dry_run,
         } => {
             let options = ConvertOptions {
@@ -498,7 +540,7 @@ fn main() -> ExitCode {
                 speed,
                 direction: direction.into(),
             };
-            report(convert(&file, &options, dry_run))
+            report(convert(&file, &options, &output.into(), dry_run))
         }
         Command::Animate {
             pictures,
@@ -513,6 +555,7 @@ fn main() -> ExitCode {
             codec,
             lossless,
             effort,
+            output,
             dry_run,
         } => {
             let options = ConvertOptions {
@@ -534,7 +577,13 @@ fn main() -> ExitCode {
                 frame_secs: frame,
                 fit: if crop { Fit::Crop } else { Fit::Pad },
             };
-            report(animate(&pictures, &options, &sequence, dry_run))
+            report(animate(
+                &pictures,
+                &options,
+                &sequence,
+                &output.into(),
+                dry_run,
+            ))
         }
         Command::Scrub {
             input,

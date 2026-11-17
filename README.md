@@ -34,7 +34,10 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
   becomes a picture or GIF.
 - **Privacy:** remove location data and keep the rest of the metadata.
 - **Size estimate** before you convert, and a serial queue with live progress.
-  Results are saved next to the original and never overwrite anything.
+- **Your folder, your name:** results are saved next to the original unless you
+  pick another folder and name. Batches take a name pattern such as
+  `{name}-{format}` or `{name}_{height}p`. Nothing is overwritten unless you
+  say so, and never the original.
 - **Works from other apps:** photos, videos and songs offer CatConvert under
   "Open With" (plus "Send to" on Windows), macOS can add a "Convert with
   CatConvert" Finder Quick Action, and finished files drag straight out of the
@@ -131,6 +134,7 @@ mise run cli -- convert clip.mov --to mp3            # pull the audio
 mise run cli -- convert clip.mov --to mp4 --crop 9:16 --size 1080  # vertical, centred
 mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print the ffmpeg command
 mise run cli -- convert clip.mov --to mp4 --bitrate 4M          # exact video bitrate, two passes
+mise run cli -- convert clip.mov --to mp4 --out-dir ~/Movies --name "{name}_{height}p"  # elsewhere, renamed
 mise run cli -- animate cat*.jpg --to gif --frame 0.25 --direction boomerang  # pictures → animation
 ```
 

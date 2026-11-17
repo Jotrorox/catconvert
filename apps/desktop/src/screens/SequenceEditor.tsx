@@ -10,14 +10,17 @@ import {
 } from "solid-js";
 import { CodecField } from "../components/CodecField";
 import { Icon } from "../components/Icon";
+import { OutputField } from "../components/OutputField";
 import { QualityField } from "../components/QualityField";
 import {
   type ConvertOptions,
   type Fit,
+  type OutputPreview,
   previewSequenceCommand,
   type QualitySummary,
   qualitySummary,
   type SequenceOptions,
+  sequenceOutputPreview,
 } from "../lib/api";
 import {
   describeQuality,
@@ -41,6 +44,7 @@ import {
   sizeChoices,
 } from "../lib/formats";
 import { createMediaQuery } from "../lib/media";
+import { targetOf } from "../lib/output";
 import { createThumbnails } from "../lib/preview";
 import {
   closeEditor,
@@ -226,12 +230,46 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
   const qualityNumbers = createMemo(() =>
     describeQuality(encoding(), estimateSequenceVideoBitrate(pictures(), options(), sequence())),
   );
+  // Where it's saved ----------------------------------------------------------
+
+  const target = () => targetOf({ ...props.draft.output });
+  const [saveAt, setSaveAt] = createSignal<OutputPreview | null>(null);
+  const [outputError, setOutputError] = createSignal<string | null>(null);
+  let outputTimer: ReturnType<typeof setTimeout> | undefined;
+  let outputChecks = 0;
+  createEffect(
+    on(
+      () => JSON.stringify([pictures().map((p) => p.path), options(), target()]),
+      () => {
+        clearTimeout(outputTimer);
+        const check = ++outputChecks;
+        const snapshot = { pictures: [...pictures()], options: { ...options() }, to: target() };
+        outputTimer = setTimeout(() => {
+          sequenceOutputPreview(snapshot.pictures, snapshot.options, snapshot.to).then(
+            (found) => {
+              if (check !== outputChecks) return;
+              setSaveAt(found);
+              setOutputError(null);
+            },
+            (error) => {
+              if (check !== outputChecks) return;
+              setSaveAt(null);
+              setOutputError(String(error));
+            },
+          );
+        }, 150);
+      },
+    ),
+  );
+  onCleanup(() => clearTimeout(outputTimer));
+
   const ready = () => {
     const codec = codecOf(options());
     return (
       state.ffmpeg?.found === true &&
       isAnimated(options().format) &&
-      (codec === null || isCodecAvailable(codec))
+      (codec === null || isCodecAvailable(codec)) &&
+      outputError() === null
     );
   };
   const unavailableReason = (format: ConvertOptions["format"]) =>
@@ -265,7 +303,14 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
   let commandTimer: ReturnType<typeof setTimeout> | undefined;
   createEffect(
     on(
-      () => JSON.stringify([pictures().map((p) => p.path), options(), sequence(), showCommand()]),
+      () =>
+        JSON.stringify([
+          pictures().map((p) => p.path),
+          options(),
+          sequence(),
+          target(),
+          showCommand(),
+        ]),
       () => {
         clearTimeout(commandTimer);
         if (!showCommand()) return;
@@ -273,12 +318,15 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
           pictures: [...pictures()],
           options: { ...options() },
           sequence: { ...sequence() } as SequenceOptions,
+          target: target(),
         };
         commandTimer = setTimeout(() => {
-          previewSequenceCommand(snapshot.pictures, snapshot.options, snapshot.sequence).then(
-            setCommand,
-            (error) => setCommand(`# ${error}`),
-          );
+          previewSequenceCommand(
+            snapshot.pictures,
+            snapshot.options,
+            snapshot.sequence,
+            snapshot.target,
+          ).then(setCommand, (error) => setCommand(`# ${error}`));
         }, 150);
       },
     ),
@@ -611,12 +659,16 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
           </Show>
 
           <div class="outcome">
-            <div class="outcome-name">
-              <Icon name="arrow-right" size={18} />
-              <span class="item-name">
-                {sequenceName(pictures())}.{options().format}
-              </span>
-            </div>
+            <OutputField
+              choice={props.draft.output}
+              preview={saveAt()}
+              error={outputError()}
+              format={options().format}
+              formatLabel={label(options().format)}
+              usualName={sequenceName(pictures())}
+              usualPlace="next to the first picture"
+              files={1}
+            />
             <ul class="outcome-chips" aria-label="Animation">
               <For each={summary()}>
                 {(item) => (
@@ -627,7 +679,6 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
                 )}
               </For>
             </ul>
-            <p class="item-meta">Saved next to the first picture.</p>
           </div>
 
           <details

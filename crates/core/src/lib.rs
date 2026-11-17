@@ -21,6 +21,9 @@
 //!
 //! Several pictures can also become one animation: [`plan_sequence`] plans
 //! it and [`Queue::submit_sequence`] runs it.
+//!
+//! Results go next to the input under a free name unless an [`OutputTarget`]
+//! picks another folder, name or name pattern (see [`Naming`]).
 
 mod convert;
 mod custom;
@@ -29,6 +32,7 @@ mod ffmpeg;
 mod job;
 mod jxl;
 mod media;
+mod output;
 mod scrub;
 mod sequence;
 
@@ -45,5 +49,8 @@ pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, Ru
 pub use job::{JobId, JobProgress, JobStage, JobTicket, Queue, SavedFrame};
 pub use jxl::{JxlTools, LIBJXL_ENV, has_jpeg_reconstruction, is_jxl_file};
 pub use media::{MediaInfo, MediaKind, jpeg_orientation, probe};
+pub use output::{Collision, Naming, OutputPreview, OutputTarget, PLACEHOLDERS, check_stem};
 pub use scrub::scrub_file;
-pub use sequence::{Fit, MAX_PICTURES, SequenceOptions, plan_sequence, sequence_output_path};
+pub use sequence::{
+    Fit, MAX_PICTURES, SequenceOptions, plan_sequence, sequence_naming, sequence_output_path,
+};
