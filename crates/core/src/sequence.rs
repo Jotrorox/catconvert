@@ -13,6 +13,8 @@
 //!   runs, every picture is first scaled into a same-sized PNG instead.
 //! - ffmpeg turns a picture upright by its EXIF orientation once per input,
 //!   from its first frame; that is why orientation is part of a run.
+//! - Tiled HEIC photos are stitched from a stream group, which a list can't
+//!   express; each of those is scaled into a PNG first.
 //! - Pixel formats may still change within a run (a grey JPEG among colour
 //!   ones). `-reinit_filter 0` keeps one filter graph, which `scale` copes
 //!   with, so the GIF palette survives.
@@ -28,14 +30,15 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::convert::{
-    ANIMATED_JXL_MAX_SIZE, ANIMATED_WEBP_MAX_SIZE, CJXL_MEMORY_BUDGET, GIF_MAX_SIZE, cjxl_step,
+    ANIMATED_JXL_MAX_SIZE, ANIMATED_WEBP_MAX_SIZE, FRAME_MEMORY_BUDGET, GIF_MAX_SIZE, cjxl_step,
     free_path, lerp, push_animated_webp, push_ffmpeg_jxl, push_video_encoder, scratch_path,
     turn_filters,
 };
 use crate::ffmpeg::format_secs;
 use crate::jxl::is_jxl;
 use crate::{
-    ConvertOptions, Error, JxlSupport, MediaInfo, MediaKind, OutputFormat, Plan, Result, Step, Tool,
+    ConvertOptions, Direction, Error, MediaInfo, MediaKind, OutputFormat, Plan, Result, Step,
+    Support, Tool,
 };
 
 /// How pictures of another shape fit the frame, which takes the size of the
@@ -50,19 +53,7 @@ pub enum Fit {
     Crop,
 }
 
-/// The order the pictures play in.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Playback {
-    #[default]
-    Forward,
-    /// Last picture first.
-    Reverse,
-    /// Forward, then back again, so the loop has no jump.
-    Boomerang,
-}
-
-impl Playback {
+impl Direction {
     /// Indices into a list of `count` pictures, in the order they show.
     /// A boomerang doesn't repeat the turning points: `0 1 2 3 2 1`, then the
     /// loop starts over at `0`.
@@ -79,9 +70,10 @@ impl Playback {
 }
 
 /// Settings that only matter when making an animation from pictures. The
-/// rest (format, size cap, turn, mirror, quality, JPEG XL settings) comes
-/// from [`ConvertOptions`]; its trim, frame rate, sound and metadata settings
-/// don't apply.
+/// rest (format, size cap, turn, mirror, direction, quality, JPEG XL
+/// settings) comes from [`ConvertOptions`]; its trim, frame rate, speed,
+/// crop, sound and metadata settings don't apply. Animations never carry the
+/// first picture's tags.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SequenceOptions {
@@ -89,7 +81,6 @@ pub struct SequenceOptions {
     /// precision of GIF.
     pub frame_secs: f64,
     pub fit: Fit,
-    pub playback: Playback,
 }
 
 impl Default for SequenceOptions {
@@ -97,7 +88,6 @@ impl Default for SequenceOptions {
         Self {
             frame_secs: 0.5,
             fit: Fit::Pad,
-            playback: Playback::Forward,
         }
     }
 }
@@ -126,8 +116,10 @@ const MAX_RUNS: usize = 8;
 /// Validate the request and plan the steps that make one animation from
 /// `inputs`, in the order given, and write it to `output`.
 ///
-/// The frame takes the size of the first picture (after its EXIF rotation),
-/// shrunk by `options.max_size` or the format's usual cap, as for a video.
+/// The pictures play as `options.direction` says. The frame takes the size
+/// of the first picture (after its EXIF rotation), shrunk by
+/// `options.max_size` or the format's usual cap, as for a video. `support`
+/// says which JPEG XL tools are installed.
 ///
 /// # Errors
 ///
@@ -140,8 +132,9 @@ pub fn plan_sequence(
     options: &ConvertOptions,
     sequence: &SequenceOptions,
     output: &Path,
-    jxl: JxlSupport,
+    support: impl Into<Support>,
 ) -> Result<Plan> {
+    let jxl = support.into().jxl;
     let format = options.format;
     if inputs.len() < 2 {
         return Err(Error::unsupported(
@@ -221,52 +214,31 @@ pub fn plan_sequence(
         ),
     };
 
-    let order = sequence.playback.order(inputs.len());
+    let order = options.direction.order(inputs.len());
+    let mut used: Vec<usize> = order.clone();
+    used.sort_unstable();
+    used.dedup();
+    let weight = 1.0 / used.len() as f32;
+    let mut prescale = |i: usize, sources: &mut [Source]| {
+        let (step, scaled) = prescale_step(&sources[i], &fit, (width, height), output, i, weight);
+        steps.push(step);
+        scratch.push(scaled.path.clone());
+        sources[i] = scaled;
+    };
+    for &i in &used {
+        if sources[i].tile_grid.is_some() {
+            prescale(i, &mut sources);
+        }
+    }
     let mut runs = runs(&order, &sources);
     let normalized = runs.len() > MAX_RUNS;
     if normalized {
-        // Too many changes along the way: scale each picture into a PNG of
-        // the final size, which then all read as one run.
-        let mut used: Vec<usize> = order.clone();
-        used.sort_unstable();
-        used.dedup();
-        let weight = 1.0 / used.len() as f32;
-        for i in used {
-            let picture = scratch_path(output, &format!("picture{}", i + 1), "png");
-            let mut args: Vec<OsString> = vec!["-i".into(), sources[i].path.clone().into()];
-            args.extend(
-                [
-                    "-map",
-                    "0:v:0",
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    &format!("{fit},setsar=1"),
-                    "-c:v",
-                    "png",
-                    "-compression_level",
-                    "1",
-                    "-pix_fmt",
-                    "rgb24",
-                    "-update",
-                    "1",
-                ]
-                .map(OsString::from),
-            );
-            args.push(picture.clone().into());
-            steps.push(Step {
-                tool: Tool::Ffmpeg,
-                args,
-                duration_secs: None,
-                weight,
-            });
-            sources[i] = Source {
-                path: picture.clone(),
-                codec: Some("png".into()),
-                dims: Some((width, height)),
-                orientation: None,
-            };
-            scratch.push(picture);
+        // Too many changes along the way: scale every picture first, so they
+        // all read as one run.
+        for &i in &used {
+            if !sources[i].prescaled {
+                prescale(i, &mut sources);
+            }
         }
         runs = vec![order.clone()];
     }
@@ -349,7 +321,7 @@ pub fn plan_sequence(
         OutputFormat::Webp => push_animated_webp(&mut push, q),
         OutputFormat::Jxl => {
             let raw = f64::from(width) * f64::from(height) * 4.0 * frames as f64;
-            let too_big = raw > CJXL_MEMORY_BUDGET;
+            let too_big = raw > FRAME_MEMORY_BUDGET;
             if jxl.cjxl && !(too_big && jxl.ffmpeg_anim_encoder) {
                 if too_big {
                     return Err(Error::unsupported(
@@ -434,12 +406,10 @@ pub fn sequence_output_path(
     format: OutputFormat,
     taken: impl Fn(&Path) -> bool,
 ) -> PathBuf {
-    let dir = inputs
+    let first = inputs
         .first()
-        .and_then(|info| info.path.parent())
-        .unwrap_or_else(|| Path::new(""));
-    let stem = sequence_name(inputs);
-    free_path(dir, &stem, format, |p| {
+        .map_or_else(|| Path::new(""), |info| &info.path);
+    free_path(first, &sequence_name(inputs), format.extension(), |p| {
         inputs.iter().any(|info| info.path == p) || taken(p)
     })
 }
@@ -490,6 +460,10 @@ struct Source {
     codec: Option<String>,
     dims: Option<(u32, u32)>,
     orientation: Option<u8>,
+    /// A tiled HEIF picture's stream group; see [`MediaInfo::tile_grid`].
+    tile_grid: Option<usize>,
+    /// Already scaled to the frame by [`prescale_step`].
+    prescaled: bool,
 }
 
 impl Source {
@@ -509,6 +483,8 @@ impl Source {
             codec: info.video_codec.clone(),
             dims: info.width.zip(info.height),
             orientation: info.orientation,
+            tile_grid: info.tile_grid,
+            prescaled: false,
         })
     }
 
@@ -526,6 +502,64 @@ impl Source {
     fn quoted(&self) -> String {
         format!("'{}'", self.path.to_string_lossy().replace('\'', r"'\''"))
     }
+}
+
+/// The ffmpeg call that fits picture `index` (read from `source`) to the
+/// frame and writes it as a PNG, and what to read in its place.
+fn prescale_step(
+    source: &Source,
+    fit: &str,
+    (width, height): (u32, u32),
+    output: &Path,
+    index: usize,
+    weight: f32,
+) -> (Step, Source) {
+    let picture = scratch_path(output, &format!("picture{}", index + 1), "png");
+    let chain = format!("{fit},setsar=1");
+    let mut args: Vec<OsString> = vec!["-i".into(), source.path.clone().into()];
+    match source.tile_grid {
+        Some(group) => args.extend(
+            [
+                "-filter_complex",
+                &format!("[0:g:{group}]{chain}[v]"),
+                "-map",
+                "[v]",
+            ]
+            .map(OsString::from),
+        ),
+        None => args.extend(["-map", "0:v:0", "-vf", &chain].map(OsString::from)),
+    }
+    args.extend(
+        [
+            "-frames:v",
+            "1",
+            "-c:v",
+            "png",
+            "-compression_level",
+            "1",
+            "-pix_fmt",
+            "rgb24",
+            "-update",
+            "1",
+        ]
+        .map(OsString::from),
+    );
+    args.push(picture.clone().into());
+    let step = Step {
+        tool: Tool::Ffmpeg,
+        args,
+        duration_secs: None,
+        weight,
+    };
+    let scaled = Source {
+        path: picture,
+        codec: Some("png".into()),
+        dims: Some((width, height)),
+        orientation: None,
+        tile_grid: None,
+        prescaled: true,
+    };
+    (step, scaled)
 }
 
 /// `order` cut into runs of neighbours that can share a concat list.
@@ -588,6 +622,7 @@ fn frame_size(first: &MediaInfo, options: &ConvertOptions) -> Result<(u32, u32)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::JxlSupport;
     use crate::media::tests::sample;
 
     fn picture(name: &str, codec: &str, w: u32, h: u32) -> MediaInfo {
@@ -640,12 +675,12 @@ mod tests {
     }
 
     #[test]
-    fn playback_orders() {
-        assert_eq!(Playback::Forward.order(4), [0, 1, 2, 3]);
-        assert_eq!(Playback::Reverse.order(4), [3, 2, 1, 0]);
-        assert_eq!(Playback::Boomerang.order(4), [0, 1, 2, 3, 2, 1]);
-        assert_eq!(Playback::Boomerang.order(2), [0, 1]);
-        assert_eq!(Playback::Boomerang.order(0), Vec::<usize>::new());
+    fn direction_orders() {
+        assert_eq!(Direction::Forward.order(4), [0, 1, 2, 3]);
+        assert_eq!(Direction::Reverse.order(4), [3, 2, 1, 0]);
+        assert_eq!(Direction::Boomerang.order(4), [0, 1, 2, 3, 2, 1]);
+        assert_eq!(Direction::Boomerang.order(2), [0, 1]);
+        assert_eq!(Direction::Boomerang.order(0), Vec::<usize>::new());
     }
 
     #[test]
@@ -711,9 +746,12 @@ mod tests {
         let sequence = SequenceOptions {
             frame_secs: 0.25,
             fit: Fit::Crop,
-            playback: Playback::Boomerang,
         };
-        let plan = plan_of(&inputs, &gif(), &sequence);
+        let boomerang = ConvertOptions {
+            direction: Direction::Boomerang,
+            ..gif()
+        };
+        let plan = plan_of(&inputs, &boomerang, &sequence);
         let lists: Vec<&str> = plan.writes.iter().map(|(_, l)| l.as_str()).collect();
         // Boomerang: a b c turned plain turned c b; only a and b are
         // neighbours that match.
@@ -757,8 +795,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             first.join(" "),
-            "-i /pics/p0.png -map 0:v:0 -frames:v 1 -vf scale=400:300:force_original_aspect_ratio=decrease:flags=lanczos,\
-             pad=400:300:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1 -c:v png -compression_level 1 -pix_fmt rgb24 \
+            "-i /pics/p0.png -map 0:v:0 -vf scale=400:300:force_original_aspect_ratio=decrease:flags=lanczos,\
+             pad=400:300:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1 -frames:v 1 -c:v png -compression_level 1 -pix_fmt rgb24 \
              -update 1 /pics/.p.mp4.picture1.png"
         );
         assert_eq!(plan.writes.len(), 1);
@@ -980,15 +1018,56 @@ mod tests {
     }
 
     #[test]
+    fn tiled_heic_photos_are_stitched_into_a_png_first() {
+        let tiled = MediaInfo {
+            tile_grid: Some(0),
+            ..picture("IMG_1.heic", "hevc", 4032, 3024)
+        };
+        let inputs = [
+            tiled.clone(),
+            MediaInfo {
+                path: PathBuf::from("/pics/IMG_2.heic"),
+                ..tiled
+            },
+        ];
+        let plan = plan_of(&inputs, &gif(), &SequenceOptions::default());
+        assert_eq!(plan.steps.len(), 3);
+        let first = plan.steps[0]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            first.starts_with(
+                "-i /pics/IMG_1.heic -filter_complex [0:g:0]scale=640:480:force_original_aspect_ratio=decrease"
+            ),
+            "{first}"
+        );
+        assert!(first.ends_with("setsar=1[v] -map [v] -frames:v 1 -c:v png -compression_level 1 -pix_fmt rgb24 -update 1 /pics/.cat.gif.picture1.png"), "{first}");
+        // The stitched PNGs read as one run, already fitted.
+        assert_eq!(plan.writes.len(), 1);
+        assert!(
+            plan.writes[0]
+                .1
+                .contains("file '/pics/.cat.gif.picture2.png'")
+        );
+        let cmd = plan.command_line();
+        assert!(
+            cmd.contains("-filter_complex '[0:v]scale=640:480:"),
+            "{cmd}"
+        );
+    }
+
+    #[test]
     fn options_deserialize_with_defaults() {
         let parsed: SequenceOptions =
-            serde_json::from_str(r#"{"frameSecs": 0.1, "playback": "boomerang"}"#).expect("parse");
+            serde_json::from_str(r#"{"frameSecs": 0.1, "fit": "crop"}"#).expect("parse");
         assert_eq!(
             parsed,
             SequenceOptions {
                 frame_secs: 0.1,
-                fit: Fit::Pad,
-                playback: Playback::Boomerang,
+                fit: Fit::Crop,
             }
         );
         assert!(OutputFormat::Mp4.animates_pictures());

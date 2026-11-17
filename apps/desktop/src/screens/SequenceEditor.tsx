@@ -13,13 +13,13 @@ import { QualityField } from "../components/QualityField";
 import {
   type ConvertOptions,
   type Fit,
-  type Playback,
   previewSequenceCommand,
   type SequenceOptions,
 } from "../lib/api";
 import { describeSequenceEstimate } from "../lib/estimate";
 import { formatBytes, formatSpan } from "../lib/format";
 import {
+  DIRECTIONS,
   FRAME_TIMES,
   isLossless,
   JXL_EFFORTS,
@@ -47,12 +47,6 @@ import {
   updateSequenceOptions,
 } from "../lib/store";
 
-const PLAYBACKS: { value: Playback; label: string }[] = [
-  { value: "forward", label: "Forward" },
-  { value: "reverse", label: "Reverse" },
-  { value: "boomerang", label: "Boomerang" },
-];
-
 const FITS: { value: Fit; label: string; hint: string }[] = [
   { value: "pad", label: "Black bars", hint: "Shows every picture whole" },
   { value: "crop", label: "Crop to fill", hint: "Fills the frame, trims the edges" },
@@ -71,7 +65,7 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
   const first = () => pictures()[0];
 
   const thumbnail = createThumbnails(() => pictures().map((p) => p.path), THUMB_HEIGHT);
-  const order = createMemo(() => playbackOrder(pictures().length, sequence().playback));
+  const order = createMemo(() => playbackOrder(pictures().length, options().direction));
   const loopSecs = () => order().length * sequence().frameSecs;
   const frame = createMemo(() => {
     const picture = first();
@@ -196,7 +190,7 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
   const lossless = () => isLossless(options());
   const setJxl = (patch: Partial<ConvertOptions["jxl"]>) =>
     updateSequenceOptions({ jxl: { ...options().jxl, ...patch } });
-  const estimate = createMemo(() => describeSequenceEstimate(pictures(), options(), sequence()));
+  const estimate = createMemo(() => describeSequenceEstimate(pictures(), options()));
   const ready = () => state.ffmpeg?.found === true && isAnimated(options().format);
   const unavailableReason = (format: ConvertOptions["format"]) =>
     format === "jxl"
@@ -211,10 +205,10 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
     items.push({ icon: "clock", text: `${formatSpan(loopSecs())} loop` });
     const f = frame();
     if (f) items.push({ icon: "image", text: `${f.width}×${f.height}` });
-    if (sequence().playback !== "forward") {
+    if (options().direction !== "forward") {
       items.push({
         icon: "refresh",
-        text: sequence().playback === "boomerang" ? "Boomerang" : "Reversed",
+        text: options().direction === "boomerang" ? "Boomerang" : "Reversed",
       });
     }
     if (options().rotate) items.push({ icon: "rotate", text: `Turned ${options().rotate}°` });
@@ -439,13 +433,13 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
           <fieldset class="field">
             <legend class="field-label">Playback</legend>
             <div class="format-chips" data-tone="green">
-              <For each={PLAYBACKS}>
+              <For each={DIRECTIONS}>
                 {(choice) => (
                   <button
                     type="button"
                     class="format-chip"
-                    aria-pressed={sequence().playback === choice.value}
-                    onClick={() => updateSequence({ playback: choice.value })}
+                    aria-pressed={options().direction === choice.direction}
+                    onClick={() => updateSequenceOptions({ direction: choice.direction })}
                   >
                     {choice.label}
                   </button>

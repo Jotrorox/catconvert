@@ -22,6 +22,9 @@ tauri-build = { version = "=2.7.5", features = [] }
 tauri-plugin-dialog = "=2.8.4"
 tauri-plugin-opener = "=2.7.2"
 tauri-plugin-updater = "=2.14.1"
+# Plugins without a JS package. drag's command is called from api.ts directly.
+tauri-plugin-drag = "=2.1.1"
+tauri-plugin-single-instance = "=2.5.5"
 uniffi = "=0.32.2"
 
 # Everything else is locked by Cargo.lock.
@@ -30,6 +33,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 tempfile = "3.27.0"
+# Photo metadata: EXIF reading for HEIF/WebP/TIFF, and the zlib/brotli
+# streams PNG text chunks and JPEG XL boxes keep it in.
+kamadak-exif = "0.6.2"
+miniz_oxide = "0.9.1"
+brotli-decompressor = "6.3.2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

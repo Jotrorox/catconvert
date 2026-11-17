@@ -5,8 +5,8 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use catconvert_core::{
-    ConvertOptions, Ffmpeg, Fit, JxlOptions, OutputFormat, Plan, Playback, RunOutcome,
-    SequenceOptions,
+    ConvertOptions, Crop, Direction, Ffmpeg, Fit, JxlOptions, Metadata, OutputFormat, Plan,
+    RunOutcome, SequenceOptions, SoundOptions,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -57,12 +57,24 @@ enum Command {
         /// Mirror horizontally.
         #[arg(long)]
         flip: bool,
+        /// Crop to this width:height, keeping the centre (e.g. 1:1, 9:16).
+        #[arg(long, value_name = "W:H", value_parser = parse_aspect)]
+        crop: Option<[u32; 2]>,
         /// 0 = smallest file, 100 = best quality.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u8).range(0..=100))]
         quality: u8,
         /// Drop the audio track.
         #[arg(long)]
         mute: bool,
+        /// Even out loudness (to -16 LUFS).
+        #[arg(long)]
+        normalize: bool,
+        /// Fade in over this many seconds (video fades from black too).
+        #[arg(long, default_value_t = 0.0)]
+        fade_in: f64,
+        /// Fade out over this many seconds (video fades to black too).
+        #[arg(long, default_value_t = 0.0)]
+        fade_out: f64,
         /// JPEG XL: mathematically lossless (an unedited JPEG is recompressed
         /// losslessly and can be restored bit for bit).
         #[arg(long)]
@@ -73,9 +85,18 @@ enum Command {
         /// JPEG XL: progressive decoding.
         #[arg(long)]
         progressive: bool,
-        /// Drop dates, location, titles and other tags.
-        #[arg(long)]
+        /// Which dates, places, titles and other tags to carry over.
+        #[arg(long, value_enum, default_value_t = Tags::NoLocation)]
+        metadata: Tags,
+        /// Same as `--metadata none`.
+        #[arg(long, hide = true, conflicts_with = "metadata")]
         strip_metadata: bool,
+        /// GIF and animated JPEG XL: playback speed, 0.25 to 4 (e.g. 2 for 2×).
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// GIF and animated JPEG XL: play forward, reversed, or forward then back.
+        #[arg(long, value_enum, default_value_t = Playback::Forward)]
+        direction: Playback,
         /// Print the command(s) instead of running them.
         #[arg(long)]
         dry_run: bool,
@@ -98,8 +119,8 @@ enum Command {
         #[arg(long)]
         crop: bool,
         /// Order the pictures play in.
-        #[arg(long, value_enum, default_value_t = PlaybackArg::Forward)]
-        playback: PlaybackArg,
+        #[arg(long, value_enum, default_value_t = Playback::Forward)]
+        direction: Playback,
         /// Shrink so the short side is at most this many pixels (e.g. 480).
         #[arg(long)]
         size: Option<u32>,
@@ -122,22 +143,64 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Copy a JPEG or PNG without its location or all of its metadata. The
+    /// picture itself is copied untouched, so a JPEG stays bit-identical
+    /// apart from the metadata.
+    Scrub {
+        /// JPEG or PNG to read.
+        input: PathBuf,
+        /// Where to write the copy; must not exist yet.
+        output: PathBuf,
+        /// What to take out.
+        #[arg(long, value_enum)]
+        drop: Strip,
+    },
 }
 
-/// CLI mirror of [`Playback`].
+/// CLI mirror of [`Metadata`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum PlaybackArg {
+enum Tags {
+    /// Everything, where the format can hold it.
+    Keep,
+    /// Everything except where the file was made (GPS, location tags).
+    NoLocation,
+    /// Nothing; colour profiles stay.
+    None,
+}
+
+impl From<Tags> for Metadata {
+    fn from(tags: Tags) -> Self {
+        match tags {
+            Tags::Keep => Self::Keep,
+            Tags::NoLocation => Self::NoLocation,
+            Tags::None => Self::None,
+        }
+    }
+}
+
+/// What `scrub` takes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Strip {
+    /// GPS coordinates in EXIF and XMP.
+    Location,
+    /// EXIF, XMP, IPTC, comments and text; colour profiles stay.
+    All,
+}
+
+/// CLI mirror of [`Direction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Playback {
     Forward,
     Reverse,
     Boomerang,
 }
 
-impl From<PlaybackArg> for Playback {
-    fn from(playback: PlaybackArg) -> Self {
+impl From<Playback> for Direction {
+    fn from(playback: Playback) -> Self {
         match playback {
-            PlaybackArg::Forward => Self::Forward,
-            PlaybackArg::Reverse => Self::Reverse,
-            PlaybackArg::Boomerang => Self::Boomerang,
+            Playback::Forward => Self::Forward,
+            Playback::Reverse => Self::Reverse,
+            Playback::Boomerang => Self::Boomerang,
         }
     }
 }
@@ -184,6 +247,14 @@ impl From<Format> for OutputFormat {
     }
 }
 
+/// `9:16` → `[9, 16]`.
+fn parse_aspect(text: &str) -> Result<[u32; 2], String> {
+    let parse = |part: &str| part.trim().parse::<u32>().ok().filter(|&n| n > 0);
+    text.split_once(':')
+        .and_then(|(w, h)| Some([parse(w)?, parse(h)?]))
+        .ok_or_else(|| format!("expected a shape like 1:1 or 9:16, got `{text}`"))
+}
+
 fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<(), String> {
     let ffmpeg = Ffmpeg::locate().map_err(|e| e.to_string())?;
     if let Some(reason) = ffmpeg.missing(options.format) {
@@ -191,7 +262,7 @@ fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<()
     }
     let info = ffmpeg.probe(file).map_err(|e| e.to_string())?;
     let output = catconvert_core::output_path(&info.path, options.format, |_| false);
-    let plan = catconvert_core::plan(&info, options, &output, ffmpeg.jxl_support())
+    let plan = catconvert_core::plan(&info, options, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
     run(&ffmpeg, &plan, dry_run)
 }
@@ -212,9 +283,8 @@ fn animate(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     let output = catconvert_core::sequence_output_path(&infos, options.format, |_| false);
-    let plan =
-        catconvert_core::plan_sequence(&infos, options, sequence, &output, ffmpeg.jxl_support())
-            .map_err(|e| e.to_string())?;
+    let plan = catconvert_core::plan_sequence(&infos, options, sequence, &output, ffmpeg.support())
+        .map_err(|e| e.to_string())?;
     run(&ffmpeg, &plan, dry_run)
 }
 
@@ -279,12 +349,19 @@ fn main() -> ExitCode {
             fps,
             rotate,
             flip,
+            crop,
             quality,
             mute,
+            normalize,
+            fade_in,
+            fade_out,
             lossless,
             effort,
             progressive,
+            metadata,
             strip_metadata,
+            speed,
+            direction,
             dry_run,
         } => {
             let options = ConvertOptions {
@@ -295,6 +372,10 @@ fn main() -> ExitCode {
                 fps,
                 rotate,
                 flip,
+                crop: crop.map(|aspect| Crop {
+                    aspect: Some(aspect),
+                    area: None,
+                }),
                 quality,
                 keep_audio: !mute,
                 jxl: JxlOptions {
@@ -302,7 +383,18 @@ fn main() -> ExitCode {
                     effort,
                     progressive,
                 },
-                keep_metadata: !strip_metadata,
+                sound: SoundOptions {
+                    normalize,
+                    fade_in,
+                    fade_out,
+                },
+                metadata: if strip_metadata {
+                    Metadata::None
+                } else {
+                    metadata.into()
+                },
+                speed,
+                direction: direction.into(),
             };
             report(convert(&file, &options, dry_run))
         }
@@ -311,7 +403,7 @@ fn main() -> ExitCode {
             to,
             frame,
             crop,
-            playback,
+            direction,
             size,
             rotate,
             flip,
@@ -331,14 +423,27 @@ fn main() -> ExitCode {
                     effort,
                     progressive: false,
                 },
+                direction: direction.into(),
                 ..ConvertOptions::default()
             };
             let sequence = SequenceOptions {
                 frame_secs: frame,
                 fit: if crop { Fit::Crop } else { Fit::Pad },
-                playback: playback.into(),
             };
             report(animate(&pictures, &options, &sequence, dry_run))
+        }
+        Command::Scrub {
+            input,
+            output,
+            drop,
+        } => {
+            let metadata = match drop {
+                Strip::Location => Metadata::NoLocation,
+                Strip::All => Metadata::None,
+            };
+            report(
+                catconvert_core::scrub_file(&input, &output, metadata).map_err(|e| e.to_string()),
+            )
         }
     }
 }
@@ -387,7 +492,7 @@ mod tests {
             "--frame",
             "0.25",
             "--crop",
-            "--playback",
+            "--direction",
             "boomerang",
         ])
         .expect("parse");
@@ -396,7 +501,7 @@ mod tests {
             to,
             frame,
             crop,
-            playback,
+            direction,
             ..
         } = cli.command
         else {
@@ -406,7 +511,7 @@ mod tests {
         assert_eq!(OutputFormat::from(to), OutputFormat::Webp);
         assert_eq!(frame, 0.25);
         assert!(crop);
-        assert_eq!(Playback::from(playback), Playback::Boomerang);
+        assert_eq!(Direction::from(direction), Direction::Boomerang);
         // One picture is not an animation.
         assert!(Cli::try_parse_from(["catconvert", "animate", "a.jpg", "--to", "gif"]).is_err());
     }
@@ -423,6 +528,10 @@ mod tests {
             "1.5",
             "--size",
             "480",
+            "--speed",
+            "2",
+            "--direction",
+            "boomerang",
         ])
         .expect("parse");
         let Command::Convert {
@@ -430,6 +539,9 @@ mod tests {
             start,
             size,
             quality,
+            metadata,
+            speed,
+            direction,
             ..
         } = cli.command
         else {
@@ -439,6 +551,30 @@ mod tests {
         assert_eq!(start, Some(1.5));
         assert_eq!(size, Some(480));
         assert_eq!(quality, 60);
+        assert_eq!(Metadata::from(metadata), Metadata::NoLocation);
+        assert!((speed - 2.0).abs() < f64::EPSILON);
+        assert_eq!(Direction::from(direction), Direction::Boomerang);
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "convert",
+            "a",
+            "--to",
+            "mp4",
+            "--crop",
+            "9:16",
+        ])
+        .expect("parse");
+        let Command::Convert { crop, .. } = cli.command else {
+            panic!("expected convert");
+        };
+        assert_eq!(crop, Some([9, 16]));
+        for bad in ["9x16", "0:1", "1:"] {
+            assert!(
+                Cli::try_parse_from(["catconvert", "convert", "a", "--to", "mp4", "--crop", bad])
+                    .is_err(),
+                "{bad}"
+            );
+        }
         assert!(
             Cli::try_parse_from([
                 "catconvert",
@@ -451,5 +587,44 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_metadata_choices_and_scrub() {
+        let metadata = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                ["catconvert", "convert", "a.jpg", "--to", "png"]
+                    .iter()
+                    .chain(args),
+            )
+            .expect("parse");
+            let Command::Convert {
+                metadata,
+                strip_metadata,
+                ..
+            } = cli.command
+            else {
+                panic!("expected convert");
+            };
+            (Metadata::from(metadata), strip_metadata)
+        };
+        assert_eq!(metadata(&["--metadata", "keep"]).0, Metadata::Keep);
+        assert_eq!(metadata(&["--metadata", "none"]).0, Metadata::None);
+        assert!(metadata(&["--strip-metadata"]).1);
+
+        // The command line plans show for in-process cleaning steps.
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "scrub",
+            "a.jpg",
+            "b.jpg",
+            "--drop",
+            "location",
+        ])
+        .expect("parse");
+        let Command::Scrub { drop, .. } = cli.command else {
+            panic!("expected scrub");
+        };
+        assert_eq!(drop, Strip::Location);
     }
 }

@@ -6,7 +6,7 @@
  * place. The types mirror the serde output of `catconvert-core` (camelCase).
  */
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -34,8 +34,18 @@ export type MediaInfo = {
   fps: number | null;
   videoCodec: string | null;
   audioCodec: string | null;
+  /** Sample rate of the sound in Hz. */
+  sampleRate: number | null;
   /** JPEG XL only: a losslessly recompressed JPEG whose original can be restored. */
   reconstructsJpeg: boolean;
+  /** HDR video (PQ or HLG, as iPhones record); pictures made from it are tone-mapped. */
+  hdr: boolean;
+  /** GPS in a photo's EXIF or XMP, or a location tag in a video or song. */
+  hasLocation: boolean;
+  /** Container tags holding the location, cleared when everything else is kept. */
+  locationTags: string[];
+  /** HEIF only: the stream group ffmpeg stitches a tiled photo from. */
+  tileGrid: number | null;
   /** EXIF orientation (2–8) ffmpeg applies when decoding; `width`/`height` already include it. */
   orientation?: number | null;
 };
@@ -59,6 +69,26 @@ export type OutputFormat =
 
 export type Rotation = 0 | 90 | 180 | 270;
 
+/** What to carry over besides the picture and sound. */
+export type MetadataMode = "keep" | "noLocation" | "none";
+
+/** Which way an animation plays; a boomerang plays forward, then back. */
+export type Direction = "forward" | "reverse" | "boomerang";
+
+/** Width to height, e.g. `[9, 16]`. */
+export type Aspect = [number, number];
+
+/** A rectangle in fractions (0 to 1) of the picture's width and height. */
+export type CropArea = { x: number; y: number; width: number; height: number };
+
+/** Part of the picture to keep, measured after the turn and mirror. */
+export type Crop = {
+  /** `null` for a free-form crop. */
+  aspect: Aspect | null;
+  /** `null` keeps the largest centred area with `aspect`, on any file. */
+  area: CropArea | null;
+};
+
 /** Settings that only matter when writing JPEG XL. */
 export type JxlOptions = {
   /** Mathematically lossless; an unedited JPEG is recompressed and can be restored exactly. */
@@ -67,6 +97,16 @@ export type JxlOptions = {
   effort: number;
   /** Sharp preview early while the file loads. */
   progressive: boolean;
+};
+
+/** Clean-up for the sound; ignored when the output has none. */
+export type SoundOptions = {
+  /** Even out loudness (to -16 LUFS). */
+  normalize: boolean;
+  /** Seconds to fade in from silence (and black, for video); 0 is off. */
+  fadeIn: number;
+  /** Seconds to fade out to silence (and black, for video); 0 is off. */
+  fadeOut: number;
 };
 
 /** Which JPEG XL code paths are installed. */
@@ -88,26 +128,31 @@ export type ConvertOptions = {
   fps: number | null;
   rotate: Rotation;
   flip: boolean;
+  crop: Crop | null;
   /** 0 = smallest file, 100 = best quality. */
   quality: number;
   keepAudio: boolean;
   jxl: JxlOptions;
-  /** Carry over dates, location and other tags where the format can hold them. */
-  keepMetadata: boolean;
+  sound: SoundOptions;
+  /** Which dates, places and other tags to carry over, where the format can hold them. */
+  metadata: MetadataMode;
+  /** Playback speed of animations (GIF, animated WebP and JPEG XL), 0.25–4. Ignored otherwise. */
+  speed: number;
+  /** Playback direction of animations. Ignored otherwise. */
+  direction: Direction;
 };
 
 /** How pictures of another shape fit an animation's frame (the first picture's size). */
 export type Fit = "pad" | "crop";
 
-/** The order an animation's pictures play in. */
-export type Playback = "forward" | "reverse" | "boomerang";
-
-/** Settings that only matter when making an animation from pictures. */
+/**
+ * Settings that only matter when making an animation from pictures. The order
+ * they play in is `ConvertOptions.direction`.
+ */
 export type SequenceOptions = {
   /** Seconds each picture shows (to the hundredth). */
   frameSecs: number;
   fit: Fit;
-  playback: Playback;
 };
 
 export type JobId = number;
@@ -122,6 +167,12 @@ export type JobProgress = {
   speed: number | null;
   outputBytes: number | null;
   error: string | null;
+};
+
+/** A frame written by {@link saveFrame}. */
+export type SavedFrame = {
+  output: string;
+  outputBytes: number;
 };
 
 export type JobTicket = {
@@ -146,6 +197,16 @@ export type FfmpegStatus = {
   jxl: JxlSupport;
 };
 
+/** Whether "Convert with CatConvert" is in Finder's Quick Actions menu. */
+export type QuickActionStatus = {
+  /** Only macOS has Quick Actions. */
+  supported: boolean;
+  installed: boolean;
+};
+
+/** How a drag out of the window ended (tauri-plugin-drag). */
+type DragEnd = { result: "Dropped" | "Cancel" };
+
 export const NO_JXL: JxlSupport = {
   cjxl: false,
   djxl: false,
@@ -163,12 +224,16 @@ type Commands = {
   ffmpeg_status: { args: Record<string, never>; result: FfmpegStatus };
   relocate_ffmpeg: { args: Record<string, never>; result: FfmpegStatus };
   probe_file: { args: { path: string }; result: MediaInfo };
-  preview_frame: { args: { path: string; at: number; height: number }; result: ArrayBuffer };
+  preview_frame: {
+    args: { path: string; at: number; height: number; hdr: boolean };
+    result: ArrayBuffer;
+  };
   waveform: {
     args: { path: string; width: number; height: number; color: string };
     result: ArrayBuffer;
   };
   preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
+  save_frame: { args: { path: string; options: ConvertOptions; at: number }; result: SavedFrame };
   preview_sequence_command: {
     args: { pictures: MediaInfo[]; options: ConvertOptions; sequence: SequenceOptions };
     result: string;
@@ -182,10 +247,19 @@ type Commands = {
   relaunch: { args: Record<string, never>; result: null };
   missing_files: { args: { paths: string[] }; result: string[] };
   third_party_licenses: { args: Record<string, never>; result: string | null };
+  take_opened_files: { args: Record<string, never>; result: string[] };
+  quick_action_status: { args: Record<string, never>; result: QuickActionStatus };
+  set_quick_action: { args: { installed: boolean }; result: QuickActionStatus };
+  "plugin:drag|start_drag": {
+    args: { item: string[]; image: string; options: { mode: "copy" }; onEvent: Channel<DragEnd> };
+    result: null;
+  };
 };
 
 type Events = {
   "job-progress": JobProgress;
+  /** Absolute paths of files opened from outside the app. */
+  "open-files": string[];
 };
 
 function command<K extends keyof Commands>(
@@ -239,9 +313,25 @@ export function probeFile(path: string): Promise<MediaInfo> {
   return command("probe_file", { path });
 }
 
-/** One JPEG frame as an object URL. Revoke it with `URL.revokeObjectURL` when done. */
-export async function previewFrame(path: string, at: number, height: number): Promise<string> {
-  return blobUrl(await command("preview_frame", { path, at, height }), "image/jpeg");
+/**
+ * One JPEG frame as an object URL, tone-mapped when `hdr` is set. Revoke it
+ * with `URL.revokeObjectURL` when done.
+ */
+export async function previewFrame(
+  path: string,
+  at: number,
+  height: number,
+  hdr = false,
+): Promise<string> {
+  return blobUrl(await command("preview_frame", { path, at, height, hdr }), "image/jpeg");
+}
+
+/**
+ * Save the frame at `at` seconds as a PNG next to the video, with the turn,
+ * mirror and size of `options`. Runs right away, not in the queue.
+ */
+export function saveFrame(path: string, options: ConvertOptions, at: number): Promise<SavedFrame> {
+  return command("save_frame", { path, options, at });
 }
 
 /** The audio waveform as a PNG object URL. */
@@ -313,7 +403,8 @@ export async function pickFiles(): Promise<string[]> {
         extensions: [
           ...["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpg", "mpeg", "gif", "apng"],
           ...["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "aiff", "wma"],
-          ...["jpg", "jpeg", "png", "webp", "avif", "jxl", "heic", "heif", "tif", "tiff", "bmp"],
+          ...["jpg", "jpeg", "png", "webp", "avif", "jxl", "tif", "tiff", "bmp"],
+          ...["heic", "heif", "hif"],
         ],
       },
     ],
@@ -325,6 +416,73 @@ export async function pickFiles(): Promise<string[]> {
 /** Show a file in Finder / Explorer / the file manager. */
 export function revealInFolder(path: string): Promise<void> {
   return revealItemInDir(path);
+}
+
+// ---------------------------------------------------------------------------
+// Files from and to other apps
+// ---------------------------------------------------------------------------
+
+/**
+ * Files opened from outside the app: "Open with", the Finder Quick Action,
+ * "Send to", a drop on the Dock icon or the command line. `handler` first gets
+ * the files that arrived before the window was ready, then each new batch.
+ */
+export async function onOpenedFiles(handler: (paths: string[]) => void): Promise<UnlistenFn> {
+  // Subscribe first: the backend emits events once the backlog is taken.
+  const stop = await subscribe("open-files", handler);
+  try {
+    const backlog = await command("take_opened_files", {});
+    if (backlog.length > 0) handler(backlog);
+  } catch (error) {
+    stop();
+    throw error;
+  }
+  return stop;
+}
+
+export async function quickActionStatus(): Promise<QuickActionStatus> {
+  if (!inTauri) return { supported: false, installed: false };
+  return command("quick_action_status", {});
+}
+
+/** Add or remove the Finder Quick Action. */
+export function setQuickAction(installed: boolean): Promise<QuickActionStatus> {
+  return command("set_quick_action", { installed });
+}
+
+/** A drag out of the window is in progress, so a drop on it is our own file coming back. */
+let draggingOut = false;
+
+/**
+ * Drag files out of the window into another app or folder, as copies. HTML
+ * drag and drop can't hand real files to other apps, so this starts a native
+ * drag; call it while the mouse button is down. `icon` is a PNG data URL shown
+ * under the pointer. Resolves when the drag ends.
+ */
+export function dragFiles(paths: string[], icon: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const end = () => {
+      draggingOut = false;
+      window.removeEventListener("pointerdown", end);
+      resolve();
+    };
+    const onEvent = new Channel<DragEnd>();
+    onEvent.onmessage = end;
+    // The window gets no pointer events during a native drag, so the next
+    // press means it is over, should the plugin never report back.
+    window.addEventListener("pointerdown", end);
+    draggingOut = true;
+    command("plugin:drag|start_drag", {
+      item: paths,
+      image: icon,
+      options: { mode: "copy" },
+      onEvent,
+    }).catch((error: unknown) => {
+      draggingOut = false;
+      window.removeEventListener("pointerdown", end);
+      reject(error);
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -409,20 +567,24 @@ export type FileDropHandlers = {
   onDrop: (paths: string[]) => void;
 };
 
-/** Subscribe to native drag-and-drop on the current webview (gives real file paths). */
+/**
+ * Subscribe to native drag-and-drop on the current webview (gives real file
+ * paths). Files dragged out with {@link dragFiles} and let go over the window
+ * again are ignored.
+ */
 export function onFileDrop(handlers: FileDropHandlers): Promise<UnlistenFn> {
   return getCurrentWebview().onDragDropEvent(({ payload }) => {
     switch (payload.type) {
       case "enter":
       case "over":
-        handlers.onHover?.(true);
+        if (!draggingOut) handlers.onHover?.(true);
         break;
       case "leave":
         handlers.onHover?.(false);
         break;
       case "drop":
         handlers.onHover?.(false);
-        handlers.onDrop(payload.paths);
+        if (!draggingOut) handlers.onDrop(payload.paths);
         break;
     }
   });

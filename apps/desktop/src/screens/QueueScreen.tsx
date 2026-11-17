@@ -1,12 +1,14 @@
 import { type Component, createMemo, For, Show } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
+import { dragIcon, startDragOnMove } from "../lib/drag";
 import { baseName, formatBytes, formatClock } from "../lib/format";
 import { label, playbackOrder } from "../lib/formats";
 import {
   cancelJob,
   chooseFiles,
   clearFinished,
+  dragOut,
   inputBytes,
   isFinal,
   type JobEntry,
@@ -16,6 +18,15 @@ import {
   state,
   tweakJob,
 } from "../lib/store";
+
+/** Finished files can be dragged straight into another app. */
+function dragDone(event: PointerEvent, job: JobEntry) {
+  if (job.stage !== "done") return;
+  startDragOnMove(
+    event,
+    () => void dragOut(job.output, dragIcon(job.options.format, job.input.kind)),
+  );
+}
 
 function route(job: JobEntry) {
   const from = job.sequence
@@ -27,7 +38,7 @@ function route(job: JobEntry) {
 /** Length of what the job writes, in seconds. */
 function outputLength(job: JobEntry): number {
   if (job.sequence) {
-    return playbackOrder(job.inputs.length, job.sequence.playback).length * job.sequence.frameSecs;
+    return playbackOrder(job.inputs.length, job.options.direction).length * job.sequence.frameSecs;
   }
   const o = job.options;
   return (o.trimEnd ?? job.input.durationSecs ?? 0) - (o.trimStart ?? 0);
@@ -193,7 +204,13 @@ export const QueueScreen: Component<{ compact: boolean }> = (props) => {
           <ul class="job-list">
             <For each={finished()}>
               {(job) => (
-                <li class="job-row pop" data-stage={job.stage}>
+                <li
+                  class="job-row pop"
+                  classList={{ "drag-out": job.stage === "done" }}
+                  data-stage={job.stage}
+                  title={job.stage === "done" ? "Drag into another app or folder" : undefined}
+                  onPointerDown={(event) => dragDone(event, job)}
+                >
                   <Show
                     when={job.stage === "done"}
                     fallback={

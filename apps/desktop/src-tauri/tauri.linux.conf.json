@@ -1,0 +1,119 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "fileAssociations": [
+      {
+        "ext": ["jpg", "jpeg"],
+        "mimeType": "image/jpeg"
+      },
+      {
+        "ext": ["png"],
+        "mimeType": "image/png"
+      },
+      {
+        "ext": ["gif"],
+        "mimeType": "image/gif"
+      },
+      {
+        "ext": ["webp"],
+        "mimeType": "image/webp"
+      },
+      {
+        "ext": ["avif"],
+        "mimeType": "image/avif"
+      },
+      {
+        "ext": ["heic", "heif"],
+        "mimeType": "image/heif"
+      },
+      {
+        "ext": ["tif", "tiff"],
+        "mimeType": "image/tiff"
+      },
+      {
+        "ext": ["bmp"],
+        "mimeType": "image/bmp"
+      },
+      {
+        "ext": ["jxl"],
+        "mimeType": "image/jxl"
+      },
+      {
+        "ext": ["apng"],
+        "mimeType": "image/apng"
+      },
+      {
+        "ext": ["mp4"],
+        "mimeType": "video/mp4"
+      },
+      {
+        "ext": ["m4v"],
+        "mimeType": "video/x-m4v"
+      },
+      {
+        "ext": ["mov"],
+        "mimeType": "video/quicktime"
+      },
+      {
+        "ext": ["mkv"],
+        "mimeType": "video/x-matroska"
+      },
+      {
+        "ext": ["webm"],
+        "mimeType": "video/webm"
+      },
+      {
+        "ext": ["avi"],
+        "mimeType": "video/x-msvideo"
+      },
+      {
+        "ext": ["wmv"],
+        "mimeType": "video/x-ms-wmv"
+      },
+      {
+        "ext": ["mpg", "mpeg"],
+        "mimeType": "video/mpeg"
+      },
+      {
+        "ext": ["mp3"],
+        "mimeType": "audio/mpeg"
+      },
+      {
+        "ext": ["m4a"],
+        "mimeType": "audio/mp4"
+      },
+      {
+        "ext": ["aac"],
+        "mimeType": "audio/aac"
+      },
+      {
+        "ext": ["flac"],
+        "mimeType": "audio/flac"
+      },
+      {
+        "ext": ["wav"],
+        "mimeType": "audio/x-wav"
+      },
+      {
+        "ext": ["ogg"],
+        "mimeType": "audio/ogg"
+      },
+      {
+        "ext": ["ogg"],
+        "mimeType": "audio/x-vorbis+ogg"
+      },
+      {
+        "ext": ["opus"],
+        "mimeType": "audio/x-opus+ogg"
+      },
+      {
+        "ext": ["aiff"],
+        "mimeType": "audio/x-aiff"
+      },
+      {
+        "ext": ["wma"],
+        "mimeType": "audio/x-ms-wma"
+      }
+    ]
+  }
+}

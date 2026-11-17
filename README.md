@@ -11,9 +11,16 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 > ship their own (with libjxl's tools), so there is nothing to install. Without
 > them, as in development, CatConvert uses an installed ffmpeg (found on `PATH`,
 > in Homebrew's folders, or via `CATCONVERT_FFMPEG`, which always wins).
-> You can drop files, trim, resize, rotate, mirror, change frame rate, quality and
-> format, drop the sound, and watch a serial queue with live progress. Results are
-> saved next to the original and never overwrite anything.
+> You can drop files, trim, crop (free or 1:1, 9:16, 16:9), resize, rotate, mirror,
+> change frame rate, quality and format, drop the sound, and watch a serial queue with live progress. Step through
+> a video frame by frame and save any frame as a PNG (←/→ and S). Results are
+> saved next to the original and never overwrite anything. HDR video, which
+> iPhones record by default, is tone-mapped when it becomes a picture or GIF.
+>
+> You don't have to open the app first: photos, videos and songs offer
+> CatConvert under "Open With" (plus "Send to" on Windows), and on macOS
+> Settings can add a "Convert with CatConvert" Finder Quick Action. Finished
+> files drag straight out of the Queue and History into other apps.
 >
 > Drop several pictures to convert each, or to make one animation of them: a GIF,
 > animated WebP or JPEG XL, or an MP4 slideshow. Reorder them in a filmstrip, pick
@@ -98,8 +105,9 @@ mise run cli -- convert clip.mov --to gif --start 1 --end 4 --size 480
 mise run cli -- convert photo.jpg --to jxl --lossless             # repack JPEG, restorable
 mise run cli -- convert clip.mov --to jxl --size 480 --effort 9    # animated JPEG XL
 mise run cli -- convert clip.mov --to mp3            # pull the audio
+mise run cli -- convert clip.mov --to mp4 --crop 9:16 --size 1080  # vertical, centred
 mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print the ffmpeg command
-mise run cli -- animate cat*.jpg --to gif --frame 0.25 --playback boomerang  # pictures → animation
+mise run cli -- animate cat*.jpg --to gif --frame 0.25 --direction boomerang  # pictures → animation
 ```
 
 ## CI and releases

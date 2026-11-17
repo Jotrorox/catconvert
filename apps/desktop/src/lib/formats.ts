@@ -2,7 +2,16 @@
  * What the UI knows about output formats, edit defaults and recipes. The
  * backend validates everything again; this only decides what to offer.
  */
-import type { ConvertOptions, MediaInfo, MediaKind, OutputFormat, SequenceOptions } from "./api";
+import type {
+  ConvertOptions,
+  Direction,
+  MediaInfo,
+  MediaKind,
+  MetadataMode,
+  OutputFormat,
+  SequenceOptions,
+} from "./api";
+import { aspectText, cropBox, cropForOtherFile, pictureSize, turnedSize } from "./crop";
 
 export type Tone = "pink" | "green" | "yellow" | "lavender";
 
@@ -73,6 +82,37 @@ export function groupsFor(kind: MediaKind): FormatGroup[] {
   }
 }
 
+/** Speed choices for animations. */
+export const SPEEDS = [0.5, 1, 2, 4] as const;
+
+export const DIRECTIONS: readonly { direction: Direction; label: string }[] = [
+  { direction: "forward", label: "Forward" },
+  { direction: "reverse", label: "Reverse" },
+  { direction: "boomerang", label: "Boomerang" },
+];
+
+export const speedLabel = (speed: number) => `${speed}×`;
+
+/** Whether the speed or direction change how this output plays. */
+export function changesPlayback(info: MediaInfo, options: ConvertOptions): boolean {
+  return (
+    isAnimatedImage(options.format, info.kind) &&
+    (options.speed !== 1 || options.direction !== "forward")
+  );
+}
+
+/**
+ * Length of the output in seconds: the kept range, and for animations its
+ * speed and direction (a boomerang plays it twice). `null` if unknown.
+ */
+export function outputSeconds(info: MediaInfo, options: ConvertOptions): number | null {
+  const end = options.trimEnd ?? info.durationSecs;
+  if (end === null) return null;
+  const kept = Math.max(0, end - (options.trimStart ?? 0));
+  if (!isAnimatedImage(options.format, info.kind)) return kept;
+  return (kept / options.speed) * (options.direction === "boomerang" ? 2 : 1);
+}
+
 /** Formats whose quality setting changes nothing. */
 export const LOSSLESS: ReadonlySet<OutputFormat> = new Set(["wav", "flac", "png"]);
 
@@ -82,6 +122,14 @@ export function isLossless(options: ConvertOptions): boolean {
 }
 
 export const label = (format: OutputFormat) => format.toUpperCase();
+
+/** Tile colour for each kind of file. */
+export const KIND_TONE: Record<MediaKind, Tone> = {
+  video: "pink",
+  audio: "yellow",
+  image: "lavender",
+  unknown: "green",
+};
 
 /** JPEG XL effort presets (cjxl's -e). */
 export const JXL_EFFORTS = [
@@ -94,23 +142,32 @@ export const JXL_EFFORTS = [
 const LOSSLESS_BY_DEFAULT = new Set(["jpg", "jpeg", "png", "apng", "gif"]);
 
 /**
- * Whether the options leave the file as it is: no trim, turn, mirror, resize or
- * new rate, and metadata kept (libjxl's tools can't drop it, see convert.rs).
+ * Whether the options leave the picture as it is: no trim, turn, mirror,
+ * crop, resize, new rate, speed or direction. Dropping metadata doesn't
+ * count; the backend cleans the JPEG before libjxl repacks it (see scrub.rs).
  */
 export function isUntouched(info: MediaInfo, options: ConvertOptions): boolean {
   const untrimmed =
     info.kind === "image" || (options.trimStart === null && options.trimEnd === null);
   return (
     untrimmed &&
-    options.keepMetadata &&
+    !changesPlayback(info, options) &&
     options.rotate === 0 &&
     !options.flip &&
-    (options.maxSize === null || !sizeChoices(info).includes(options.maxSize)) &&
+    !hasCrop(info, options) &&
+    (options.maxSize === null || !sizeChoices(info, options).includes(options.maxSize)) &&
     (options.fps === null || !fpsChoices(info).includes(options.fps))
   );
 }
 
 /** A JPEG XL that holds a recompressed JPEG, turned back into that exact JPEG. */
+/** Whether the crop cuts anything off this file. Unknown sizes count as cut. */
+export function hasCrop(info: MediaInfo, options: Pick<ConvertOptions, "rotate" | "crop">) {
+  if (!options.crop) return false;
+  const size = turnedSize(info, options.rotate);
+  return size === null || cropBox(size, options.crop) !== null;
+}
+
 export function restoresJpeg(info: MediaInfo, options: ConvertOptions): boolean {
   return info.reconstructsJpeg && options.format === "jpg" && isUntouched(info, options);
 }
@@ -150,11 +207,94 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     fps: null,
     rotate: 0,
     flip: false,
+    crop: null,
     quality: 60,
     keepAudio: true,
     jxl: { lossless: false, effort: 7, progressive: false },
-    keepMetadata: true,
+    sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
+    metadata: "noLocation",
+    speed: 1,
+    direction: "forward",
   };
+}
+
+/** Fade lengths offered in the Sound section, in seconds (0 is off). */
+export const FADE_CHOICES = [0, 1, 3] as const;
+
+/** Whether the output carries sound, so the Sound settings apply. */
+export function outputHasSound(info: MediaInfo, options: ConvertOptions): boolean {
+  if (info.audioCodec === null) return false;
+  const out = formatKind(options.format, info.kind);
+  if (out === "audio") return true;
+  return out === "video" && !isAnimatedImage(options.format, info.kind) && options.keepAudio;
+}
+
+/**
+ * How long the fades run over a kept range of `length` seconds, clipped to it
+ * as the planner does. A fade-out needs a known length.
+ */
+export function fadeSpans(
+  sound: ConvertOptions["sound"],
+  length: number | null,
+): { fadeIn: number; fadeOut: number } {
+  const clip = (secs: number) => Math.max(0, length === null ? secs : Math.min(secs, length));
+  return { fadeIn: clip(sound.fadeIn), fadeOut: length === null ? 0 : clip(sound.fadeOut) };
+}
+
+export const METADATA_CHOICES: readonly { mode: MetadataMode; label: string }[] = [
+  { mode: "keep", label: "Keep everything" },
+  { mode: "noLocation", label: "Keep all but location" },
+  { mode: "none", label: "Remove everything" },
+];
+
+/**
+ * Whether the output can carry tags over at all. ffmpeg writes no EXIF into
+ * JPG, WebP or AVIF, stills grabbed from a video have none, and animations
+ * keep no tags, so those come out clean whatever the setting.
+ */
+export function keepsMetadata(format: OutputFormat, input: MediaKind): boolean {
+  if (formatKind(format, input) === "image") {
+    return input === "image" && (format === "png" || format === "jxl");
+  }
+  return !isAnimatedImage(format, input);
+}
+
+/** Whether the converted file will still say where the original was made. */
+export function keepsLocation(info: MediaInfo, options: ConvertOptions): boolean {
+  return (
+    info.hasLocation && options.metadata === "keep" && keepsMetadata(options.format, info.kind)
+  );
+}
+
+const PLACE_WORDS = {
+  image: "photo knows where it was taken",
+  video: "video knows where it was filmed",
+  audio: "recording knows where it was made",
+  unknown: "file knows where it was made",
+} as const;
+
+/** "📍 This photo knows where it was taken", for files with a location. */
+export function locationLine(info: MediaInfo): string | null {
+  return info.hasLocation ? `This ${PLACE_WORDS[info.kind]}` : null;
+}
+
+/**
+ * The metadata setting as stored by older versions (`keepMetadata: boolean`)
+ * or now. On only meant "keep", off meant "remove everything".
+ */
+export function metadataFrom(stored: {
+  metadata?: unknown;
+  keepMetadata?: unknown;
+}): MetadataMode | null {
+  if (
+    stored.metadata === "keep" ||
+    stored.metadata === "noLocation" ||
+    stored.metadata === "none"
+  ) {
+    return stored.metadata;
+  }
+  if (typeof stored.keepMetadata === "boolean") return stored.keepMetadata ? "keep" : "none";
+  return null;
 }
 
 export const QUALITY_STEPS = ["Tiny file", "Balanced", "Crisp"] as const;
@@ -168,13 +308,14 @@ export type Defaults = {
   /** Preferred output per input kind; `null` lets CatConvert pick. */
   formats: Record<FormatGroup["kind"], OutputFormat | null>;
   quality: number;
-  keepMetadata: boolean;
+  metadata: MetadataMode;
 };
 
+/** Keeping all but the location suits an app that never sends files anywhere. */
 export const DEFAULTS: Defaults = {
   formats: { video: null, audio: null, image: null },
   quality: 60,
-  keepMetadata: true,
+  metadata: "noLocation",
 };
 
 /** Whether the editor offers `format` for an input of `kind`. */
@@ -182,16 +323,19 @@ export function offers(kind: MediaKind, format: OutputFormat): boolean {
   return groupsFor(kind).some((group) => group.formats.includes(format));
 }
 
-/** Short side of the picture after rotation metadata, if known. */
-export function shortSide(info: MediaInfo): number | null {
-  return info.width && info.height ? Math.min(info.width, info.height) : null;
+type Framing = Pick<ConvertOptions, "rotate" | "crop">;
+
+/** Short side of the picture after rotation metadata and the crop, if known. */
+export function shortSide(info: MediaInfo, framing?: Framing): number | null {
+  const size = pictureSize(info, framing ?? { rotate: 0, crop: null });
+  return size ? Math.min(size.width, size.height) : null;
 }
 
 const SIZES = [2160, 1440, 1080, 720, 480, 360, 240] as const;
 
-/** Downscale choices smaller than the source. */
-export function sizeChoices(info: MediaInfo): number[] {
-  const short = shortSide(info);
+/** Downscale choices smaller than the (cropped) source. */
+export function sizeChoices(info: MediaInfo, framing?: Framing): number[] {
+  const short = shortSide(info, framing);
   return SIZES.filter((size) => short === null || size < short);
 }
 
@@ -265,7 +409,8 @@ export const RECIPES: readonly Recipe[] = [
 /**
  * `options` adapted to another file, or `null` when they don't fit it: a
  * format the editor wouldn't offer for it, sound from a silent file, or an
- * encoder that isn't installed. The trim belongs to one file and is dropped.
+ * encoder that isn't installed. The trim and a hand-drawn crop belong to one
+ * file and are dropped; a crop shape is kept and centred.
  */
 export function fitOptions(
   info: MediaInfo,
@@ -274,9 +419,16 @@ export function fitOptions(
 ): ConvertOptions | null {
   if (!offers(info.kind, options.format) || !available(options.format)) return null;
   if (formatKind(options.format, info.kind) === "audio" && info.audioCodec === null) return null;
-  const fitted = { ...options, jxl: { ...options.jxl }, trimStart: null, trimEnd: null };
+  const fitted = {
+    ...options,
+    jxl: { ...options.jxl },
+    sound: { ...options.sound },
+    trimStart: null,
+    trimEnd: null,
+    crop: cropForOtherFile(options.crop),
+  };
   // Drop choices that would upscale or speed up this particular file.
-  if (fitted.maxSize !== null && !sizeChoices(info).includes(fitted.maxSize)) {
+  if (fitted.maxSize !== null && !sizeChoices(info, fitted).includes(fitted.maxSize)) {
     fitted.maxSize = null;
   }
   if (fitted.fps !== null && !fpsChoices(info).includes(fitted.fps)) fitted.fps = null;
@@ -306,7 +458,7 @@ export function initialOptions(
   const base = (format: OutputFormat): ConvertOptions => ({
     ...defaultOptions(format),
     quality: defaults.quality,
-    keepMetadata: defaults.keepMetadata,
+    metadata: defaults.metadata,
     jxl: { ...defaultOptions("jxl").jxl, lossless: LOSSLESS_BY_DEFAULT.has(info.extension ?? "") },
   });
   if (recipe?.accepts.includes(info.kind)) {
@@ -321,29 +473,36 @@ export function initialOptions(
 }
 
 const KIND_WORD = { video: "VIDEO", audio: "SOUND", image: "PICTURE", unknown: "ANY" } as const;
-const KIND_TONE: Record<FormatGroup["kind"], Tone> = {
-  video: "pink",
-  audio: "yellow",
-  image: "lavender",
-};
 
 /** One line describing what a recipe does, e.g. "720p · 30 fps · Balanced". */
 export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
   const out = formatKind(options.format, info.kind);
   const parts: string[] = [];
+  if (out !== "audio" && options.crop?.aspect)
+    parts.push(`${aspectText(options.crop.aspect)} crop`);
   if (out !== "audio" && options.maxSize !== null) parts.push(sizeLabel(options.maxSize, out));
   if (out === "video" && options.fps !== null) parts.push(`${options.fps} fps`);
+  if (isAnimatedImage(options.format, info.kind)) {
+    if (options.speed !== 1) parts.push(speedLabel(options.speed));
+    if (options.direction !== "forward") parts.push(options.direction);
+  }
   const video = out === "video" && !isAnimatedImage(options.format, info.kind);
   if (video && !options.keepAudio) parts.push("no sound");
   parts.push(isLossless(options) ? "lossless" : qualityStep(options.quality).toLowerCase());
-  if (!options.keepMetadata) parts.push("no metadata");
+  if (outputHasSound(info, options)) {
+    if (options.sound.normalize) parts.push("even loudness");
+    if (options.sound.fadeIn > 0 || options.sound.fadeOut > 0) parts.push("fades");
+  }
+  if (options.metadata === "keep") parts.push("all metadata");
+  if (options.metadata === "none") parts.push("no metadata");
   const text = parts.join(" · ");
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /**
  * A user recipe from the editor's current settings. It keeps the encoding
- * choices; the trim, turn and mirror belong to the file they were made for.
+ * choices and the crop's shape; the trim, turn, mirror and where the crop
+ * sits belong to the file they were made for.
  */
 export function recipeFrom(
   id: RecipeId,
@@ -354,14 +513,15 @@ export function recipeFrom(
   const out = formatKind(options.format, info.kind);
   const accepts: MediaKind[] = out === "audio" ? ["video", "audio"] : [info.kind];
   const { trimStart: _start, trimEnd: _end, rotate: _rotate, flip: _flip, ...kept } = options;
+  const crop = out === "audio" ? null : cropForOtherFile(options.crop);
   return {
     id,
     title,
     custom: true,
-    detail: recipeDetail(info, options),
+    detail: recipeDetail(info, { ...options, crop }),
     route: `${accepts.length > 1 ? "ANY" : KIND_WORD[info.kind]} → ${label(options.format)}`,
     tone: KIND_TONE[out],
-    options: { ...kept, jxl: { ...kept.jxl } },
+    options: { ...kept, crop, jxl: { ...kept.jxl }, sound: { ...kept.sound } },
     accepts,
   };
 }
@@ -379,12 +539,11 @@ export const FRAME_TIMES = [0.1, 0.25, 0.5, 1] as const;
 export const DEFAULT_SEQUENCE: SequenceOptions = {
   frameSecs: 0.5,
   fit: "pad",
-  playback: "forward",
 };
 
 /** Extensions of still pictures. GIF and APNG may move, so they don't count. */
 const PICTURE_EXTENSIONS = new Set([
-  ...["jpg", "jpeg", "png", "webp", "avif", "heic", "heif", "tif", "tiff", "bmp", "jxl"],
+  ...["jpg", "jpeg", "png", "webp", "avif", "heic", "heif", "hif", "tif", "tiff", "bmp", "jxl"],
 ]);
 
 /** Whether a dropped path looks like a still picture, judging by its name. */
@@ -429,11 +588,11 @@ export function sequenceFrame(
   return options.rotate % 180 === 90 ? { width: height, height: width } : { width, height };
 }
 
-/** The order pictures show in. Mirrors `Playback::order` in sequence.rs. */
-export function playbackOrder(count: number, playback: SequenceOptions["playback"]): number[] {
+/** The order pictures show in. Mirrors `Direction::order` in sequence.rs. */
+export function playbackOrder(count: number, direction: Direction): number[] {
   const forward = Array.from({ length: count }, (_, i) => i);
-  if (playback === "reverse") return forward.reverse();
-  if (playback === "boomerang") return [...forward, ...forward.slice(1, -1).reverse()];
+  if (direction === "reverse") return forward.reverse();
+  if (direction === "boomerang") return [...forward, ...forward.slice(1, -1).reverse()];
   return forward;
 }
 
@@ -451,7 +610,7 @@ export function sequenceOptions(
     ...defaultOptions(sequenceFormat(animated)),
     quality: defaults.quality,
     // An animation never carries one picture's tags; the backend strips them.
-    keepMetadata: false,
+    metadata: "none",
   };
 }
 

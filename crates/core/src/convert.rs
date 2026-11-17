@@ -169,6 +169,88 @@ impl Default for JxlOptions {
     }
 }
 
+/// Which way an animation plays.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    #[default]
+    Forward,
+    /// Back to front.
+    Reverse,
+    /// Forward, then back again, so the loop has no seam.
+    Boomerang,
+}
+
+impl Direction {
+    /// How many times the kept range plays per loop.
+    #[must_use]
+    pub fn passes(self) -> f64 {
+        if self == Self::Boomerang { 2.0 } else { 1.0 }
+    }
+}
+
+/// Clean-up for the sound. Only applies when the output has sound; video
+/// fades the picture along with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SoundOptions {
+    /// Even out loudness to -16 LUFS with ffmpeg's single-pass `loudnorm`.
+    pub normalize: bool,
+    /// Seconds to fade in from silence (and black) at the start; 0 is off.
+    pub fade_in: f64,
+    /// Seconds to fade out to silence (and black) at the end; 0 is off.
+    pub fade_out: f64,
+}
+
+/// Target loudness of [`SoundOptions::normalize`]: -16 LUFS integrated,
+/// -1.5 dBTP peak ceiling, loudness range 11 LU.
+const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
+/// Sample rate after `loudnorm` when the source rate is unknown.
+const FALLBACK_SAMPLE_RATE: u32 = 48_000;
+
+/// Part of the picture to keep, measured on the picture as it looks after the
+/// turn and mirror, so it matches what the user sees in the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Crop {
+    /// Width to height to keep, e.g. `[9, 16]`. `None` for a free-form crop.
+    #[serde(default)]
+    pub aspect: Option<[u32; 2]>,
+    /// The kept area as fractions of the picture. `None` keeps the largest
+    /// centred area with `aspect`, which is how recipes and batches apply a
+    /// crop shape to files of any size.
+    #[serde(default)]
+    pub area: Option<CropArea>,
+}
+
+/// A rectangle in fractions (0 to 1) of the picture's width and height.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CropArea {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl CropArea {
+    const FULL: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    };
+}
+
+/// A crop in pixels, as ffmpeg's `crop` filter takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CropBox {
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+}
+
 /// The edits and encoding choices for one conversion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -187,15 +269,40 @@ pub struct ConvertOptions {
     pub rotate: u16,
     /// Mirror horizontally.
     pub flip: bool,
+    /// Keep only part of the picture. Applied after the turn and mirror.
+    pub crop: Option<Crop>,
     /// 0 = smallest file, 100 = best quality.
     pub quality: u8,
     /// Keep the sound when writing video.
     pub keep_audio: bool,
     /// JPEG XL settings, ignored for other formats.
     pub jxl: JxlOptions,
-    /// Carry over dates, location, titles and other tags where the output
-    /// format can hold them. Off strips them.
-    pub keep_metadata: bool,
+    /// Loudness and fades, ignored when the output has no sound.
+    pub sound: SoundOptions,
+    /// Which dates, places, titles and other tags to carry over.
+    pub metadata: Metadata,
+    /// Playback speed of animations (GIF, animated JPEG XL), from 0.25 to 4.
+    /// Ignored for other outputs.
+    pub speed: f64,
+    /// Playback direction of animations. Ignored for other outputs.
+    pub direction: Direction,
+}
+
+/// What to carry over from the original besides the picture and sound.
+///
+/// Only where the output can hold it: ffmpeg writes no EXIF into JPEG, WebP or
+/// AVIF, so those come out without photo metadata whatever this says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Metadata {
+    /// Dates, location, camera details, titles and the rest.
+    Keep,
+    /// Everything except where the file was made: the GPS coordinates in
+    /// EXIF and XMP, and location tags in videos.
+    #[default]
+    NoLocation,
+    /// No tags at all. Colour profiles stay, as they are part of the picture.
+    None,
 }
 
 impl Default for ConvertOptions {
@@ -208,11 +315,22 @@ impl Default for ConvertOptions {
             fps: None,
             rotate: 0,
             flip: false,
+            crop: None,
             quality: 60,
             keep_audio: true,
             jxl: JxlOptions::default(),
-            keep_metadata: true,
+            sound: SoundOptions::default(),
+            metadata: Metadata::default(),
+            speed: 1.0,
+            direction: Direction::Forward,
         }
+    }
+}
+
+impl ConvertOptions {
+    /// Whether speed or direction change how an animation plays.
+    fn changes_playback(&self) -> bool {
+        (self.speed - 1.0).abs() > 1e-9 || self.direction != Direction::Forward
     }
 }
 
@@ -251,6 +369,31 @@ impl JxlSupport {
     }
 }
 
+/// What the installed tools can do, as far as [`plan`] cares.
+/// [`crate::Ffmpeg::support`] fills this in; the default assumes the least.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Support {
+    /// Which JPEG XL code paths are installed.
+    pub jxl: JxlSupport,
+    /// ffmpeg's `scale` filter converts between transfer functions (ffmpeg
+    /// 8 and later), so HDR video can be tone-mapped for pictures and GIFs.
+    pub tone_map: bool,
+}
+
+impl From<JxlSupport> for Support {
+    fn from(jxl: JxlSupport) -> Self {
+        Self {
+            jxl,
+            ..Self::default()
+        }
+    }
+}
+
+/// HDR (PQ or HLG) to SDR BT.709 with swscale's colour management. Without
+/// it, pictures from iPhone videos come out flat and washed out.
+pub(crate) const TONE_MAP_FILTER: &str =
+    "scale=out_transfer=bt709:out_primaries=bt709:out_color_matrix=bt709";
+
 /// A program a [`Step`] runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tool {
@@ -259,6 +402,10 @@ pub enum Tool {
     Cjxl,
     /// libjxl's decoder.
     Djxl,
+    /// CatConvert itself, taking metadata out of a JPEG or PNG without
+    /// re-encoding it (see [`crate::scrub_file`]). Shown as the CLI command
+    /// that does the same.
+    Scrub,
 }
 
 impl Tool {
@@ -269,6 +416,7 @@ impl Tool {
             Self::Ffmpeg => "ffmpeg",
             Self::Cjxl => "cjxl",
             Self::Djxl => "djxl",
+            Self::Scrub => "catconvert scrub",
         }
     }
 }
@@ -325,15 +473,6 @@ impl Plan {
     pub fn duration_secs(&self) -> Option<f64> {
         self.steps.iter().rev().find_map(|step| step.duration_secs)
     }
-
-    fn single(step: Step, output: &Path) -> Self {
-        Self {
-            steps: vec![step],
-            output: output.to_path_buf(),
-            scratch: Vec::new(),
-            writes: Vec::new(),
-        }
-    }
 }
 
 /// Default output height for GIFs, which get huge quickly.
@@ -349,29 +488,33 @@ const ANIMATED_JXL_FPS: f64 = 30.0;
 pub(crate) const ANIMATED_WEBP_MAX_SIZE: u32 = 480;
 /// Default frame-rate cap of animated WebP.
 const ANIMATED_WEBP_FPS: f64 = 24.0;
-/// `cjxl` holds every decoded frame in memory; refuse animations whose raw
-/// frames would exceed this many bytes.
-pub(crate) const CJXL_MEMORY_BUDGET: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
+/// `cjxl` and ffmpeg's `reverse` filter hold every decoded frame in memory;
+/// refuse animations whose raw frames would exceed this many bytes.
+pub(crate) const FRAME_MEMORY_BUDGET: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
+/// Slowest and fastest animation speed.
+const SPEEDS: std::ops::RangeInclusive<f64> = 0.25..=4.0;
 /// Inputs `cjxl` reads itself, keeping metadata, bit depth and (for JPEG) the
 /// original bitstream.
 const CJXL_INPUTS: [&str; 6] = ["png", "apng", "gif", "jpg", "jpeg", "jxl"];
 
 /// Validate `options` for `input` and plan the steps that write `output`.
 ///
-/// `jxl` says which JPEG XL tools are installed; it only matters when the
-/// input or output is JPEG XL.
+/// `support` says what the installed tools can do: which JPEG XL tools there
+/// are (only matters when the input or output is JPEG XL), and whether HDR
+/// video can be tone-mapped for pictures and GIFs.
 ///
 /// # Errors
 ///
 /// [`Error::Unsupported`] if the format cannot be made from this input (e.g.
-/// MP3 from a silent video), the trim range or rotation is invalid, or the
+/// MP3 from a silent video), the trim range, rotation or crop is invalid, or the
 /// JPEG XL tools this needs are missing.
 pub fn plan(
     input: &MediaInfo,
     options: &ConvertOptions,
     output: &Path,
-    jxl: JxlSupport,
+    support: impl Into<Support>,
 ) -> Result<Plan> {
+    let Support { jxl, tone_map } = support.into();
     let format = options.format;
     if !format.accepts(input.kind) {
         return Err(Error::unsupported(format!(
@@ -388,56 +531,105 @@ pub fn plan(
             "rotation must be 0, 90, 180 or 270 degrees",
         ));
     }
+    let fades = [options.sound.fade_in, options.sound.fade_out];
+    if fades.iter().any(|f| !f.is_finite() || *f < 0.0) {
+        return Err(Error::unsupported("fade lengths must be positive numbers"));
+    }
+    if let Some(crop) = &options.crop {
+        validate_crop(crop)?;
+    }
     if output == input.path {
         return Err(Error::unsupported(
             "the output would overwrite the original",
         ));
     }
     let trim = trim_range(input, options)?;
-    // cjxl and djxl carry metadata over and can't drop it, so stripping
-    // means going through ffmpeg.
-    let untouched = is_untouched(input, options) && options.keep_metadata;
     let jxl_in = is_jxl(input);
     let animated = format.animates(input.kind);
+    if animated && !(options.speed.is_finite() && SPEEDS.contains(&options.speed)) {
+        return Err(Error::unsupported("speed must be between 0.25× and 4×"));
+    }
+    // ffmpeg's `reverse` buffers the whole (already shrunk) clip.
+    let defaults = animation_defaults(format);
+    if animated
+        && options.direction != Direction::Forward
+        && animation_bytes(input, options, defaults, trim).is_some_and(|b| b > FRAME_MEMORY_BUDGET)
+    {
+        return Err(Error::unsupported(
+            "this clip is too long to play backwards: trim it, or lower the size or frame rate",
+        ));
+    }
+    let untouched = is_untouched(input, options);
+    // Photo metadata that ffmpeg's -map_metadata can't reach (see
+    // crate::scrub): it has to be cleaned out of a JPEG or PNG on the way.
+    let scrub = photo_scrub(input, options.metadata);
 
-    // Single-tool shortcuts for unedited files. libjxl does these best: they
-    // keep metadata, colour profiles, high bit depth and, for JPEG, the
-    // original bitstream.
+    let mut steps = Vec::new();
+    let mut scratch = Vec::new();
+
+    // Shortcuts for unedited files. libjxl does these best: they keep colour
+    // profiles, high bit depth and, for JPEG, the original bitstream. Its
+    // tools copy metadata as is, so JPEG and PNG get cleaned first or after.
     if untouched && format == OutputFormat::Jxl && jxl.cjxl {
         let ext = input.extension.as_deref().unwrap_or_default();
         let fits = !animated
-            || animation_bytes(input, options, None, None, trim)
-                .is_none_or(|b| b <= CJXL_MEMORY_BUDGET);
-        if CJXL_INPUTS.contains(&ext) && fits {
-            let jpeg = matches!(ext, "jpg" | "jpeg");
-            return Ok(Plan::single(
-                cjxl_step(&input.path, output, options, jpeg, 1.0),
-                output,
-            ));
+            || animation_bytes(input, options, (None, None), trim)
+                .is_none_or(|b| b <= FRAME_MEMORY_BUDGET);
+        let jpeg = matches!(ext, "jpg" | "jpeg");
+        let cleanable = jpeg || matches!(ext, "png" | "apng");
+        // GIFs hold no EXIF; JPEG XL input with metadata to drop is decoded.
+        if CJXL_INPUTS.contains(&ext) && fits && (scrub.is_none() || cleanable || ext == "gif") {
+            let source = match scrub.filter(|_| cleanable) {
+                Some(metadata) => {
+                    let cleaned = scratch_path(output, "clean", ext);
+                    steps.push(scrub_step(&input.path, &cleaned, metadata));
+                    scratch.push(cleaned.clone());
+                    cleaned
+                }
+                None => input.path.clone(),
+            };
+            steps.push(cjxl_step(&source, output, options, jpeg, 1.0));
+            return Ok(Plan {
+                steps,
+                output: output.to_path_buf(),
+                scratch,
+                writes: Vec::new(),
+            });
         }
     }
     if untouched && jxl_in && jxl.djxl && input.kind == MediaKind::Image {
         let restore_jpeg = format == OutputFormat::Jpg && input.reconstructs_jpeg;
         if format == OutputFormat::Png || restore_jpeg {
-            let mut args = vec![input.path.clone().into_os_string(), output.into()];
+            let decoded = match scrub {
+                Some(_) => {
+                    let decoded = scratch_path(output, "decoded", format.extension());
+                    scratch.push(decoded.clone());
+                    decoded
+                }
+                None => output.to_path_buf(),
+            };
+            let mut args = vec![input.path.clone().into_os_string(), decoded.clone().into()];
             if restore_jpeg {
                 args.push("--reconstruct_jpeg".into());
             }
             args.push("--quiet".into());
-            return Ok(Plan::single(
-                Step {
-                    tool: Tool::Djxl,
-                    args,
-                    duration_secs: None,
-                    weight: 1.0,
-                },
-                output,
-            ));
+            steps.push(Step {
+                tool: Tool::Djxl,
+                args,
+                duration_secs: None,
+                weight: 1.0,
+            });
+            if let Some(metadata) = scrub {
+                steps.push(scrub_step(&decoded, output, metadata));
+            }
+            return Ok(Plan {
+                steps,
+                output: output.to_path_buf(),
+                scratch,
+                writes: Vec::new(),
+            });
         }
     }
-
-    let mut steps = Vec::new();
-    let mut scratch = Vec::new();
 
     // JPEG XL that ffmpeg can't decode: let djxl unpack it to (A)PNG first.
     let mut source = input.clone();
@@ -466,22 +658,19 @@ pub fn plan(
         source.path = decoded.clone();
         source.extension = Some(ext.into());
         source.video_codec = Some(ext.into());
+        // Whether djxl's PNG keeps HDR tags is up to libjxl; don't guess.
+        source.hdr = false;
+        source.tile_grid = None;
         scratch.push(decoded);
     }
 
     if format == OutputFormat::Jxl {
+        // cjxl holds the whole animation, both halves of a boomerang.
         let raw_bytes = animated
-            .then(|| {
-                animation_bytes(
-                    input,
-                    options,
-                    Some(ANIMATED_JXL_MAX_SIZE),
-                    Some(ANIMATED_JXL_FPS),
-                    trim,
-                )
-            })
-            .flatten();
-        let too_big_for_cjxl = raw_bytes.is_some_and(|b| b > CJXL_MEMORY_BUDGET);
+            .then(|| animation_bytes(input, options, defaults, trim))
+            .flatten()
+            .map(|b| b * options.direction.passes());
+        let too_big_for_cjxl = raw_bytes.is_some_and(|b| b > FRAME_MEMORY_BUDGET);
         let ffmpeg_can = if animated {
             jxl.ffmpeg_anim_encoder
         } else {
@@ -502,11 +691,71 @@ pub fn plan(
                 trim,
                 Sink::Frames { animated },
                 &frames,
+                tone_map,
             ));
+            scratch.push(frames.clone());
+            let frames = match scrub.filter(|_| !animated) {
+                Some(metadata) => {
+                    let cleaned = scratch_path(output, "clean", ext);
+                    steps.push(scrub_step(&frames, &cleaned, metadata));
+                    scratch.push(cleaned.clone());
+                    cleaned
+                }
+                None => frames,
+            };
             steps.push(cjxl_step(&frames, output, options, false, 0.6));
-            scratch.push(frames);
+        } else if let (true, Some(metadata)) = (ffmpeg_can && !animated, scrub) {
+            // ffmpeg's libjxl writes the EXIF it decoded: edit into a PNG,
+            // clean that, then encode it as it is.
+            let frames = scratch_path(output, "frames", "png");
+            let cleaned = scratch_path(output, "clean", "png");
+            steps.push(ffmpeg_step(
+                &source,
+                options,
+                trim,
+                Sink::Frames { animated: false },
+                &frames,
+                tone_map,
+            ));
+            steps.push(scrub_step(&frames, &cleaned, metadata));
+            let (width, height) = output_dims(input, options, None).unzip();
+            let edited = MediaInfo {
+                path: cleaned.clone(),
+                extension: Some("png".into()),
+                width,
+                height,
+                video_codec: Some("png".into()),
+                has_location: false,
+                location_tags: Vec::new(),
+                // Already stitched together and tone-mapped by the first pass.
+                tile_grid: None,
+                hdr: false,
+                ..source.clone()
+            };
+            let as_is = ConvertOptions {
+                trim_start: None,
+                trim_end: None,
+                max_size: None,
+                fps: None,
+                rotate: 0,
+                flip: false,
+                crop: None,
+                metadata: Metadata::Keep,
+                ..options.clone()
+            };
+            let mut encode = ffmpeg_step(&edited, &as_is, (0.0, None), Sink::Output, output, false);
+            encode.weight = 0.6;
+            steps.push(encode);
+            scratch.extend([frames, cleaned]);
         } else if ffmpeg_can {
-            steps.push(ffmpeg_step(&source, options, trim, Sink::Output, output));
+            steps.push(ffmpeg_step(
+                &source,
+                options,
+                trim,
+                Sink::Output,
+                output,
+                tone_map,
+            ));
         } else if animated {
             return Err(Error::unsupported(
                 "animated JPEG XL needs cjxl from libjxl or an ffmpeg with the libjxl_anim encoder",
@@ -516,8 +765,28 @@ pub fn plan(
                 "writing JPEG XL needs cjxl from libjxl or an ffmpeg built with libjxl",
             ));
         }
+    } else if let (OutputFormat::Png, Some(metadata)) = (format, scrub) {
+        // ffmpeg's PNG encoder writes the EXIF it decoded.
+        let encoded = scratch_path(output, "encoded", "png");
+        steps.push(ffmpeg_step(
+            &source,
+            options,
+            trim,
+            Sink::Output,
+            &encoded,
+            tone_map,
+        ));
+        steps.push(scrub_step(&encoded, output, metadata));
+        scratch.push(encoded);
     } else {
-        steps.push(ffmpeg_step(&source, options, trim, Sink::Output, output));
+        steps.push(ffmpeg_step(
+            &source,
+            options,
+            trim,
+            Sink::Output,
+            output,
+            tone_map,
+        ));
     }
 
     Ok(Plan {
@@ -538,12 +807,16 @@ enum Sink {
 }
 
 /// The ffmpeg call that applies the edits in `options` to `input` and writes `out`.
+///
+/// `tone_map` says whether this ffmpeg can turn HDR into SDR; it is used for
+/// HDR input written as pictures or GIFs, which can't hold HDR.
 fn ffmpeg_step(
     input: &MediaInfo,
     options: &ConvertOptions,
     (start, end): (f64, Option<f64>),
     sink: Sink,
     out: &Path,
+    tone_map: bool,
 ) -> Step {
     let format = options.format;
     let animated = format.animates(input.kind);
@@ -551,6 +824,14 @@ fn ffmpeg_step(
         MediaKind::Video
     } else {
         format.kind()
+    };
+    let tone_map =
+        tone_map && input.hdr && (format == OutputFormat::Gif || format.kind() == MediaKind::Image);
+    let tone_mapped = |mut filters: Vec<String>| {
+        if tone_map {
+            filters.insert(0, TONE_MAP_FILTER.to_owned());
+        }
+        filters
     };
     let mut args: Vec<OsString> = Vec::new();
     let mut push = |items: &[&str]| args.extend(items.iter().map(OsString::from));
@@ -560,20 +841,48 @@ fn ffmpeg_step(
     // (the decoder then fails); those short clips are decoded from the start.
     let timed_input = input.kind != MediaKind::Image;
     let seek_input = !is_jxl(input);
+    // A new speed or direction retimes the output, so output-side -ss/-t
+    // would cut the wrong part: the range is limited on the input instead
+    // (or by a trim filter where the input can't seek).
+    let retimed = animated && options.changes_playback();
+    let trim_end = end.filter(|_| options.trim_end.is_some());
+    let mut lead_trim = None;
     if timed_input && start > 0.0 && seek_input {
         push(&["-ss", &format_secs(start)]);
     }
+    if timed_input && retimed {
+        if let Some(end) = trim_end {
+            let read = if seek_input { end - start } else { end };
+            push(&["-t", &format_secs(read)]);
+        }
+        if start > 0.0 && !seek_input {
+            lead_trim = Some(start);
+        }
+    }
     push(&["-i"]);
     args.push(input.path.clone().into_os_string());
-    if timed_input && start > 0.0 && !seek_input {
+    if timed_input && start > 0.0 && !seek_input && !retimed {
         args.extend(["-ss".into(), format_secs(start).into()]);
     }
+    // Where the kept range starts on the filters' clock: 0 after an input
+    // seek or a lead trim, the trim start after an output seek.
+    let t0 = if timed_input && !seek_input && !retimed {
+        start
+    } else {
+        0.0
+    };
     let duration_secs = if timed_input && out_kind != MediaKind::Image {
-        let end = end.or(input.duration_secs);
-        if let Some(end) = end.filter(|_| options.trim_end.is_some()) {
+        if let Some(end) = trim_end.filter(|_| !retimed) {
             args.extend(["-t".into(), format_secs(end - start).into()]);
         }
-        end.map(|end| (end - start).max(0.0))
+        end.or(input.duration_secs).map(|end| {
+            let kept = (end - start).max(0.0);
+            if animated {
+                kept / options.speed * options.direction.passes()
+            } else {
+                kept
+            }
+        })
     } else {
         None
     };
@@ -583,34 +892,33 @@ fn ffmpeg_step(
 
     match (format, sink) {
         (OutputFormat::Jxl, Sink::Frames { animated }) => {
-            let filters = animation_filters(input, options);
+            let filters = tone_mapped(animation_filters(input, options, lead_trim));
             if animated {
-                push(&["-map", "0:v:0"]);
-                if !filters.is_empty() {
-                    push(&["-vf", &filters.join(",")]);
-                }
+                push_video(&mut push, input, &[], &filters);
                 // Fast zlib: this file only lives until cjxl has read it.
                 push(&["-c:v", "apng", "-compression_level", "1", "-plays", "0"]);
                 push(&["-an", "-sn", "-dn", "-f", "apng"]);
             } else {
-                push(&["-map", "0:v:0", "-frames:v", "1"]);
-                if !filters.is_empty() {
-                    push(&["-vf", &filters.join(",")]);
-                }
+                push_video(&mut push, input, &["-frames:v", "1"], &filters);
                 push(&["-c:v", "png", "-compression_level", "1"]);
                 push(&["-update", "1", "-an", "-sn", "-dn"]);
             }
         }
         (_, Sink::Frames { .. }) => unreachable!("only JPEG XL goes through intermediate frames"),
         (OutputFormat::Mp4 | OutputFormat::Mov | OutputFormat::Mkv | OutputFormat::Webm, _) => {
-            push(&["-map", "0:v:0"]);
             let keep_audio = options.keep_audio && input.has_audio();
+            let audio: &[&str] = if keep_audio { &["-map", "0:a:0"] } else { &[] };
+            let mut filters = video_filters(input, options, None, true);
             if keep_audio {
-                push(&["-map", "0:a:0"]);
+                // The sound's fades take the picture along, from and to black.
+                filters.extend(fades("fade", options.sound, t0, duration_secs));
             }
-            let filters = video_filters(input, options, None, true);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
+            push_video(&mut push, input, audio, &filters);
+            if keep_audio {
+                let audio = audio_filters(input, options.sound, t0, duration_secs);
+                if !audio.is_empty() {
+                    push(&["-af", &audio.join(",")]);
+                }
             }
             push_video_encoder(&mut push, format, q);
             if keep_audio {
@@ -628,44 +936,26 @@ fn ffmpeg_step(
             }
         }
         (OutputFormat::Gif, _) => {
-            let mut filters = video_filters(input, options, Some(GIF_MAX_SIZE), false);
-            if options.fps.is_none() && input.fps.is_none_or(|fps| fps > GIF_FPS) {
-                filters.push(format!("fps={GIF_FPS}"));
-            }
+            let mut filters = tone_mapped(animation_filters(input, options, lead_trim));
             let colors = lerp(q, 32.0, 256.0);
             filters.push(format!(
                 "split[a][b];[a]palettegen=max_colors={colors}:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4"
             ));
-            push(&[
-                "-map",
-                "0:v:0",
-                "-vf",
-                &filters.join(","),
-                "-loop",
-                "0",
-                "-an",
-                "-sn",
-                "-dn",
-            ]);
+            push_video(&mut push, input, &[], &filters);
+            push(&["-loop", "0", "-an", "-sn", "-dn"]);
         }
         (OutputFormat::Jxl, Sink::Output) if animated => {
             // ffmpeg's libjxl_anim emits the codestream frame by frame; the
             // data muxer writes the packets back to back as one file.
-            let filters = animation_filters(input, options);
-            push(&["-map", "0:v:0"]);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
-            }
+            let filters = tone_mapped(animation_filters(input, options, lead_trim));
+            push_video(&mut push, input, &[], &filters);
             push(&["-c:v", "libjxl_anim"]);
             push_ffmpeg_jxl(&mut push, options);
             push(&["-an", "-sn", "-dn", "-f", "data"]);
         }
         (OutputFormat::Webp, Sink::Output) if animated => {
-            let filters = animation_filters(input, options);
-            push(&["-map", "0:v:0"]);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
-            }
+            let filters = tone_mapped(animation_filters(input, options, lead_trim));
+            push_video(&mut push, input, &[], &filters);
             push_animated_webp(&mut push, q);
             push(&["-an", "-sn", "-dn"]);
         }
@@ -678,6 +968,10 @@ fn ffmpeg_step(
             _,
         ) => {
             push(&["-map", "0:a:0", "-vn", "-sn", "-dn"]);
+            let audio = audio_filters(input, options.sound, t0, duration_secs);
+            if !audio.is_empty() {
+                push(&["-af", &audio.join(",")]);
+            }
             match format {
                 OutputFormat::Mp3 => {
                     let vbr = lerp(q, 7.0, 0.0).to_string();
@@ -701,11 +995,8 @@ fn ffmpeg_step(
             Sink::Output,
         ) => {
             let needs_even = format == OutputFormat::Avif;
-            let filters = video_filters(input, options, None, needs_even);
-            push(&["-map", "0:v:0", "-frames:v", "1"]);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
-            }
+            let filters = tone_mapped(video_filters(input, options, None, needs_even));
+            push_video(&mut push, input, &["-frames:v", "1"], &filters);
             match format {
                 OutputFormat::Png => push(&["-c:v", "png"]),
                 OutputFormat::Jpg => {
@@ -734,8 +1025,18 @@ fn ffmpeg_step(
         }
     }
 
-    if !options.keep_metadata {
-        args.extend(["-map_metadata", "-1", "-map_chapters", "-1"].map(OsString::from));
+    match options.metadata {
+        Metadata::Keep => {}
+        // Videos keep their place in container tags, e.g. `location` or
+        // `com.apple.quicktime.location.ISO6709`; an empty value deletes one.
+        Metadata::NoLocation => {
+            for tag in &input.location_tags {
+                args.extend(["-metadata".into(), format!("{tag}=").into()]);
+            }
+        }
+        Metadata::None => {
+            args.extend(["-map_metadata", "-1", "-map_chapters", "-1"].map(OsString::from));
+        }
     }
     args.push(out.as_os_str().to_owned());
     let weight = if matches!(sink, Sink::Frames { .. }) {
@@ -748,6 +1049,108 @@ fn ffmpeg_step(
         args,
         duration_secs,
         weight,
+    }
+}
+
+/// Whether photo metadata must be cleaned out of JPEG or PNG files on the
+/// way, and how. Only stills carry EXIF; with all but the location kept, only
+/// files known to have a location need it.
+fn photo_scrub(input: &MediaInfo, metadata: Metadata) -> Option<Metadata> {
+    let needed = match metadata {
+        Metadata::Keep => false,
+        Metadata::NoLocation => input.has_location,
+        Metadata::None => true,
+    };
+    (needed && input.kind == MediaKind::Image).then_some(metadata)
+}
+
+/// The built-in step that copies `input` to `output` without the metadata
+/// `metadata` rules out.
+fn scrub_step(input: &Path, output: &Path, metadata: Metadata) -> Step {
+    Step {
+        tool: Tool::Scrub,
+        args: crate::scrub::step_args(input, output, metadata),
+        duration_secs: None,
+        weight: 0.05,
+    }
+}
+
+/// Loudness, fade and resampling filters for the sound. `t0` is where the
+/// kept range starts on the filters' clock and `length` how long it is.
+fn audio_filters(
+    input: &MediaInfo,
+    sound: SoundOptions,
+    t0: f64,
+    length: Option<f64>,
+) -> Vec<String> {
+    let mut filters = Vec::new();
+    // Normalize first: fading afterwards keeps loudnorm from lifting the fades.
+    if sound.normalize {
+        filters.push(LOUDNORM.to_owned());
+    }
+    filters.extend(fades("afade", sound, t0, length));
+    if sound.normalize {
+        // loudnorm resamples to 192 kHz and passes that on. Asking for the
+        // source rate in the graph rather than with -ar lets ffmpeg settle on
+        // the nearest rate the encoder takes (Opus only does 48 kHz).
+        let rate = input.sample_rate.unwrap_or(FALLBACK_SAMPLE_RATE);
+        filters.push(format!("aresample={rate}"));
+    }
+    filters
+}
+
+/// Fade-in and fade-out with ffmpeg's `fade` (picture) or `afade` (sound)
+/// filter. A fade-out needs the output's `length`, and neither fade runs
+/// longer than the clip.
+fn fades(filter: &str, sound: SoundOptions, t0: f64, length: Option<f64>) -> Vec<String> {
+    let mut filters = Vec::new();
+    let fade_in = length.map_or(sound.fade_in, |l| sound.fade_in.min(l));
+    if fade_in > 0.0 {
+        let st = if t0 > 0.0 {
+            format!(":st={}", format_secs(t0))
+        } else {
+            String::new()
+        };
+        filters.push(format!("{filter}=t=in{st}:d={}", format_secs(fade_in)));
+    }
+    if let Some(length) = length {
+        let fade_out = sound.fade_out.min(length);
+        if fade_out > 0.0 {
+            filters.push(format!(
+                "{filter}=t=out:st={}:d={}",
+                format_secs(t0 + length - fade_out),
+                format_secs(fade_out)
+            ));
+        }
+    }
+    filters
+}
+
+/// Pick the picture of `input`, push `extra`, and run `filters` on the picture.
+///
+/// HEIF tile grids come out of a filtergraph ffmpeg builds itself (stitching
+/// the tiles, then applying the rotation), and `-vf` can't be added to that,
+/// so their filters go into a complex filtergraph fed by the grid instead.
+fn push_video(
+    push: &mut impl FnMut(&[&str]),
+    input: &MediaInfo,
+    extra: &[&str],
+    filters: &[String],
+) {
+    let chain = filters.join(",");
+    match input.tile_grid {
+        Some(group) if chain.is_empty() => push(&["-map", &format!("[0:g:{group}]")]),
+        Some(group) => push(&[
+            "-filter_complex",
+            &format!("[0:g:{group}]{chain}[v]"),
+            "-map",
+            "[v]",
+        ]),
+        None => push(&["-map", "0:v:0"]),
+    }
+    push(extra);
+    if input.tile_grid.is_none() && !chain.is_empty() {
+        push(&["-vf", &chain]);
     }
 }
 
@@ -824,68 +1227,101 @@ fn jxl_distance(options: &ConvertOptions) -> String {
     format_secs((distance * 100.0).round() / 100.0)
 }
 
-/// Default short side and frame-rate cap of animated WebP and JPEG XL.
-fn animation_limits(format: OutputFormat) -> (u32, f64) {
-    if format == OutputFormat::Webp {
-        (ANIMATED_WEBP_MAX_SIZE, ANIMATED_WEBP_FPS)
-    } else {
-        (ANIMATED_JXL_MAX_SIZE, ANIMATED_JXL_FPS)
+/// The size and frame-rate caps an animation gets when the user picks none.
+fn animation_defaults(format: OutputFormat) -> (Option<u32>, Option<f64>) {
+    match format {
+        OutputFormat::Gif => (Some(GIF_MAX_SIZE), Some(GIF_FPS)),
+        OutputFormat::Jxl => (Some(ANIMATED_JXL_MAX_SIZE), Some(ANIMATED_JXL_FPS)),
+        OutputFormat::Webp => (Some(ANIMATED_WEBP_MAX_SIZE), Some(ANIMATED_WEBP_FPS)),
+        _ => (None, None),
     }
 }
 
-/// Filters for WebP or JPEG XL, animated or still: like [`video_filters`],
-/// plus the default size and frame-rate caps of animations.
-fn animation_filters(input: &MediaInfo, options: &ConvertOptions) -> Vec<String> {
+/// Filters for GIFs and JPEG XL (animated or still), minus the GIF palette.
+///
+/// Animations run: trim (`lead_trim`, where the input couldn't seek) →
+/// speed → frame-rate cap → turn, mirror and shrink → reverse or boomerang.
+/// Speeding up before the cap means 2× also makes the file smaller, and
+/// reversing last means `reverse` buffers the smallest frames.
+fn animation_filters(
+    input: &MediaInfo,
+    options: &ConvertOptions,
+    lead_trim: Option<f64>,
+) -> Vec<String> {
     if !options.format.animates(input.kind) {
         return video_filters(input, options, None, false);
     }
-    let (max_size, max_fps) = animation_limits(options.format);
-    let mut filters = video_filters(input, options, Some(max_size), false);
-    if options.fps.is_none() && input.fps.is_none_or(|fps| fps > max_fps + 0.01) {
-        filters.push(format!("fps={}", format_secs(max_fps)));
+    let (default_max, default_fps) = animation_defaults(options.format);
+    let mut filters = Vec::new();
+    if let Some(start) = lead_trim {
+        filters.push(format!(
+            "trim=start={},setpts=PTS-STARTPTS",
+            format_secs(start)
+        ));
+    }
+    let speed = options.speed;
+    if (speed - 1.0).abs() > 1e-9 {
+        filters.push(format!("setpts=(PTS-STARTPTS)/{}", format_secs(speed)));
+    }
+    let source_fps = input.fps.map(|fps| fps * speed);
+    if let Some(fps) = fps_filter(options.fps.or(default_fps), source_fps) {
+        filters.push(fps);
+    }
+    filters.extend(picture_filters(input, options, default_max, false));
+    match options.direction {
+        Direction::Forward => {}
+        Direction::Reverse => filters.push("reverse".to_owned()),
+        // The way back skips both turnaround frames (the last one, and the
+        // first, which the loop shows next), or the loop visibly stutters.
+        Direction::Boomerang => filters.push(
+            "split[fwd][back];[back]trim=start_frame=1,reverse,trim=start_frame=1,setpts=PTS-STARTPTS[rev];[fwd][rev]concat=n=2:v=1:a=0".to_owned(),
+        ),
     }
     filters
 }
 
 /// Whether the options leave the picture exactly as it is: no trim, turn,
-/// mirror, downscale or frame-rate change.
+/// mirror, crop, downscale, frame-rate change or (for animations) new speed
+/// or direction.
 fn is_untouched(input: &MediaInfo, options: &ConvertOptions) -> bool {
     let untrimmed = options.trim_start.is_none_or(|s| s <= 0.0) && options.trim_end.is_none();
+    let replayed = options.format.animates(input.kind) && options.changes_playback();
     (input.kind == MediaKind::Image || untrimmed)
+        && !replayed
         && video_filters(input, options, None, false).is_empty()
 }
 
-/// Rough size of every decoded frame of an animation at 4 bytes per pixel,
-/// or `None` if the size, rate or length is unknown.
+/// Rough size of every decoded frame of one pass through an animation at 4
+/// bytes per pixel, or `None` if the size, rate or length is unknown.
 fn animation_bytes(
     input: &MediaInfo,
     options: &ConvertOptions,
-    default_max: Option<u32>,
-    default_fps: Option<f64>,
+    (default_max, default_fps): (Option<u32>, Option<f64>),
     (start, end): (f64, Option<f64>),
 ) -> Option<f64> {
     let (w, h) = output_dims(input, options, default_max)?;
-    let source_fps = input.fps?;
+    let speed = options.speed;
+    let source_fps = input.fps? * speed;
     let fps = options
         .fps
         .or(default_fps)
         .map_or(source_fps, |fps| fps.min(source_fps));
-    let length = end.or(input.duration_secs)? - start;
+    let length = (end.or(input.duration_secs)? - start) / speed;
     Some(f64::from(w) * f64::from(h) * 4.0 * fps * length.max(0.0))
 }
 
-/// Picture size after rotation and downscaling, if the source size is known.
+/// Picture size after rotation, cropping and downscaling, if the source size
+/// is known.
 fn output_dims(
     input: &MediaInfo,
     options: &ConvertOptions,
     default_max: Option<u32>,
 ) -> Option<(u32, u32)> {
-    let (w, h) = input.width.zip(input.height)?;
-    let (w, h) = if options.rotate % 180 == 90 {
-        (h, w)
-    } else {
-        (w, h)
-    };
+    let (w, h) = turned_dims(input, options)?;
+    let (w, h) = options
+        .crop
+        .and_then(|crop| crop_box(w, h, &crop, false))
+        .map_or((w, h), |b| (b.width, b.height));
     let target = options.max_size.or(default_max).map(|t| t.max(2) & !1);
     Some(match target {
         Some(t) if t < w.min(h) => {
@@ -912,22 +1348,89 @@ pub(crate) fn scratch_path(output: &Path, tag: &str, ext: &str) -> PathBuf {
 /// `taken` lets the caller rule out paths that are reserved but not yet on disk.
 #[must_use]
 pub fn output_path(input: &Path, format: OutputFormat, taken: impl Fn(&Path) -> bool) -> PathBuf {
-    let dir = input.parent().unwrap_or_else(|| Path::new(""));
-    let stem = input
-        .file_stem()
-        .map_or_else(|| "converted".into(), |s| s.to_string_lossy().into_owned());
-    free_path(dir, &stem, format, |p| p == input || taken(p))
+    free_path(input, &file_stem(input), format.extension(), taken)
 }
 
-/// The first of `dir/stem.ext`, `dir/stem 2.ext`, … that is not on disk and
-/// not `taken`.
+/// Frame rate assumed for a video that doesn't say.
+const FALLBACK_FPS: f64 = 30.0;
+
+/// Plan saving the frame of `input` at `at_secs` as a PNG, with the crop,
+/// turn, mirror, size and metadata choices of `options`. Their trim, frame
+/// rate, speed, direction, sound and format don't apply.
+///
+/// ffmpeg takes the first frame at or after `at_secs`, as
+/// [`crate::Ffmpeg::frame`] does for the preview, so the saved frame is the
+/// one on screen. A time past the last frame saves the last frame.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] if `input` is not a video, `at_secs` is not a
+/// positive number, or the options are invalid (see [`plan`]).
+pub fn frame_plan(
+    input: &MediaInfo,
+    options: &ConvertOptions,
+    at_secs: f64,
+    output: &Path,
+    support: impl Into<Support>,
+) -> Result<Plan> {
+    if input.kind != MediaKind::Video {
+        return Err(Error::unsupported("only videos have frames to save"));
+    }
+    if !at_secs.is_finite() || at_secs < 0.0 {
+        return Err(Error::unsupported(
+            "the frame time must be a positive number",
+        ));
+    }
+    // Seeking to the very end finds no frame to grab.
+    let last = input
+        .duration_secs
+        .map(|d| (d - 1.0 / input.fps.unwrap_or(FALLBACK_FPS)).max(0.0));
+    let at = last.map_or(at_secs, |last| at_secs.min(last));
+    let still = ConvertOptions {
+        format: OutputFormat::Png,
+        trim_start: (at > 0.0).then_some(at),
+        trim_end: None,
+        fps: None,
+        keep_audio: false,
+        sound: SoundOptions::default(),
+        speed: 1.0,
+        direction: Direction::Forward,
+        ..options.clone()
+    };
+    plan(input, &still, output, support)
+}
+
+/// Pick a free name for the frame at `at_secs` next to `input`:
+/// `clip-frame-0m12s.png`, then `clip-frame-0m12s 2.png`, …
+#[must_use]
+pub fn frame_output_path(input: &Path, at_secs: f64, taken: impl Fn(&Path) -> bool) -> PathBuf {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let whole = at_secs.max(0.0).floor() as u64;
+    let (h, m, s) = (whole / 3600, whole / 60 % 60, whole % 60);
+    let stamp = if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else {
+        format!("{m}m{s:02}s")
+    };
+    let stem = format!("{}-frame-{stamp}", file_stem(input));
+    free_path(input, &stem, OutputFormat::Png.extension(), taken)
+}
+
+fn file_stem(input: &Path) -> String {
+    input
+        .file_stem()
+        .map_or_else(|| "converted".into(), |s| s.to_string_lossy().into_owned())
+}
+
+/// `{stem}.{ext}` next to `input`, or `{stem} 2.{ext}`, `{stem} 3.{ext}`, …,
+/// whichever is first neither `input`, on disk, nor `taken`.
 pub(crate) fn free_path(
-    dir: &Path,
+    input: &Path,
     stem: &str,
-    format: OutputFormat,
+    ext: &str,
     taken: impl Fn(&Path) -> bool,
 ) -> PathBuf {
-    let ext = format.extension();
+    let dir = input.parent().unwrap_or_else(|| Path::new(""));
     (1..)
         .map(|n| {
             let name = if n == 1 {
@@ -937,7 +1440,7 @@ pub(crate) fn free_path(
             };
             dir.join(name)
         })
-        .find(|candidate| !candidate.exists() && !taken(candidate))
+        .find(|candidate| candidate != input && !candidate.exists() && !taken(candidate))
         .expect("an unbounded range always yields a free name")
 }
 
@@ -966,9 +1469,104 @@ fn trim_range(input: &MediaInfo, options: &ConvertOptions) -> Result<(f64, Optio
     Ok((start, end))
 }
 
-/// Rotate, flip, downscale and frame-rate filters, in that order.
+fn validate_crop(crop: &Crop) -> Result<()> {
+    if crop
+        .aspect
+        .is_some_and(|[w, h]| w == 0 || h == 0 || w > 1000 || h > 1000)
+    {
+        return Err(Error::unsupported(
+            "the crop shape must be two whole numbers like 9:16",
+        ));
+    }
+    if let Some(a) = crop.area {
+        let parts = [a.x, a.y, a.width, a.height];
+        // A little slack for rounding in the front end.
+        let inside = parts
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0 + 1e-6).contains(v))
+            && a.x + a.width <= 1.0 + 1e-6
+            && a.y + a.height <= 1.0 + 1e-6;
+        if !inside || a.width <= 0.0 || a.height <= 0.0 {
+            return Err(Error::unsupported("the crop must lie inside the picture"));
+        }
+    }
+    Ok(())
+}
+
+/// Display size after our rotation, if known.
+fn turned_dims(input: &MediaInfo, options: &ConvertOptions) -> Option<(u32, u32)> {
+    let (w, h) = input.width.zip(input.height)?;
+    Some(if options.rotate % 180 == 90 {
+        (h, w)
+    } else {
+        (w, h)
+    })
+}
+
+/// The crop in pixels of a `w`×`h` picture, or `None` when it keeps the
+/// whole picture.
 ///
-/// `default_max` caps the short side when the user picked no size (GIFs).
+/// With an aspect, the largest box of that shape inside the area is kept,
+/// centred on the area, so the result has the exact shape even when the
+/// area's fractions round unevenly. `even` rounds the size down to even
+/// numbers, which yuv420p encoders need.
+fn crop_box(w: u32, h: u32, crop: &Crop, even: bool) -> Option<CropBox> {
+    let area = crop.area.unwrap_or(CropArea::FULL);
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let px = |v: f64, max: u32| (v.round().max(1.0) as u32).min(max);
+    let mut width = px(area.width * fw, w);
+    let mut height = px(area.height * fh, h);
+    if let Some([aw, ah]) = crop.aspect {
+        if u64::from(width) * u64::from(ah) <= u64::from(height) * u64::from(aw) {
+            height = px(f64::from(width) * f64::from(ah) / f64::from(aw), height);
+        } else {
+            width = px(f64::from(height) * f64::from(aw) / f64::from(ah), width);
+        }
+    }
+    if (width, height) == (w, h) {
+        return None;
+    }
+    if even {
+        width = (width & !1).max(2).min(w);
+        height = (height & !1).max(2).min(h);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let place = |start: f64, size: f64, kept: u32, total: u32| {
+        let centre = (start + size / 2.0) * f64::from(total);
+        ((centre - f64::from(kept) / 2.0).round().max(0.0) as u32).min(total - kept)
+    };
+    Some(CropBox {
+        width,
+        height,
+        x: place(area.x, area.width, width, w),
+        y: place(area.y, area.height, height, h),
+    })
+}
+
+/// The `crop` filter for a picture of unknown size: the aspect's largest
+/// centred box, or the area as fractions of the input.
+fn crop_expression(crop: &Crop) -> Option<String> {
+    let frac = |v: f64| {
+        let s = format!("{:.6}", v.clamp(0.0, 1.0));
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    };
+    match (crop.aspect, crop.area) {
+        (Some([w, h]), _) => Some(format!("crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})'")),
+        (None, Some(a)) if a != CropArea::FULL => Some(format!(
+            "crop='iw*{}':'ih*{}':'iw*{}':'ih*{}'",
+            frac(a.width),
+            frac(a.height),
+            frac(a.x),
+            frac(a.y)
+        )),
+        (None, _) => None,
+    }
+}
+
+/// Rotate, flip, crop, downscale and frame-rate filters, in that order.
+///
+/// `default_max` caps the short side when the user picked no size.
 /// `even` forces even dimensions, which yuv420p encoders require.
 fn video_filters(
     input: &MediaInfo,
@@ -976,16 +1574,41 @@ fn video_filters(
     default_max: Option<u32>,
     even: bool,
 ) -> Vec<String> {
+    let mut filters = picture_filters(input, options, default_max, even);
+    filters.extend(fps_filter(options.fps, input.fps));
+    filters
+}
+
+/// An `fps` filter for `target`, unless that wouldn't lower `source`.
+fn fps_filter(target: Option<f64>, source: Option<f64>) -> Option<String> {
+    target
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .filter(|&fps| source.is_none_or(|source| fps < source - 0.01))
+        .map(|fps| format!("fps={}", format_secs(fps)))
+}
+
+/// Rotate, flip, crop and downscale filters, in that order.
+fn picture_filters(
+    input: &MediaInfo,
+    options: &ConvertOptions,
+    default_max: Option<u32>,
+    even: bool,
+) -> Vec<String> {
     let mut filters = turn_filters(options);
 
-    // Display size after our rotation.
-    let dims = input.width.zip(input.height).map(|(w, h)| {
-        if options.rotate % 180 == 90 {
-            (h, w)
-        } else {
-            (w, h)
+    // Display size after our rotation, then after the crop.
+    let mut dims = turned_dims(input, options);
+    if let Some(crop) = &options.crop {
+        match dims {
+            Some((w, h)) => {
+                if let Some(b) = crop_box(w, h, crop, even) {
+                    filters.push(format!("crop={}:{}:{}:{}", b.width, b.height, b.x, b.y));
+                    dims = Some((b.width, b.height));
+                }
+            }
+            None => filters.extend(crop_expression(crop)),
         }
-    });
+    }
     let target = options.max_size.or(default_max).map(|t| t.max(2) & !1);
     let scale = match (target, dims) {
         (Some(t), Some((w, h))) if t < w.min(h) => Some(if w >= h {
@@ -1007,11 +1630,6 @@ fn video_filters(
             filters.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_owned());
         }
         None => {}
-    }
-
-    let fps = options.fps.filter(|f| f.is_finite() && *f > 0.0);
-    if let Some(fps) = fps.filter(|&fps| input.fps.is_none_or(|source| fps < source - 0.01)) {
-        filters.push(format!("fps={}", format_secs(fps)));
     }
     filters
 }
@@ -1047,7 +1665,7 @@ fn tiered<T>(quality: u8, tiers: [T; 3]) -> T {
     }
 }
 
-pub(crate) fn kind_noun(kind: MediaKind) -> &'static str {
+fn kind_noun(kind: MediaKind) -> &'static str {
     match kind {
         MediaKind::Image => "an image",
         MediaKind::Video => "a video",
@@ -1085,7 +1703,12 @@ mod tests {
             fps: Some(30.0),
             video_codec: Some("h264".into()),
             audio_codec: Some("aac".into()),
+            sample_rate: Some(44_100),
             reconstructs_jpeg: false,
+            hdr: false,
+            has_location: false,
+            location_tags: Vec::new(),
+            tile_grid: None,
             orientation: None,
         }
     }
@@ -1159,6 +1782,179 @@ mod tests {
         assert!(!cmd.contains("0:a:0"), "{cmd}");
     }
 
+    fn cropped(aspect: Option<[u32; 2]>, area: Option<[f64; 4]>) -> Option<Crop> {
+        Some(Crop {
+            aspect,
+            area: area.map(|[x, y, width, height]| CropArea {
+                x,
+                y,
+                width,
+                height,
+            }),
+        })
+    }
+
+    #[test]
+    fn vertical_crop_keeps_the_centre_and_skips_needless_scaling() {
+        let options = ConvertOptions {
+            crop: cropped(Some([9, 16]), None),
+            max_size: Some(720),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("wide.mov"), &options, "/clips/wide.mp4");
+        // 1080 × 9/16 = 607.5, rounded to 608 and centred; 608 is already under 720.
+        assert!(cmd.contains(" -vf crop=608:1080:656:0 "), "{cmd}");
+    }
+
+    #[test]
+    fn crop_follows_turn_and_mirror_and_stays_exact() {
+        let mut input = video("phone.mp4");
+        (input.width, input.height) = (Some(1080), Some(1920));
+        let options = ConvertOptions {
+            format: OutputFormat::Webm,
+            rotate: 90,
+            flip: true,
+            // A hair short of square at the right edge: 1080×1079 px.
+            crop: cropped(Some([1, 1]), Some([0.4374, 0.0, 0.5626, 0.999])),
+            max_size: Some(480),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &options, "/clips/phone.webm");
+        assert!(
+            // Square, rounded to even sizes, and kept inside the picture.
+            cmd.contains(" -vf transpose=clock,hflip,crop=1078:1078:841:0,scale=-2:480 "),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn free_crop_rounds_to_even_sizes_for_video_but_not_png() {
+        let crop = cropped(None, Some([0.1, 0.2, 0.3001, 0.4]));
+        let mp4 = ConvertOptions {
+            crop,
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &mp4, "/clips/a.mp4");
+        // 0.3001 × 1920 = 576.2 → 576; 0.4 × 1080 = 432.
+        assert!(cmd.contains(" -vf crop=576:432:192:216 "), "{cmd}");
+
+        let mut photo = video("odd.png");
+        photo.kind = MediaKind::Image;
+        (photo.width, photo.height) = (Some(1001), Some(1001));
+        let png = ConvertOptions {
+            format: OutputFormat::Png,
+            crop: cropped(None, Some([0.0, 0.0, 0.5, 1.0])),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&photo, &png, "/clips/odd 2.png");
+        assert!(cmd.contains(" -vf crop=501:1001:0:0 "), "{cmd}");
+    }
+
+    #[test]
+    fn crop_of_the_whole_picture_changes_nothing() {
+        let options = ConvertOptions {
+            crop: cropped(Some([16, 9]), None),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &options, "/clips/a.mp4");
+        assert!(!cmd.contains("-vf"), "{cmd}");
+        let free = ConvertOptions {
+            crop: cropped(None, None),
+            ..ConvertOptions::default()
+        };
+        assert!(!command(&video("a.mov"), &free, "/clips/a.mp4").contains("-vf"));
+    }
+
+    #[test]
+    fn crop_without_a_known_size_uses_expressions() {
+        let mut input = video("mystery.mov");
+        (input.width, input.height) = (None, None);
+        let options = ConvertOptions {
+            crop: cropped(Some([1, 1]), Some([0.2, 0.0, 0.5, 1.0])),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &options, "/clips/mystery.mp4");
+        assert!(
+            cmd.contains(
+                "-vf 'crop='\\''min(iw,ih*1/1)'\\'':'\\''min(ih,iw*1/1)'\\'',scale=trunc(iw/2)*2:trunc(ih/2)*2'"
+            ),
+            "{cmd}"
+        );
+        let free = ConvertOptions {
+            crop: cropped(None, Some([0.25, 0.0, 0.5, 1.0])),
+            ..ConvertOptions::default()
+        };
+        let plan = plan(
+            &input,
+            &free,
+            Path::new("/clips/m.mp4"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let vf = plan.steps[0]
+            .args
+            .iter()
+            .skip_while(|a| *a != "-vf")
+            .nth(1)
+            .expect("filters");
+        assert_eq!(
+            vf.to_string_lossy(),
+            "crop='iw*0.5':'ih*1':'iw*0.25':'ih*0',scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        );
+    }
+
+    #[test]
+    fn gif_caps_the_size_of_the_cropped_picture() {
+        let options = ConvertOptions {
+            format: OutputFormat::Gif,
+            crop: cropped(Some([9, 16]), None),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &options, "/clips/a.gif");
+        assert!(
+            cmd.contains("-vf 'fps=15,crop=608:1080:656:0,scale=480:-2:flags=lanczos,split"),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn rejects_crops_outside_the_picture_or_without_a_shape() {
+        for crop in [
+            cropped(None, Some([0.6, 0.0, 0.5, 1.0])),
+            cropped(None, Some([0.0, 0.0, 0.0, 1.0])),
+            cropped(None, Some([f64::NAN, 0.0, 0.5, 0.5])),
+            cropped(Some([0, 1]), None),
+        ] {
+            let options = ConvertOptions {
+                crop,
+                ..ConvertOptions::default()
+            };
+            assert!(
+                plan(
+                    &video("a.mov"),
+                    &options,
+                    Path::new("/clips/a.mp4"),
+                    JxlSupport::default()
+                )
+                .is_err(),
+                "{crop:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_crops_from_the_front_end() {
+        let options: ConvertOptions = serde_json::from_value(serde_json::json!({
+            "format": "mp4",
+            "crop": {"aspect": [9, 16], "area": null}
+        }))
+        .expect("parse");
+        assert_eq!(options.crop, cropped(Some([9, 16]), None));
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp4"})).expect("parse");
+        assert_eq!(options.crop, None);
+    }
+
     #[test]
     fn never_upscales_or_raises_fps() {
         let mut input = video("small.mov");
@@ -1191,7 +1987,7 @@ mod tests {
         };
         let cmd = command(&video("loop.mov"), &options, "/clips/loop.gif");
         assert!(
-            cmd.contains("scale=-2:480:flags=lanczos,fps=15,split[a][b]"),
+            cmd.contains("-vf 'fps=15,scale=-2:480:flags=lanczos,split[a][b]"),
             "{cmd}"
         );
         assert!(cmd.contains("palettegen=max_colors=166"), "{cmd}");
@@ -1218,18 +2014,171 @@ mod tests {
             JxlSupport::default(),
         )
         .expect("plan");
-        assert_eq!(
-            plan.command_line(),
-            "ffmpeg -i /clips/loop.mov -t 4 -map 0:v:0 -vf scale=-2:480:flags=lanczos,fps=24 \
-             -c:v libwebp_anim -quality 73 -loop 0 -an -sn -dn /clips/loop.webp"
+        let cmd = plan.command_line();
+        assert!(
+            cmd.contains("-vf fps=24,scale=-2:480:flags=lanczos -c:v libwebp_anim -quality 73 -loop 0 -an -sn -dn"),
+            "{cmd}"
         );
         assert_eq!(plan.duration_secs(), Some(4.0));
+
+        // Played as a boomerang like GIFs and animated JPEG XL.
+        let boomerang = ConvertOptions {
+            direction: Direction::Boomerang,
+            ..options.clone()
+        };
+        let cmd = command(&video("loop.mov"), &boomerang, "/clips/loop.webp");
+        assert!(cmd.contains("reverse"), "{cmd}");
 
         // A picture still makes a still.
         let cmd = command(&image("cat.png", 800, 600), &options, "/clips/cat.webp");
         assert!(
             cmd.contains("-frames:v 1 -c:v libwebp -quality 73"),
             "{cmd}"
+        );
+    }
+
+    fn gif(patch: ConvertOptions) -> ConvertOptions {
+        ConvertOptions {
+            format: OutputFormat::Gif,
+            ..patch
+        }
+    }
+
+    #[test]
+    fn fast_boomerang_gif() {
+        let options = gif(ConvertOptions {
+            trim_start: Some(2.0),
+            trim_end: Some(8.0),
+            speed: 2.0,
+            direction: Direction::Boomerang,
+            ..ConvertOptions::default()
+        });
+        let plan = plan(
+            &video("cat.mov"),
+            &options,
+            Path::new("/clips/cat.gif"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let cmd = plan.command_line();
+        // The range is cut on the input, since the output is retimed.
+        assert!(
+            cmd.starts_with("ffmpeg -ss 2 -t 6 -i /clips/cat.mov -map 0:v:0 -vf "),
+            "{cmd}"
+        );
+        // Speed → fps cap → shrink → boomerang → palette.
+        assert!(
+            cmd.contains(
+                "'setpts=(PTS-STARTPTS)/2,fps=15,scale=-2:480:flags=lanczos,\
+                 split[fwd][back];[back]trim=start_frame=1,reverse,trim=start_frame=1,setpts=PTS-STARTPTS[rev];\
+                 [fwd][rev]concat=n=2:v=1:a=0,split[a][b];"
+            ),
+            "{cmd}"
+        );
+        // 6 s at 2× is 3 s, played there and back.
+        assert_eq!(plan.duration_secs(), Some(6.0));
+    }
+
+    #[test]
+    fn slow_reversed_gif_keeps_the_source_rate() {
+        // At 0.5× a 24 fps clip plays at 12 fps, under the 15 fps cap.
+        let input = MediaInfo {
+            fps: Some(24.0),
+            ..video("cat.mov")
+        };
+        let options = gif(ConvertOptions {
+            speed: 0.5,
+            direction: Direction::Reverse,
+            ..ConvertOptions::default()
+        });
+        let plan = plan(
+            &input,
+            &options,
+            Path::new("/clips/cat.gif"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let cmd = plan.command_line();
+        assert!(
+            cmd.contains("-vf 'setpts=(PTS-STARTPTS)/0.5,scale=-2:480:flags=lanczos,reverse,split"),
+            "{cmd}"
+        );
+        assert_eq!(plan.duration_secs(), Some(84.0));
+    }
+
+    #[test]
+    fn playback_is_ignored_for_videos_and_checked_for_animations() {
+        let options = ConvertOptions {
+            speed: 2.0,
+            direction: Direction::Reverse,
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &options, "/clips/a.mp4");
+        assert!(!cmd.contains("setpts") && !cmd.contains("reverse"), "{cmd}");
+
+        for speed in [0.1, 8.0, f64::NAN] {
+            let err = plan_err(
+                &video("a.mov"),
+                &gif(ConvertOptions {
+                    speed,
+                    ..ConvertOptions::default()
+                }),
+                JxlSupport::default(),
+            );
+            assert!(err.contains("speed"), "{err}");
+        }
+    }
+
+    #[test]
+    fn long_clips_are_refused_backwards() {
+        let input = MediaInfo {
+            duration_secs: Some(3600.0),
+            ..video("long.mov")
+        };
+        let backwards = gif(ConvertOptions {
+            direction: Direction::Reverse,
+            ..ConvertOptions::default()
+        });
+        let err = plan_err(&input, &backwards, JxlSupport::default());
+        assert!(err.contains("backwards"), "{err}");
+
+        // Trimmed, or sped up enough, it fits.
+        let trimmed = ConvertOptions {
+            trim_end: Some(60.0),
+            ..backwards.clone()
+        };
+        assert!(
+            plan(
+                &input,
+                &trimmed,
+                Path::new("/clips/a.gif"),
+                JxlSupport::default()
+            )
+            .is_ok()
+        );
+        let fast = ConvertOptions {
+            trim_end: Some(600.0),
+            speed: 4.0,
+            ..backwards
+        };
+        assert!(
+            plan(
+                &input,
+                &fast,
+                Path::new("/clips/a.gif"),
+                JxlSupport::default()
+            )
+            .is_ok()
+        );
+        // Forward needs no buffer.
+        assert!(
+            plan(
+                &input,
+                &gif(ConvertOptions::default()),
+                Path::new("/clips/a.gif"),
+                JxlSupport::default()
+            )
+            .is_ok()
         );
     }
 
@@ -1401,6 +2350,124 @@ mod tests {
         assert_eq!(options.trim_start, Some(1.5));
         assert_eq!(options.quality, 60);
         assert!(options.keep_audio);
+        assert!((options.speed - 1.0).abs() < f64::EPSILON);
+        assert_eq!(options.direction, Direction::Forward);
+
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"speed": 0.5, "direction": "boomerang"}))
+                .expect("parse");
+        assert_eq!(options.direction, Direction::Boomerang);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sound clean-up
+    // -----------------------------------------------------------------------
+
+    fn sound(normalize: bool, fade_in: f64, fade_out: f64) -> SoundOptions {
+        SoundOptions {
+            normalize,
+            fade_in,
+            fade_out,
+        }
+    }
+
+    #[test]
+    fn trimmed_song_is_normalized_and_faded() {
+        let options = ConvertOptions {
+            format: OutputFormat::Mp3,
+            trim_start: Some(2.0),
+            trim_end: Some(12.0),
+            quality: 100,
+            sound: sound(true, 1.0, 3.0),
+            ..ConvertOptions::default()
+        };
+        assert_eq!(
+            command(&video("talk.mov"), &options, "/clips/talk.mp3"),
+            "ffmpeg -ss 2 -i /clips/talk.mov -t 10 -map 0:a:0 -vn -sn -dn \
+             -af loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=1,afade=t=out:st=7:d=3,aresample=44100 \
+             -c:a libmp3lame -q:a 0 /clips/talk.mp3"
+        );
+    }
+
+    #[test]
+    fn video_fades_picture_and_sound_together() {
+        let options = ConvertOptions {
+            sound: sound(false, 1.0, 1.0),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("garden.mov"), &options, "/clips/garden.mp4");
+        assert!(
+            cmd.contains(
+                "-vf fade=t=in:d=1,fade=t=out:st=41:d=1 -af afade=t=in:d=1,afade=t=out:st=41:d=1 "
+            ),
+            "{cmd}"
+        );
+
+        // Without sound the section is hidden, so nothing fades.
+        let muted = ConvertOptions {
+            keep_audio: false,
+            ..options
+        };
+        let cmd = command(&video("garden.mov"), &muted, "/clips/garden.mp4");
+        assert!(!cmd.contains("fade"), "{cmd}");
+        let gif = ConvertOptions {
+            format: OutputFormat::Gif,
+            ..options
+        };
+        let cmd = command(&video("garden.mov"), &gif, "/clips/garden.gif");
+        assert!(!cmd.contains("fade="), "{cmd}");
+    }
+
+    #[test]
+    fn fades_fit_the_clip_and_need_a_known_length() {
+        let options = ConvertOptions {
+            format: OutputFormat::Ogg,
+            trim_end: Some(2.0),
+            sound: sound(false, 3.0, 3.0),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("short.mov"), &options, "/clips/short.ogg");
+        assert!(
+            cmd.contains("-af afade=t=in:d=2,afade=t=out:st=0:d=2 "),
+            "{cmd}"
+        );
+
+        // Unknown length: fade in only, and the default 48 kHz after loudnorm.
+        let input = MediaInfo {
+            duration_secs: None,
+            sample_rate: None,
+            ..video("stream.mkv")
+        };
+        let options = ConvertOptions {
+            format: OutputFormat::Flac,
+            sound: sound(true, 1.0, 3.0),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &options, "/clips/stream.flac");
+        assert!(
+            cmd.contains("-af loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=1,aresample=48000 "),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_fades_and_reads_old_recipes() {
+        let options = ConvertOptions {
+            format: OutputFormat::Mp3,
+            sound: sound(false, -1.0, 0.0),
+            ..ConvertOptions::default()
+        };
+        let err = plan_err(&video("a.mov"), &options, JxlSupport::default());
+        assert!(err.contains("fade"), "{err}");
+
+        let old: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp3", "keepAudio": true}))
+                .expect("parse");
+        assert_eq!(old.sound, SoundOptions::default());
+        let partial: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp3", "sound": {"fadeIn": 1}}))
+                .expect("parse");
+        assert_eq!(partial.sound, sound(false, 1.0, 0.0));
     }
 
     // -----------------------------------------------------------------------
@@ -1493,39 +2560,210 @@ mod tests {
     }
 
     #[test]
-    fn stripping_metadata_goes_through_ffmpeg() {
-        let strip = ConvertOptions {
-            format: OutputFormat::Mp4,
-            keep_metadata: false,
+    fn video_metadata_is_dropped_by_ffmpeg() {
+        let mut input = video("garden.mov");
+        input.location_tags = vec!["location".into(), "location-eng".into()];
+        input.has_location = true;
+        let with = |metadata| ConvertOptions {
+            metadata,
             ..ConvertOptions::default()
         };
-        let cmd = command(&video("garden.mov"), &strip, "/clips/garden.mp4");
+
+        let cmd = command(&input, &with(Metadata::None), "/clips/garden.mp4");
         assert!(
             cmd.ends_with("-map_metadata -1 -map_chapters -1 /clips/garden.mp4"),
             "{cmd}"
         );
+        let cmd = command(&input, &with(Metadata::NoLocation), "/clips/garden.mp4");
+        assert!(
+            cmd.ends_with(
+                "-movflags +faststart -metadata location= -metadata location-eng= /clips/garden.mp4"
+            ),
+            "{cmd}"
+        );
+        let cmd = command(&input, &with(Metadata::Keep), "/clips/garden.mp4");
+        assert!(cmd.ends_with("+faststart /clips/garden.mp4"), "{cmd}");
+        // Location is the default thing to drop.
+        assert_eq!(ConvertOptions::default().metadata, Metadata::NoLocation);
+    }
 
-        // cjxl would carry the EXIF over, so an unedited JPEG is decoded instead.
+    fn scrub_args(plan: &Plan, index: usize) -> Vec<String> {
+        assert_eq!(plan.steps[index].tool, Tool::Scrub);
+        plan.steps[index]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn jpeg_repack_survives_dropping_metadata() {
+        let lossless = |metadata| {
+            jxl(ConvertOptions {
+                jxl: JxlOptions {
+                    lossless: true,
+                    ..JxlOptions::default()
+                },
+                metadata,
+                ..ConvertOptions::default()
+            })
+        };
+        let mut photo = image("photo.jpg", 4000, 3000);
+        let out = Path::new("/clips/photo.jxl");
+
+        // Nothing to hide: cjxl reads the JPEG itself.
+        let planned = plan(&photo, &lossless(Metadata::NoLocation), out, LIBJXL).expect("plan");
+        assert_eq!(tools(&planned), [Tool::Cjxl]);
+
+        // A located photo is copied without its GPS, then repacked losslessly.
+        photo.has_location = true;
+        for (metadata, what) in [(Metadata::NoLocation, "location"), (Metadata::None, "all")] {
+            let planned = plan(&photo, &lossless(metadata), out, LIBJXL).expect("plan");
+            assert_eq!(tools(&planned), [Tool::Scrub, Tool::Cjxl]);
+            assert_eq!(
+                scrub_args(&planned, 0),
+                [
+                    "/clips/photo.jpg",
+                    "/clips/.photo.jxl.clean.jpg",
+                    "--drop",
+                    what
+                ]
+            );
+            assert_eq!(
+                planned.steps[1].args[..3],
+                [
+                    "/clips/.photo.jxl.clean.jpg",
+                    "/clips/photo.jxl",
+                    "--lossless_jpeg=1"
+                ]
+                .map(OsString::from)
+            );
+            assert_eq!(
+                planned.scratch,
+                [PathBuf::from("/clips/.photo.jxl.clean.jpg")]
+            );
+        }
+        assert!(
+            plan(&photo, &lossless(Metadata::None), out, LIBJXL)
+                .unwrap()
+                .command_line()
+                .starts_with(
+                    "catconvert scrub /clips/photo.jpg /clips/.photo.jxl.clean.jpg --drop all && "
+                ),
+        );
+    }
+
+    #[test]
+    fn png_output_is_cleaned_after_ffmpeg() {
+        let mut photo = image("photo.jpg", 400, 300);
+        let png = ConvertOptions {
+            format: OutputFormat::Png,
+            ..ConvertOptions::default()
+        };
+        let out = Path::new("/clips/photo.png");
+        let plan_for = |photo: &MediaInfo, options: &ConvertOptions| {
+            plan(photo, options, out, JxlSupport::default()).expect("plan")
+        };
+        assert_eq!(tools(&plan_for(&photo, &png)), [Tool::Ffmpeg]);
+
+        photo.has_location = true;
+        let planned = plan_for(&photo, &png);
+        assert_eq!(tools(&planned), [Tool::Ffmpeg, Tool::Scrub]);
+        assert_eq!(
+            planned.steps[0].args.last(),
+            Some(&OsString::from("/clips/.photo.png.encoded.png"))
+        );
+        assert_eq!(
+            scrub_args(&planned, 1),
+            [
+                "/clips/.photo.png.encoded.png",
+                "/clips/photo.png",
+                "--drop",
+                "location"
+            ]
+        );
+
+        // JPG, WebP and AVIF come out of ffmpeg without EXIF anyway.
+        for format in [OutputFormat::Jpg, OutputFormat::Webp, OutputFormat::Avif] {
+            let options = ConvertOptions {
+                format,
+                metadata: Metadata::None,
+                ..png.clone()
+            };
+            let out = format!("/clips/small.{}", format.extension());
+            let planned = plan(&photo, &options, Path::new(&out), JxlSupport::default()).unwrap();
+            assert_eq!(tools(&planned), [Tool::Ffmpeg], "{format:?}");
+        }
+    }
+
+    #[test]
+    fn edited_jxl_is_cleaned_between_ffmpeg_and_the_encoder() {
         let options = jxl(ConvertOptions {
-            jxl: JxlOptions {
-                lossless: true,
-                ..JxlOptions::default()
-            },
-            keep_metadata: false,
+            rotate: 90,
+            metadata: Metadata::None,
             ..ConvertOptions::default()
         });
-        let plan = plan(
-            &image("photo.jpg", 4000, 3000),
-            &options,
-            Path::new("/clips/photo.jxl"),
-            LIBJXL,
-        )
-        .expect("plan");
-        assert_eq!(tools(&plan), [Tool::Ffmpeg, Tool::Cjxl]);
-        assert!(
-            plan.command_line().contains("-map_metadata -1"),
-            "{}",
-            plan.command_line()
+        let photo = image("photo.png", 400, 300);
+        let out = Path::new("/clips/photo.jxl");
+
+        let plan_cjxl = plan(&photo, &options, out, LIBJXL).expect("plan");
+        assert_eq!(tools(&plan_cjxl), [Tool::Ffmpeg, Tool::Scrub, Tool::Cjxl]);
+        assert_eq!(plan_cjxl.steps[2].args[0], "/clips/.photo.jxl.clean.png");
+
+        // Without cjxl, ffmpeg encodes the cleaned picture as it is.
+        let plan_ffmpeg = plan(&photo, &options, out, FFMPEG_JXL).expect("plan");
+        assert_eq!(
+            tools(&plan_ffmpeg),
+            [Tool::Ffmpeg, Tool::Scrub, Tool::Ffmpeg]
+        );
+        let encode = plan_ffmpeg.steps[2]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            encode,
+            "-i /clips/.photo.jxl.clean.png -map 0:v:0 -frames:v 1 -c:v libjxl -distance 1.5 \
+             -effort 7 -update 1 -an -sn -dn /clips/photo.jxl"
+        );
+        assert_eq!(plan_ffmpeg.scratch.len(), 2);
+
+        // Animations carry no EXIF.
+        let short = ConvertOptions {
+            trim_end: Some(2.0),
+            ..options
+        };
+        let clip = plan(&video("clip.mov"), &short, out, LIBJXL).expect("plan");
+        assert_eq!(tools(&clip), [Tool::Ffmpeg, Tool::Cjxl]);
+    }
+
+    #[test]
+    fn restored_jpeg_is_cleaned_after_djxl() {
+        let mut packed = image("photo.jxl", 4000, 3000);
+        packed.reconstructs_jpeg = true;
+        packed.has_location = true;
+        let options = ConvertOptions {
+            format: OutputFormat::Jpg,
+            ..ConvertOptions::default()
+        };
+        let planned = plan(&packed, &options, Path::new("/clips/photo.jpg"), LIBJXL).expect("plan");
+        assert_eq!(
+            planned.command_line(),
+            "djxl /clips/photo.jxl /clips/.photo.jpg.decoded.jpg --reconstruct_jpeg --quiet && \\\n  \
+             catconvert scrub /clips/.photo.jpg.decoded.jpg /clips/photo.jpg --drop location"
+        );
+
+        // JPEG XL with metadata to drop isn't re-encoded by cjxl directly.
+        let options = jxl(ConvertOptions {
+            metadata: Metadata::None,
+            ..ConvertOptions::default()
+        });
+        let planned =
+            plan(&packed, &options, Path::new("/clips/photo 2.jxl"), LIBJXL).expect("plan");
+        assert_eq!(
+            tools(&planned),
+            [Tool::Djxl, Tool::Ffmpeg, Tool::Scrub, Tool::Cjxl]
         );
     }
 
@@ -1566,6 +2804,38 @@ mod tests {
     }
 
     #[test]
+    fn tiled_heic_is_read_through_its_grid() {
+        let photo = MediaInfo {
+            tile_grid: Some(0),
+            ..image("IMG_0001.heic", 3024, 4032)
+        };
+        // Edits go into a complex filtergraph fed by the stitched grid.
+        let options = ConvertOptions {
+            format: OutputFormat::Jpg,
+            max_size: Some(1080),
+            quality: 100,
+            ..ConvertOptions::default()
+        };
+        let jpg = plan(&photo, &options, Path::new("/clips/IMG_0001.jpg"), LIBJXL).expect("plan");
+        assert_eq!(
+            jpg.command_line(),
+            "ffmpeg -i /clips/IMG_0001.heic -filter_complex '[0:g:0]scale=1080:-2:flags=lanczos[v]' \
+             -map '[v]' -frames:v 1 -c:v mjpeg -q:v 2 -update 1 -an -sn -dn /clips/IMG_0001.jpg"
+        );
+        // Without edits the grid is mapped directly.
+        let options = ConvertOptions {
+            format: OutputFormat::Png,
+            ..ConvertOptions::default()
+        };
+        let png = plan(&photo, &options, Path::new("/clips/IMG_0001.png"), LIBJXL).expect("plan");
+        let cmd = png.command_line();
+        assert!(
+            cmd.starts_with("ffmpeg -i /clips/IMG_0001.heic -map '[0:g:0]' -frames:v 1 -c:v png "),
+            "{cmd}"
+        );
+    }
+
+    #[test]
     fn video_becomes_an_animated_jxl_with_sensible_caps() {
         let options = jxl(ConvertOptions {
             trim_start: Some(1.0),
@@ -1581,7 +2851,7 @@ mod tests {
         let cmd = plan.command_line();
         assert!(
             cmd.starts_with(
-                "ffmpeg -ss 1 -i /clips/clip.mov -t 3 -map 0:v:0 -vf scale=-2:720:flags=lanczos,fps=30 \
+                "ffmpeg -ss 1 -i /clips/clip.mov -t 3 -map 0:v:0 -vf fps=30,scale=-2:720:flags=lanczos \
                  -c:v apng -compression_level 1 -plays 0 -an -sn -dn -f apng /clips/.clip.jxl.frames.apng"
             ),
             "{cmd}"
@@ -1641,6 +2911,69 @@ mod tests {
             command_with(&gif, &options, "/clips/loop.jxl", LIBJXL),
             "cjxl /clips/loop.gif /clips/loop.jxl -d 0 -e 7 --quiet"
         );
+    }
+
+    #[test]
+    fn retimed_gifs_skip_the_cjxl_shortcut_and_trim_unseekable_jxl_in_the_graph() {
+        let loop_gif = MediaInfo {
+            extension: Some("gif".into()),
+            width: Some(320),
+            height: Some(240),
+            fps: Some(10.0),
+            duration_secs: Some(2.0),
+            audio_codec: None,
+            ..video("loop.gif")
+        };
+        let reversed = jxl(ConvertOptions {
+            direction: Direction::Reverse,
+            ..ConvertOptions::default()
+        });
+        let plan = plan(&loop_gif, &reversed, Path::new("/clips/loop.jxl"), LIBJXL).expect("plan");
+        assert_eq!(tools(&plan), [Tool::Ffmpeg, Tool::Cjxl]);
+        assert!(
+            plan.command_line().contains("-vf reverse "),
+            "{}",
+            plan.command_line()
+        );
+
+        // ffmpeg's animated JPEG XL decoder can't seek: read up to the end,
+        // cut the start in the graph.
+        let anim = MediaInfo {
+            extension: Some("jxl".into()),
+            video_codec: Some("jpegxl_anim".into()),
+            audio_codec: None,
+            ..video("loop.jxl")
+        };
+        let fast = gif(ConvertOptions {
+            trim_start: Some(1.0),
+            trim_end: Some(3.0),
+            speed: 2.0,
+            ..ConvertOptions::default()
+        });
+        let cmd = command_with(&anim, &fast, "/clips/loop.gif", FFMPEG_JXL);
+        assert!(
+            cmd.starts_with(
+                "ffmpeg -t 3 -i /clips/loop.jxl -map 0:v:0 \
+                 -vf 'trim=start=1,setpts=PTS-STARTPTS,setpts=(PTS-STARTPTS)/2,fps=15,"
+            ),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn boomerangs_count_twice_against_the_cjxl_budget() {
+        let input = MediaInfo {
+            duration_secs: Some(30.0),
+            ..video("clip.mov")
+        };
+        let forward = jxl(ConvertOptions::default());
+        assert!(plan(&input, &forward, Path::new("/clips/c.jxl"), LIBJXL).is_ok());
+        let boomerang = jxl(ConvertOptions {
+            direction: Direction::Boomerang,
+            ..ConvertOptions::default()
+        });
+        let err = plan_err(&input, &boomerang, LIBJXL);
+        assert!(err.contains("too long"), "{err}");
     }
 
     #[test]
@@ -1770,6 +3103,191 @@ mod tests {
         assert!(options.jxl.lossless);
         assert_eq!(options.jxl.effort, 7);
         assert!(!options.jxl.progressive);
+    }
+
+    const TONE_MAP: Support = Support {
+        jxl: JxlSupport {
+            cjxl: false,
+            djxl: false,
+            ffmpeg_encoder: false,
+            ffmpeg_anim_encoder: false,
+            ffmpeg_decoder: false,
+            ffmpeg_anim_decoder: false,
+        },
+        tone_map: true,
+    };
+
+    #[test]
+    fn frame_plan_grabs_one_edited_frame_as_png() {
+        let options = ConvertOptions {
+            format: OutputFormat::Gif,
+            trim_start: Some(2.0),
+            trim_end: Some(8.0),
+            fps: Some(10.0),
+            max_size: Some(720),
+            rotate: 90,
+            flip: true,
+            ..ConvertOptions::default()
+        };
+        let plan = frame_plan(
+            &video("garden.mov"),
+            &options,
+            12.5,
+            Path::new("/clips/garden-frame-0m12s.png"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        // The trim, frame rate and GIF format belong to the conversion, not the frame.
+        assert_eq!(
+            plan.command_line(),
+            "ffmpeg -ss 12.5 -i /clips/garden.mov -map 0:v:0 -frames:v 1 \
+             -vf transpose=clock,hflip,scale=720:-2:flags=lanczos -c:v png -update 1 -an -sn -dn \
+             /clips/garden-frame-0m12s.png"
+        );
+        assert_eq!(plan.duration_secs(), None);
+    }
+
+    #[test]
+    fn frame_plan_at_start_or_past_the_end() {
+        let out = Path::new("/clips/a.png");
+        let first = frame_plan(
+            &video("a.mov"),
+            &ConvertOptions::default(),
+            0.0,
+            out,
+            TONE_MAP,
+        )
+        .expect("plan");
+        assert!(!first.steps[0].args.iter().any(|a| a == "-ss"));
+        // 42 s at 30 fps: the last frame starts a frame's length before the end.
+        let last = frame_plan(
+            &video("a.mov"),
+            &ConvertOptions::default(),
+            99.0,
+            out,
+            TONE_MAP,
+        )
+        .expect("plan")
+        .command_line();
+        assert!(last.starts_with("ffmpeg -ss 41.967 -i"), "{last}");
+    }
+
+    #[test]
+    fn frame_plan_needs_a_video() {
+        let out = Path::new("/clips/a.png");
+        let photo = image("photo.jpg", 4000, 3000);
+        let err = frame_plan(&photo, &ConvertOptions::default(), 1.0, out, TONE_MAP)
+            .expect_err("still image");
+        assert!(err.to_string().contains("only videos"), "{err}");
+        let err = frame_plan(
+            &video("a.mov"),
+            &ConvertOptions::default(),
+            f64::NAN,
+            out,
+            TONE_MAP,
+        )
+        .expect_err("bad time");
+        assert!(err.to_string().contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn hdr_is_tone_mapped_for_pictures_and_gifs_only() {
+        let hdr = MediaInfo {
+            hdr: true,
+            ..video("iphone.mov")
+        };
+        let run = |format, support: Support| {
+            let options = ConvertOptions {
+                format,
+                ..ConvertOptions::default()
+            };
+            plan(&hdr, &options, Path::new("/clips/out"), support)
+                .expect("plan")
+                .command_line()
+        };
+        let png = run(OutputFormat::Png, TONE_MAP);
+        assert!(png.contains(&format!("-vf {TONE_MAP_FILTER} ")), "{png}");
+        let gif = run(OutputFormat::Gif, TONE_MAP);
+        assert!(
+            gif.contains(&format!(
+                "-vf '{TONE_MAP_FILTER},fps=15,scale=-2:480:flags=lanczos,"
+            )),
+            "{gif}"
+        );
+        // Videos keep their HDR tags; older ffmpegs can't tone-map at all.
+        assert!(!run(OutputFormat::Mp4, TONE_MAP).contains("out_transfer"));
+        assert!(!run(OutputFormat::Png, Support::default()).contains("out_transfer"));
+        // SDR sources are left alone.
+        let sdr = plan(
+            &video("garden.mov"),
+            &ConvertOptions {
+                format: OutputFormat::Png,
+                ..ConvertOptions::default()
+            },
+            Path::new("/clips/out.png"),
+            TONE_MAP,
+        )
+        .expect("plan");
+        assert!(!sdr.command_line().contains("out_transfer"));
+    }
+
+    #[test]
+    fn hdr_photo_is_tone_mapped_once_when_cleaned() {
+        let photo = MediaInfo {
+            hdr: true,
+            has_location: true,
+            ..image("sunset.avif", 4000, 3000)
+        };
+        let ffmpeg_jxl = Support {
+            jxl: JxlSupport {
+                ffmpeg_encoder: true,
+                ..JxlSupport::default()
+            },
+            tone_map: true,
+        };
+        for (format, support) in [
+            (OutputFormat::Png, TONE_MAP),
+            (OutputFormat::Jxl, ffmpeg_jxl),
+        ] {
+            let options = ConvertOptions {
+                format,
+                metadata: Metadata::NoLocation,
+                ..ConvertOptions::default()
+            };
+            let plan = plan(&photo, &options, Path::new("/photos/out"), support).expect("plan");
+            let mapped: Vec<bool> = plan
+                .steps
+                .iter()
+                .filter(|step| step.tool == Tool::Ffmpeg)
+                .map(|step| {
+                    step.args
+                        .iter()
+                        .any(|a| a.to_string_lossy().contains("out_transfer"))
+                })
+                .collect();
+            // The edit pass reads the HDR source; a re-encode of its PNG must not map again.
+            assert_eq!(mapped.first(), Some(&true), "{format:?}");
+            assert_eq!(mapped.iter().filter(|m| **m).count(), 1, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn frame_names_carry_the_time() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("clip.mov");
+        let at = |secs| {
+            frame_output_path(&input, secs, |_| false)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        assert_eq!(at(12.4), "clip-frame-0m12s.png");
+        assert_eq!(at(0.0), "clip-frame-0m00s.png");
+        assert_eq!(at(605.9), "clip-frame-10m05s.png");
+        assert_eq!(at(3723.0), "clip-frame-1h02m03s.png");
+        // A second frame in the same second gets a number.
+        std::fs::write(dir.path().join("clip-frame-0m12s.png"), b"x").expect("write");
+        assert_eq!(at(12.6), "clip-frame-0m12s 2.png");
     }
 
     #[test]

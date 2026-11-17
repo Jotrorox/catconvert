@@ -17,6 +17,7 @@ import type {
   JobStage,
   MediaInfo,
   OutputFormat,
+  QuickActionStatus,
   SequenceOptions,
   UpdateInfo,
 } from "./api";
@@ -29,6 +30,7 @@ import {
   fitOptions,
   initialOptions,
   looksLikePicture,
+  metadataFrom,
   naturalOrder,
   RECIPES,
   type Recipe,
@@ -131,6 +133,8 @@ type State = {
   recipes: Recipe[];
   /** Waiting files being queued with one set of settings. */
   batch: { done: number; total: number } | null;
+  /** The Finder Quick Action, once Settings has looked. */
+  quickAction: QuickActionStatus | null;
   toasts: Toast[];
 };
 
@@ -168,20 +172,30 @@ function saveHistory(items: HistoryItem[]) {
 }
 
 function loadSettings(): Defaults {
-  const parsed = load(SETTINGS_KEY) as Partial<Defaults> | null;
+  const parsed = load(SETTINGS_KEY) as (Partial<Defaults> & { keepMetadata?: unknown }) | null;
   if (!parsed || typeof parsed !== "object") return structuredClone(DEFAULTS);
+  const { keepMetadata: _old, ...rest } = parsed;
   return {
     ...DEFAULTS,
-    ...parsed,
+    ...rest,
     formats: { ...DEFAULTS.formats, ...parsed.formats },
+    metadata: metadataFrom(parsed) ?? DEFAULTS.metadata,
   };
 }
 
 function loadRecipes(): Recipe[] {
   const parsed = load(RECIPES_KEY);
-  return Array.isArray(parsed)
-    ? (parsed as Recipe[]).filter((r) => r && typeof r.id === "string" && r.options?.format)
-    : [];
+  if (!Array.isArray(parsed)) return [];
+  return (parsed as Recipe[])
+    .filter((r) => r && typeof r.id === "string" && r.options?.format)
+    .map((recipe) => {
+      // Recipes saved before the three-way choice stored `keepMetadata`.
+      const { keepMetadata: _old, ...options } = recipe.options as Recipe["options"] & {
+        keepMetadata?: unknown;
+      };
+      const metadata = metadataFrom(recipe.options);
+      return { ...recipe, options: metadata ? { ...options, metadata } : options };
+    });
 }
 
 const [state, setState] = createStore<State>({
@@ -201,6 +215,7 @@ const [state, setState] = createStore<State>({
   settings: loadSettings(),
   recipes: loadRecipes(),
   batch: null,
+  quickAction: null,
   toasts: [],
 });
 
@@ -517,13 +532,13 @@ export function updateOptions(patch: Partial<ConvertOptions>) {
 // Animations from pictures
 // ---------------------------------------------------------------------------
 
-/** Change the format, size, turn or quality of the animation being made. */
+/** Change the format, size, turn, direction or quality of the animation being made. */
 export function updateSequenceOptions(patch: Partial<ConvertOptions>) {
   if (!state.sequence) return;
   setState("sequence", "options", (options) => ({ ...options, ...patch }));
 }
 
-/** Change the frame time, fit or playback of the animation being made. */
+/** Change the frame time or fit of the animation being made. */
 export function updateSequence(patch: Partial<SequenceOptions>) {
   if (!state.sequence) return;
   setState("sequence", "sequence", (sequence) => ({ ...sequence, ...patch }));
@@ -652,7 +667,11 @@ export async function convertDraft() {
 export async function convertAll() {
   const draft = state.draft;
   if (!draft) return;
-  const options = { ...draft.options, jxl: { ...draft.options.jxl } };
+  const options = {
+    ...draft.options,
+    jxl: { ...draft.options.jxl },
+    sound: { ...draft.options.sound },
+  };
   const paths = [...state.inbox];
   try {
     addJob(await api.startJob(draft.info.path, options), options);
@@ -749,7 +768,7 @@ export function applyProgress(event: JobProgress) {
   );
 
   if (event.stage === "done") {
-    const item: HistoryItem = {
+    remember({
       id: `${job.submittedAt}-${job.id}`,
       name: baseName(job.output),
       output: job.output,
@@ -759,11 +778,6 @@ export function applyProgress(event: JobProgress) {
       outputBytes: event.outputBytes ?? 0,
       finishedAt: Date.now(),
       ...(job.sequence ? { pictures: job.inputs.length } : {}),
-    };
-    setState("history", (items) => {
-      const next = [item, ...items].slice(0, HISTORY_LIMIT);
-      saveHistory(next);
-      return next;
     });
   } else if (event.stage === "failed" && state.screen !== "queue") {
     toast(`${job.name} didn't convert`, {
@@ -776,6 +790,42 @@ export function applyProgress(event: JobProgress) {
 /** Size of everything a job reads. */
 export function inputBytes(job: JobEntry): number {
   return job.inputs.reduce((sum, info) => sum + info.sizeBytes, 0);
+}
+
+function remember(item: HistoryItem) {
+  setState("history", (items) => {
+    const next = [item, ...items].slice(0, HISTORY_LIMIT);
+    saveHistory(next);
+    return next;
+  });
+}
+
+/**
+ * Save the frame at `at` seconds of the open video as a PNG next to it, with
+ * the editor's turn, mirror and size. Runs right away rather than queueing.
+ */
+export async function saveFrame(at: number) {
+  const draft = state.draft;
+  if (!draft) return;
+  const { info } = draft;
+  try {
+    const saved = await api.saveFrame(info.path, { ...draft.options }, at);
+    remember({
+      id: `${Date.now()}-${saved.output}`,
+      name: baseName(saved.output),
+      output: saved.output,
+      format: "png",
+      kind: info.kind,
+      inputBytes: info.sizeBytes,
+      outputBytes: saved.outputBytes,
+      finishedAt: Date.now(),
+    });
+    toast("Saved frame", {
+      action: { label: "Show in folder", run: () => void reveal(saved.output) },
+    });
+  } catch (error) {
+    toast(`Couldn't save the frame: ${errorText(error)}`, { tone: "error" });
+  }
 }
 
 export function isFinal(stage: JobStage) {
@@ -892,6 +942,46 @@ export async function reveal(path: string) {
   }
 }
 
+/** Drag a finished file into another app or folder; `icon` is the drag image. */
+export async function dragOut(path: string, icon: string) {
+  if (state.missing.includes(path)) return;
+  try {
+    await api.dragFiles([path], icon);
+  } catch (error) {
+    toast(`Couldn't drag ${baseName(path)}: ${errorText(error)}`, { tone: "error" });
+    void checkHistory();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Finder Quick Action
+// ---------------------------------------------------------------------------
+
+export async function loadQuickAction() {
+  try {
+    setState("quickAction", await api.quickActionStatus());
+  } catch {
+    // Settings simply doesn't offer it.
+  }
+}
+
+/** Add the Quick Action if it's missing, remove it otherwise. */
+export async function toggleQuickAction() {
+  const current = state.quickAction;
+  if (!current?.supported) return;
+  try {
+    const next = await api.setQuickAction(!current.installed);
+    setState("quickAction", next);
+    toast(
+      next.installed
+        ? "Right-click files in Finder › Quick Actions › Convert with CatConvert"
+        : "Removed from Finder's Quick Actions",
+    );
+  } catch (error) {
+    toast(`Couldn't change the Quick Action: ${errorText(error)}`, { tone: "error" });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Settings and recipes
 // ---------------------------------------------------------------------------
@@ -948,7 +1038,7 @@ export function errorText(error: unknown): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-/** Test helper: reset everything to a fresh state. */
+/** Test helper: reset everything to a fresh start, reading storage as at launch. */
 export function resetStore() {
   early.clear();
   setState({
@@ -963,11 +1053,12 @@ export function resetStore() {
     opening: null,
     recipe: null,
     jobs: [],
-    history: [],
+    history: loadHistory(),
     missing: [],
-    settings: structuredClone(DEFAULTS),
-    recipes: [],
+    settings: loadSettings(),
+    recipes: loadRecipes(),
     batch: null,
+    quickAction: null,
     toasts: [],
   });
 }
