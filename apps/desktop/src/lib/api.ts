@@ -67,6 +67,9 @@ export type OutputFormat =
   | "avif"
   | "jxl";
 
+/** How the picture of an MP4, MOV, MKV or WebM file is compressed. */
+export type VideoCodec = "h264" | "vp9" | "av1";
+
 export type Rotation = 0 | 90 | 180 | 270;
 
 /** What to carry over besides the picture and sound. */
@@ -132,6 +135,8 @@ export type ConvertOptions = {
   /** 0 = smallest file, 100 = best quality. */
   quality: number;
   keepAudio: boolean;
+  /** Codec of MP4, MOV, MKV and WebM files; `null` is the format's usual one. Ignored otherwise. */
+  videoCodec: VideoCodec | null;
   jxl: JxlOptions;
   sound: SoundOptions;
   /** Which dates, places and other tags to carry over, where the format can hold them. */
@@ -192,6 +197,10 @@ export type FfmpegStatus = {
   error: string | null;
   /** `animated`: pictures or a video can become an animation in this format. */
   formats: { format: OutputFormat; available: boolean; animated: boolean }[];
+  /** Video codecs ffmpeg can write. */
+  videoCodecs: VideoCodec[];
+  /** ffmpeg decodes AV1 video and AVIF pictures (it has dav1d or libaom). */
+  readsAv1: boolean;
   /** Version of libjxl's cjxl/djxl, if installed. */
   libjxl: string | null;
   jxl: JxlSupport;
@@ -296,6 +305,8 @@ export async function ffmpegStatus(): Promise<FfmpegStatus> {
       path: null,
       error: "Open CatConvert as an app to convert files.",
       formats: [],
+      videoCodecs: [],
+      readsAv1: false,
       libjxl: null,
       jxl: NO_JXL,
     };

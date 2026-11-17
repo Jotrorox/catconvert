@@ -44,7 +44,8 @@ Release builds ship `ffmpeg`, `ffprobe` and libjxl's `cjxl`, `djxl` and
   ffmpeg.
 - `mise run media-tools` builds them for this machine into
   `apps/desktop/src-tauri/binaries` (gitignored). It takes a while and needs
-  cmake, ninja, nasm and pkg-config (`brew install cmake ninja nasm pkgconf`).
+  cmake, meson, ninja, nasm and pkg-config
+  (`brew install cmake meson ninja nasm pkgconf`).
   Then `mise run build-bundled` builds the app with them inside.
 - To update a component, change its version, URL and SHA-256 in `sources.lock`
   together and open a PR. `.github/workflows/media-tools.yml` builds all three

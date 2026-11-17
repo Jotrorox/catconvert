@@ -38,7 +38,7 @@ use crate::ffmpeg::format_secs;
 use crate::jxl::is_jxl;
 use crate::{
     ConvertOptions, Direction, Error, MediaInfo, MediaKind, OutputFormat, Plan, Result, Step,
-    Support, Tool,
+    Support, Tool, VideoCodec,
 };
 
 /// How pictures of another shape fit the frame, which takes the size of the
@@ -158,6 +158,7 @@ pub fn plan_sequence(
             format.extension().to_uppercase()
         )));
     }
+    options.check_codec()?;
     if !matches!(options.rotate, 0 | 90 | 180 | 270) {
         return Err(Error::unsupported(
             "rotation must be 0, 90, 180 or 270 degrees",
@@ -343,8 +344,9 @@ pub fn plan_sequence(
             }
         }
         _ => {
-            push_video_encoder(&mut push, format, q);
-            if format != OutputFormat::Webm {
+            let codec = options.codec().unwrap_or(VideoCodec::H264);
+            push_video_encoder(&mut push, codec, q);
+            if codec == VideoCodec::H264 {
                 push(&["-tune", "stillimage"]);
             }
             if matches!(format, OutputFormat::Mp4 | OutputFormat::Mov) {
@@ -824,6 +826,35 @@ mod tests {
         );
         assert_eq!(plan.duration_secs(), Some(5.0));
         assert_eq!(plan.scratch.len(), 11);
+    }
+
+    #[test]
+    fn av1_slideshow_skips_the_x264_tuning() {
+        let inputs = [
+            picture("a.jpg", "mjpeg", 1920, 1080),
+            picture("b.jpg", "mjpeg", 1920, 1080),
+        ];
+        let options = ConvertOptions {
+            format: OutputFormat::Mp4,
+            video_codec: Some(VideoCodec::Av1),
+            ..ConvertOptions::default()
+        };
+        let cmd = plan_sequence(
+            &inputs,
+            &options,
+            &SequenceOptions::default(),
+            Path::new("/pics/a.mp4"),
+            JxlSupport::default(),
+        )
+        .expect("plan")
+        .command_line();
+        assert!(
+            cmd.contains(
+                "-c:v libsvtav1 -preset 8 -crf 32 -pix_fmt yuv420p10le -movflags +faststart"
+            ),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("stillimage"), "{cmd}");
     }
 
     #[test]

@@ -20,10 +20,12 @@ import type {
   QuickActionStatus,
   SequenceOptions,
   UpdateInfo,
+  VideoCodec,
 } from "./api";
 import * as api from "./api";
 import { baseName } from "./format";
 import {
+  codecFor,
   DEFAULT_SEQUENCE,
   DEFAULTS,
   type Defaults,
@@ -260,6 +262,8 @@ export async function refreshFfmpeg(relocate = false) {
       path: null,
       error: String(error),
       formats: [],
+      videoCodecs: [],
+      readsAv1: false,
       libjxl: null,
       jxl: api.NO_JXL,
     };
@@ -270,6 +274,29 @@ export async function refreshFfmpeg(relocate = false) {
 
 export function isAvailable(format: OutputFormat): boolean {
   return state.ffmpeg?.formats.find((f) => f.format === format)?.available ?? false;
+}
+
+/** Whether ffmpeg can write video in `codec`. */
+export function isCodecAvailable(codec: VideoCodec): boolean {
+  return state.ffmpeg?.videoCodecs?.includes(codec) ?? false;
+}
+
+/** Whether ffmpeg can read the picture of `info`: AV1 needs dav1d or libaom. */
+export function canRead(info: MediaInfo): boolean {
+  return info.videoCodec !== "av1" || state.ffmpeg?.readsAv1 !== false;
+}
+
+/**
+ * `patch` applied to `options`. A new format keeps the codec choice when it
+ * can hold that codec (AV1 MP4 → AV1 WebM) and falls back to its usual one
+ * otherwise.
+ */
+function patched(options: ConvertOptions, patch: Partial<ConvertOptions>): ConvertOptions {
+  const next = { ...options, ...patch };
+  if (patch.format !== undefined && patch.videoCodec === undefined) {
+    next.videoCodec = codecFor(patch.format, options.videoCodec ?? null);
+  }
+  return next;
 }
 
 /** Whether pictures or a video can become an animation in `format`. */
@@ -525,7 +552,7 @@ export function closeEditor() {
 
 export function updateOptions(patch: Partial<ConvertOptions>) {
   if (!state.draft) return;
-  setState("draft", "options", (options) => ({ ...options, ...patch }));
+  setState("draft", "options", (options) => patched(options, patch));
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +562,7 @@ export function updateOptions(patch: Partial<ConvertOptions>) {
 /** Change the format, size, turn, direction or quality of the animation being made. */
 export function updateSequenceOptions(patch: Partial<ConvertOptions>) {
   if (!state.sequence) return;
-  setState("sequence", "options", (options) => ({ ...options, ...patch }));
+  setState("sequence", "options", (options) => patched(options, patch));
 }
 
 /** Change the frame time or fit of the animation being made. */

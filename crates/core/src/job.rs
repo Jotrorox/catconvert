@@ -174,10 +174,13 @@ impl Queue {
     /// or the tools to write the format are missing.
     pub fn submit(&self, input: impl AsRef<Path>, options: &ConvertOptions) -> Result<JobTicket> {
         let ffmpeg = &self.shared.ffmpeg;
-        if let Some(message) = ffmpeg.missing(options.format) {
+        if let Some(message) = ffmpeg.missing_output(options) {
             return Err(Error::Unsupported { message });
         }
         let info = ffmpeg.probe(input)?;
+        if let Some(message) = ffmpeg.unreadable(&info) {
+            return Err(Error::Unsupported { message });
+        }
         if options.format.animates(info.kind)
             && let Some(message) = ffmpeg.missing_animation(options.format)
         {
@@ -212,13 +215,19 @@ impl Queue {
         sequence: &SequenceOptions,
     ) -> Result<JobTicket> {
         let ffmpeg = &self.shared.ffmpeg;
-        if let Some(message) = ffmpeg.missing_animation(options.format) {
+        if let Some(message) = ffmpeg
+            .missing_animation(options.format)
+            .or_else(|| ffmpeg.missing_output(options))
+        {
             return Err(Error::Unsupported { message });
         }
         let infos = pictures
             .iter()
             .map(|path| ffmpeg.probe(path))
             .collect::<Result<Vec<_>>>()?;
+        if let Some(message) = infos.iter().find_map(|info| ffmpeg.unreadable(info)) {
+            return Err(Error::Unsupported { message });
+        }
 
         let plan = {
             let mut reserved = lock(&self.shared.reserved);
@@ -276,6 +285,9 @@ impl Queue {
             return Err(Error::Unsupported { message });
         }
         let info = ffmpeg.probe(input)?;
+        if let Some(message) = ffmpeg.unreadable(&info) {
+            return Err(Error::Unsupported { message });
+        }
         let plan = {
             let mut reserved = lock(&self.shared.reserved);
             let output = convert::frame_output_path(&info.path, at_secs, |p| reserved.contains(p));
@@ -664,6 +676,94 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(hidden.is_empty(), "{hidden:?}");
+    }
+
+    /// AV1 out and back in: an HDR clip becomes 10-bit AV1 that stays HDR,
+    /// and that file can be read, previewed and converted again. Skipped
+    /// (passes) without an ffmpeg that has SVT-AV1 and a software AV1 decoder.
+    #[test]
+    fn av1_round_trip_end_to_end() {
+        use crate::VideoCodec;
+
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping AV1 end-to-end test");
+            return;
+        };
+        if ffmpeg.missing_codec(VideoCodec::Av1).is_some() || !ffmpeg.reads_av1() {
+            eprintln!("ffmpeg lacks SVT-AV1 or dav1d; skipping AV1 end-to-end test");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        // 10-bit, tagged as HDR10 (PQ), with sound.
+        let input = dir.path().join("hdr.mkv");
+        let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=1:r=25",
+            ])
+            .args(["-f", "lavfi", "-i", "sine=d=1", "-shortest"])
+            .args([
+                "-vf",
+                "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+            ])
+            .args([
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&input)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+        assert!(ffmpeg.probe(&input).expect("probe").hdr);
+
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let av1 = ConvertOptions {
+            format: OutputFormat::Mp4,
+            video_codec: Some(VideoCodec::Av1),
+            max_size: Some(120),
+            ..ConvertOptions::default()
+        };
+        let ticket = queue.submit(&input, &av1).expect("submit");
+        let done = finish_of(&rx, ticket.id);
+        assert_eq!(done.stage, JobStage::Done, "{done:?}");
+        let out = ffmpeg.probe(&ticket.output).expect("probe AV1");
+        assert_eq!(out.video_codec.as_deref(), Some("av1"));
+        assert_eq!((out.width, out.height), (Some(160), Some(120)));
+        assert!(out.hdr, "AV1 keeps the HDR transfer");
+        assert!(out.has_audio());
+
+        // Reading it back: a preview frame and another conversion.
+        let frame = ffmpeg.frame(&ticket.output, 0.5, 60, true).expect("frame");
+        assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
+        let webm = ConvertOptions {
+            format: OutputFormat::Webm,
+            ..ConvertOptions::default()
+        };
+        if ffmpeg.supports(OutputFormat::Webm) {
+            let again = queue.submit(&ticket.output, &webm).expect("submit again");
+            let done = finish_of(&rx, again.id);
+            assert_eq!(done.stage, JobStage::Done, "{done:?}");
+            let out = ffmpeg.probe(&again.output).expect("probe VP9");
+            assert_eq!(out.video_codec.as_deref(), Some("vp9"));
+        }
+
+        // AV1 can't go into MOV.
+        let mov = ConvertOptions {
+            format: OutputFormat::Mov,
+            ..av1
+        };
+        assert!(queue.submit(&input, &mov).is_err());
     }
 
     /// Wait for the final event of `id`.

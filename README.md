@@ -19,6 +19,9 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
   shows, play forward, reversed or as a boomerang, and fit other shapes with
   black bars or by cropping. GIFs and animated JXL get the same speed, reverse
   and boomerang controls.
+- **AV1 video:** write MP4, MKV and WebM files with AV1 instead of H.264 or
+  VP9: smaller at the same look, 10-bit, and HDR stays HDR. AV1 videos and AVIF
+  photos open like any other file (the bundled ffmpeg decodes them with dav1d).
 - **JPEG XL**, still and animated: lossless or lossy, an effort setting and
   progressive files. Unedited JPEGs are repacked losslessly and can be restored
   bit for bit.

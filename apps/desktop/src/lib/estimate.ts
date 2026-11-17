@@ -12,6 +12,7 @@ import { pictureSize } from "./crop";
 import { formatBytes } from "./format";
 import {
   autoLimits,
+  codecOf,
   formatKind,
   isAnimatedImage,
   outputSeconds,
@@ -99,6 +100,25 @@ const TYPICAL_IMAGE_BPP: Record<string, number> = {
   heif: 1.2,
   jxl: 1.5,
 };
+
+/**
+ * Bits per pixel of a typical 1080p30 frame for the video encoder settings in
+ * `push_video_encoder`. Each step of CRF changes the size by a fixed ratio:
+ * x264 doubles about every 6, VP9 about every 8 and SVT-AV1 about every 9.
+ * VP9 needs roughly 30% fewer bits than x264 for the same look; 10-bit AV1
+ * at CRF 32 looks about like x264 at 24 with roughly 40% fewer.
+ */
+function videoBpp(options: ConvertOptions): number {
+  const q = options.quality;
+  switch (codecOf(options)) {
+    case "av1":
+      return 0.045 * 2 ** ((32 - lerp(q, 48, 22)) / 9);
+    case "vp9":
+      return 0.056 * 2 ** ((31 - lerp(q, 48, 28)) / 8);
+    default:
+      return 0.08 * 2 ** ((23 - lerp(q, 34, 18)) / 6);
+  }
+}
 
 /** Bigger frames need fewer bits per pixel for the same look. */
 const resolutionFactor = (pixels: number) => (pixels / FULL_HD) ** -0.25;
@@ -210,13 +230,8 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
     return (frames * jxlBpp(options) * busy) / 8;
   }
 
-  // Each step of CRF changes the size by a fixed ratio. x264 doubles about
-  // every 6, VP9 about every 8; VP9 needs roughly 30% fewer bits.
-  const bpp =
-    options.format === "webm"
-      ? 0.056 * 2 ** ((31 - lerp(q, 48, 28)) / 8)
-      : 0.08 * 2 ** ((23 - lerp(q, 34, 18)) / 6);
-  const videoBits = frames * bpp * resolutionFactor(pixels) * (fps / 30) ** -0.3 * busy;
+  const videoBits =
+    frames * videoBpp(options) * resolutionFactor(pixels) * (fps / 30) ** -0.3 * busy;
   const keepAudio = options.keepAudio && info.audioCodec !== null;
   const audioBits = keepAudio ? audioRate(info, options, null) * seconds : 0;
   return (videoBits + audioBits) / 8;
@@ -260,8 +275,8 @@ export function estimateSequenceBytes(
       bpp = jxlBpp(options) * busy;
       break;
     default:
-      // An H.264/VP9 key frame costs about ten times a typical frame.
-      bpp = 10 * 0.08 * 2 ** ((23 - lerp(q, 34, 18)) / 6) * resolutionFactor(pixels) * busy;
+      // A key frame costs about ten times a typical frame.
+      bpp = 10 * videoBpp(options) * resolutionFactor(pixels) * busy;
   }
   return (shown * pixels * bpp) / 8;
 }

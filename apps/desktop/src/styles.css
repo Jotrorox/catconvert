@@ -2124,6 +2124,11 @@ button.format-chip:not(:disabled):active {
   font-weight: 600;
 }
 
+.warning-note {
+  background: var(--pink-bg);
+  color: var(--pink-ink);
+}
+
 .estimate {
   margin: -10px 0 0;
   color: var(--muted);

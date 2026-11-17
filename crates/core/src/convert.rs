@@ -90,12 +90,14 @@ impl OutputFormat {
     }
 
     /// The ffmpeg encoder this format needs. JPEG XL can also be written by
-    /// libjxl's `cjxl` instead (see [`crate::Ffmpeg::supports`]).
+    /// libjxl's `cjxl` instead (see [`crate::Ffmpeg::supports`]). For video
+    /// files this is the encoder of their usual codec; see
+    /// [`OutputFormat::video_codecs`] for the others.
     #[must_use]
     pub fn encoder(self) -> &'static str {
         match self {
-            Self::Mp4 | Self::Mov | Self::Mkv => "libx264",
-            Self::Webm => "libvpx-vp9",
+            Self::Mp4 | Self::Mov | Self::Mkv => VideoCodec::H264.encoder(),
+            Self::Webm => VideoCodec::Vp9.encoder(),
             Self::Gif => "gif",
             Self::Mp3 => "libmp3lame",
             Self::M4a => "aac",
@@ -133,6 +135,19 @@ impl OutputFormat {
         }
     }
 
+    /// The video codecs this format can carry, its usual one first. Empty for
+    /// formats without a choice: GIFs, animated images, stills and sound.
+    /// MOV stays H.264, which is what the Apple tools it is meant for expect.
+    #[must_use]
+    pub fn video_codecs(self) -> &'static [VideoCodec] {
+        match self {
+            Self::Mp4 | Self::Mkv => &[VideoCodec::H264, VideoCodec::Av1],
+            Self::Mov => &[VideoCodec::H264],
+            Self::Webm => &[VideoCodec::Vp9, VideoCodec::Av1],
+            _ => &[],
+        }
+    }
+
     /// The ffmpeg encoder that writes this format as an animation, where it
     /// differs from [`OutputFormat::encoder`].
     #[must_use]
@@ -141,6 +156,41 @@ impl OutputFormat {
             Self::Webp => "libwebp_anim",
             Self::Jxl => "libjxl_anim",
             _ => self.encoder(),
+        }
+    }
+}
+
+/// How the picture of a video file is compressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoCodec {
+    /// H.264 (AVC) with x264: plays everywhere.
+    H264,
+    /// VP9 with libvpx: WebM's usual codec.
+    Vp9,
+    /// AV1 with SVT-AV1, in 10 bits: about a third smaller than H.264 at the
+    /// same look, keeps HDR, but is slower to make and needs a newer player.
+    Av1,
+}
+
+impl VideoCodec {
+    /// The ffmpeg encoder that writes this codec.
+    #[must_use]
+    pub fn encoder(self) -> &'static str {
+        match self {
+            Self::H264 => "libx264",
+            Self::Vp9 => "libvpx-vp9",
+            Self::Av1 => "libsvtav1",
+        }
+    }
+
+    /// The codec's usual name, e.g. `"H.264"`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Vp9 => "VP9",
+            Self::Av1 => "AV1",
         }
     }
 }
@@ -275,6 +325,10 @@ pub struct ConvertOptions {
     pub quality: u8,
     /// Keep the sound when writing video.
     pub keep_audio: bool,
+    /// Codec of the picture in MP4, MOV, MKV and WebM files; `None` is the
+    /// format's usual one (see [`OutputFormat::video_codecs`]). Ignored for
+    /// other formats.
+    pub video_codec: Option<VideoCodec>,
     /// JPEG XL settings, ignored for other formats.
     pub jxl: JxlOptions,
     /// Loudness and fades, ignored when the output has no sound.
@@ -318,6 +372,7 @@ impl Default for ConvertOptions {
             crop: None,
             quality: 60,
             keep_audio: true,
+            video_codec: None,
             jxl: JxlOptions::default(),
             sound: SoundOptions::default(),
             metadata: Metadata::default(),
@@ -328,6 +383,28 @@ impl Default for ConvertOptions {
 }
 
 impl ConvertOptions {
+    /// The codec the picture is encoded with: the chosen one, or the
+    /// format's usual one. `None` for formats without a codec choice.
+    #[must_use]
+    pub fn codec(&self) -> Option<VideoCodec> {
+        let usual = *self.format.video_codecs().first()?;
+        Some(self.video_codec.unwrap_or(usual))
+    }
+
+    /// Fails if the chosen codec doesn't fit in the format, e.g. AV1 in MOV.
+    pub(crate) fn check_codec(&self) -> Result<()> {
+        match self.codec() {
+            Some(codec) if !self.format.video_codecs().contains(&codec) => {
+                Err(Error::unsupported(format!(
+                    "{} files can't hold {} video",
+                    self.format.extension().to_uppercase(),
+                    codec.label()
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Whether speed or direction change how an animation plays.
     fn changes_playback(&self) -> bool {
         (self.speed - 1.0).abs() > 1e-9 || self.direction != Direction::Forward
@@ -526,6 +603,7 @@ pub fn plan(
     if format.kind() == MediaKind::Audio && !input.has_audio() {
         return Err(Error::unsupported("this file has no sound to keep"));
     }
+    options.check_codec()?;
     if !matches!(options.rotate, 0 | 90 | 180 | 270) {
         return Err(Error::unsupported(
             "rotation must be 0, 90, 180 or 270 degrees",
@@ -920,7 +998,7 @@ fn ffmpeg_step(
                     push(&["-af", &audio.join(",")]);
                 }
             }
-            push_video_encoder(&mut push, format, q);
+            push_video_encoder(&mut push, options.codec().unwrap_or(VideoCodec::H264), q);
             if keep_audio {
                 if format == OutputFormat::Webm {
                     push(&["-c:a", "libopus", "-b:a", tiered(q, ["64k", "96k", "160k"])]);
@@ -1154,19 +1232,38 @@ fn push_video(
     }
 }
 
-/// The video encoder of MP4, MOV, MKV (H.264) or WebM (VP9) at quality `q`,
-/// in a pixel format every player reads.
-pub(crate) fn push_video_encoder(push: &mut impl FnMut(&[&str]), format: OutputFormat, q: u8) {
-    if format == OutputFormat::Webm {
-        let crf = lerp(q, 48.0, 28.0).to_string();
-        push(&["-c:v", "libvpx-vp9", "-crf", &crf, "-b:v", "0"]);
-        push(&["-row-mt", "1", "-deadline", "good", "-cpu-used", "4"]);
-    } else {
-        let crf = lerp(q, 34.0, 18.0).to_string();
-        push(&["-c:v", "libx264", "-preset", "fast", "-crf", &crf]);
+/// The video encoder of `codec` at quality `q`, in a pixel format every
+/// player of that codec reads.
+///
+/// AV1 is written in 10 bits: every AV1 decoder handles them (they are part
+/// of the Main profile), they compress better than 8 bits even for SDR
+/// sources, and HDR video keeps its HDR (ffmpeg passes the source's colour
+/// tags on to SVT-AV1). SVT-AV1's preset 8 is about as quick as x264's
+/// `fast` and still well ahead of it in size.
+pub(crate) fn push_video_encoder(push: &mut impl FnMut(&[&str]), codec: VideoCodec, q: u8) {
+    match codec {
+        VideoCodec::H264 => {
+            let crf = lerp(q, 34.0, 18.0).to_string();
+            push(&["-c:v", "libx264", "-preset", "fast", "-crf", &crf]);
+            push(&["-pix_fmt", "yuv420p"]);
+        }
+        VideoCodec::Vp9 => {
+            let crf = lerp(q, 48.0, 28.0).to_string();
+            push(&["-c:v", "libvpx-vp9", "-crf", &crf, "-b:v", "0"]);
+            push(&["-row-mt", "1", "-deadline", "good", "-cpu-used", "4"]);
+            push(&["-pix_fmt", "yuv420p"]);
+        }
+        VideoCodec::Av1 => {
+            let crf = lerp(q, AV1_CRF.0, AV1_CRF.1).to_string();
+            push(&["-c:v", "libsvtav1", "-preset", "8", "-crf", &crf]);
+            push(&["-pix_fmt", "yuv420p10le"]);
+        }
     }
-    push(&["-pix_fmt", "yuv420p"]);
 }
+
+/// SVT-AV1's CRF at quality 0 and 100. The default quality of 60 lands at
+/// 32, which looks about like x264's 24.
+const AV1_CRF: (f64, f64) = (48.0, 22.0);
 
 /// libwebp's animation encoder at quality `q`, looping forever.
 pub(crate) fn push_animated_webp(push: &mut impl FnMut(&[&str]), q: u8) {
@@ -1755,6 +1852,119 @@ mod tests {
         .expect("plan");
         assert!(!plan.steps[0].args.iter().any(|a| a == "-t" || a == "-ss"));
         assert_eq!(plan.duration_secs(), Some(42.0));
+    }
+
+    #[test]
+    fn av1_mp4_is_ten_bit_svt_av1_with_aac() {
+        let options = ConvertOptions {
+            format: OutputFormat::Mp4,
+            video_codec: Some(VideoCodec::Av1),
+            ..ConvertOptions::default()
+        };
+        assert_eq!(
+            command(&video("garden.mov"), &options, "/clips/garden.mp4"),
+            "ffmpeg -i /clips/garden.mov -map 0:v:0 -map 0:a:0 \
+             -c:v libsvtav1 -preset 8 -crf 32 -pix_fmt yuv420p10le -c:a aac -b:a 128k -sn -dn \
+             -movflags +faststart /clips/garden.mp4"
+        );
+    }
+
+    #[test]
+    fn av1_webm_and_mkv_keep_their_sound_codecs() {
+        let input = video("garden.mov");
+        let webm = ConvertOptions {
+            format: OutputFormat::Webm,
+            video_codec: Some(VideoCodec::Av1),
+            quality: 100,
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &webm, "/clips/garden.webm");
+        assert!(
+            cmd.contains("-c:v libsvtav1 -preset 8 -crf 22 -pix_fmt yuv420p10le"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("-c:a libopus"), "{cmd}");
+        let mkv = ConvertOptions {
+            format: OutputFormat::Mkv,
+            quality: 0,
+            ..webm
+        };
+        let cmd = command(&input, &mkv, "/clips/garden.mkv");
+        assert!(cmd.contains("-c:v libsvtav1 -preset 8 -crf 48"), "{cmd}");
+        assert!(cmd.contains("-c:a aac"), "{cmd}");
+        assert!(!cmd.contains("faststart"), "{cmd}");
+    }
+
+    #[test]
+    fn video_codec_defaults_to_the_formats_usual_one() {
+        let options = |format, video_codec| ConvertOptions {
+            format,
+            video_codec,
+            ..ConvertOptions::default()
+        };
+        assert_eq!(
+            options(OutputFormat::Mp4, None).codec(),
+            Some(VideoCodec::H264)
+        );
+        assert_eq!(
+            options(OutputFormat::Webm, None).codec(),
+            Some(VideoCodec::Vp9)
+        );
+        assert_eq!(
+            options(OutputFormat::Mkv, Some(VideoCodec::Av1)).codec(),
+            Some(VideoCodec::Av1)
+        );
+        // Formats without a codec choice ignore it.
+        assert_eq!(
+            options(OutputFormat::Gif, Some(VideoCodec::Av1)).codec(),
+            None
+        );
+        let cmd = command(
+            &video("garden.mov"),
+            &options(OutputFormat::Gif, Some(VideoCodec::Av1)),
+            "/clips/garden.gif",
+        );
+        assert!(!cmd.contains("libsvtav1"), "{cmd}");
+    }
+
+    #[test]
+    fn codecs_a_format_cant_hold_are_refused() {
+        for (format, codec) in [
+            (OutputFormat::Mov, VideoCodec::Av1),
+            (OutputFormat::Mp4, VideoCodec::Vp9),
+            (OutputFormat::Webm, VideoCodec::H264),
+        ] {
+            let options = ConvertOptions {
+                format,
+                video_codec: Some(codec),
+                ..ConvertOptions::default()
+            };
+            let out = format!("/clips/garden.{}", format.extension());
+            let err = plan(
+                &video("garden.mov"),
+                &options,
+                Path::new(&out),
+                JxlSupport::default(),
+            )
+            .expect_err("refused");
+            assert!(
+                err.to_string()
+                    .contains(&format!("can't hold {} video", codec.label())),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_codec_parses_from_json() {
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "webm", "videoCodec": "av1"}))
+                .expect("parse");
+        assert_eq!(options.video_codec, Some(VideoCodec::Av1));
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp4", "videoCodec": null}))
+                .expect("parse");
+        assert_eq!(options.codec(), Some(VideoCodec::H264));
     }
 
     #[test]

@@ -29,7 +29,8 @@ mod sequence;
 
 pub use convert::{
     ConvertOptions, Crop, CropArea, Direction, JxlOptions, JxlSupport, Metadata, OutputFormat,
-    Plan, SoundOptions, Step, Support, Tool, frame_output_path, frame_plan, output_path, plan,
+    Plan, SoundOptions, Step, Support, Tool, VideoCodec, frame_output_path, frame_plan,
+    output_path, plan,
 };
 pub use error::{Error, Result};
 pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, RunProgress};

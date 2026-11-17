@@ -12,6 +12,7 @@ import {
   Switch,
 } from "solid-js";
 import { CatPeek } from "../components/Cat";
+import { CodecField } from "../components/CodecField";
 import { CropOverlay } from "../components/CropOverlay";
 import { Icon } from "../components/Icon";
 import { QualityField } from "../components/QualityField";
@@ -32,7 +33,9 @@ import { describeEstimate } from "../lib/estimate";
 import { baseName, formatBytes, formatClock, formatSpan, parseClock } from "../lib/format";
 import {
   autoLimits,
+  CODEC_LABELS,
   changesPlayback,
+  codecOf,
   DIRECTIONS,
   FADE_CHOICES,
   fadeSpans,
@@ -60,12 +63,14 @@ import {
 import { FALLBACK_FPS, stepFrame } from "../lib/frames";
 import { createFilmstrip, createFrame, createWaveform } from "../lib/preview";
 import {
+  canRead,
   closeEditor,
   convertAll,
   convertDraft,
   convertEach,
   type Draft,
   isAvailable,
+  isCodecAvailable,
   makeAnimation,
   saveFrame,
   saveRecipe,
@@ -384,7 +389,17 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     }
   };
   const estimate = createMemo(() => describeEstimate(info(), options()));
-  const ready = () => state.ffmpeg?.found === true && isAvailable(options().format);
+  const codec = () => (animatedImage() ? null : codecOf(options()));
+  const readable = () => canRead(info());
+  const ready = () => {
+    const chosen = codec();
+    return (
+      state.ffmpeg?.found === true &&
+      readable() &&
+      isAvailable(options().format) &&
+      (chosen === null || isCodecAvailable(chosen))
+    );
+  };
 
   const summary = createMemo(() => {
     const o = options();
@@ -434,6 +449,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       if (fadeIn > 0) items.push({ icon: "fade", text: `Fades in ${formatSpan(fadeIn)}` });
       if (fadeOut > 0) items.push({ icon: "fade", text: `Fades out ${formatSpan(fadeOut)}` });
     }
+    const chosen = codec();
+    if (chosen === "av1") items.push({ icon: "sparkle", text: CODEC_LABELS[chosen] });
     if (isJxl() && info().kind === "video") items.push({ icon: "sparkle", text: "Animated" });
     if (isJxl() && o.jxl.lossless) items.push({ icon: "sparkle", text: "Lossless" });
     if (info().hasLocation && !keepsLocation(info(), o)) {
@@ -799,6 +816,22 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               </For>
             </div>
           </fieldset>
+
+          <Show when={!readable()}>
+            <p class="lossless-note warning-note" role="alert">
+              <Icon name="alert" size={16} />
+              This file is AV1, which your ffmpeg can't read. Install one built with dav1d.
+            </p>
+          </Show>
+
+          <Show when={!animatedImage()}>
+            <CodecField
+              format={options().format}
+              codec={options().videoCodec ?? null}
+              available={isCodecAvailable}
+              onChange={(videoCodec) => updateOptions({ videoCodec })}
+            />
+          </Show>
 
           <Show
             when={!lossless()}

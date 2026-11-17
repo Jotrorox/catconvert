@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the media tools the desktop app bundles: ffmpeg (with x264) and a
-# decode-only ffprobe, both GPL-2.0-or-later, and libjxl's cjxl, djxl and
-# jxlinfo. Everything is built from the pinned sources in sources.lock and
+# decode-only ffprobe, both GPL-2.0-or-later and both reading AV1 with dav1d,
+# and libjxl's cjxl, djxl and jxlinfo. Everything is built from the pinned sources in sources.lock and
 # linked statically, so the binaries only need what the OS itself provides.
 #
 # Usage:
@@ -20,8 +20,9 @@
 #   <out-dir>/THIRD-PARTY-LICENSES.txt
 # The default out-dir is apps/desktop/src-tauri/binaries.
 #
-# Needs: a C/C++ toolchain, cmake (3.23+), ninja, make, pkg-config, git, curl,
-# perl, and nasm for x86_64 targets. Windows needs mingw-w64 (posix threads).
+# Needs: a C/C++ toolchain, cmake (3.23+), meson (0.54+), ninja, make,
+# pkg-config, git, curl, perl, and nasm for x86_64 targets. Windows needs
+# mingw-w64 (posix threads).
 #
 # Environment:
 #   MEDIA_TOOLS_WORK     scratch directory (default: target/media-tools)
@@ -54,8 +55,10 @@ MACOS_MIN="11.0"
 # Encoders catconvert-core asks for (crates/core/src/convert.rs).
 REQUIRED_ENCODERS="libx264 libvpx-vp9 libopus libmp3lame libwebp libwebp_anim libsvtav1 libjxl libjxl_anim aac flac pcm_s16le gif apng png mjpeg"
 # Decoders and filters it relies on beyond the usual: HEIC photos are HEVC
-# tiles that ffmpeg stitches with xstack and crops and turns upright.
-REQUIRED_DECODERS="hevc"
+# tiles that ffmpeg stitches with xstack and crops and turns upright; AV1
+# video and AVIF pictures need dav1d (ffmpeg's own av1 decoder only drives
+# hardware decoders).
+REQUIRED_DECODERS="hevc libdav1d"
 REQUIRED_FILTERS="xstack crop transpose"
 
 log() { printf '\n==> %s\n' "$*" >&2; }
@@ -273,6 +276,75 @@ cmake_install() {
   cmake --install "$src/_build"
 }
 
+# meson_install <source dir> [meson options...]
+meson_install() {
+  local src=$1 cross=()
+  shift
+  if [ "$CROSS" = 1 ]; then
+    write_meson_cross "$BUILD/meson-cross.ini"
+    cross=(--cross-file "$BUILD/meson-cross.ini")
+  fi
+  rm -rf "$src/_build"
+  (
+    # In a cross build meson applies CC, CFLAGS and so on to the build
+    # machine; they describe the target here, so leave it the defaults.
+    if [ "$CROSS" = 1 ]; then unset CC CXX AR RANLIB CFLAGS CXXFLAGS LDFLAGS; fi
+    meson setup "$src/_build" "$src" \
+      ${cross[@]+"${cross[@]}"} \
+      --prefix="$PREFIX" \
+      --libdir=lib \
+      --buildtype=release \
+      --default-library=static \
+      "$@"
+  )
+  meson compile -C "$src/_build" -j "$JOBS"
+  meson install -C "$src/_build"
+}
+
+# meson_list <flags>: "-arch x86_64 -O2" as a meson array, ['-arch', 'x86_64', '-O2'].
+meson_list() {
+  local out="" flag
+  for flag in $1; do out="$out${out:+, }'$flag'"; done
+  printf '[%s]' "$out"
+}
+
+# Meson takes a cross build's compiler and flags from a file rather than from
+# CC/CFLAGS, which it keeps for the build machine.
+write_meson_cross() {
+  local file=$1 system cpu tool path
+  case $OS in
+    macos) system=darwin ;;
+    windows) system=windows ;;
+    *) die "no meson cross file for $OS" ;;
+  esac
+  cpu=$ARCH
+  {
+    echo "[binaries]"
+    echo "c = '$CC'"
+    echo "cpp = '$CXX'"
+    echo "ar = '${AR:-ar}'"
+    echo "strip = '${STRIP_CMD%% *}'"
+    for tool in nasm pkg-config "${CROSS_PREFIX}windres"; do
+      path=$(command -v "$tool" || true)
+      [ -n "$path" ] || continue
+      case $tool in *windres) tool=windres ;; esac
+      echo "$tool = '$path'"
+    done
+    echo
+    echo "[built-in options]"
+    echo "c_args = $(meson_list "$CFLAGS")"
+    echo "c_link_args = $(meson_list "$LDFLAGS")"
+    echo "cpp_args = $(meson_list "$CXXFLAGS")"
+    echo "cpp_link_args = $(meson_list "$LDFLAGS")"
+    echo
+    echo "[host_machine]"
+    echo "system = '$system'"
+    echo "cpu_family = '$cpu'"
+    echo "cpu = '$cpu'"
+    echo "endian = 'little'"
+  } >"$file"
+}
+
 # autotools_install <source dir> [configure options...]
 autotools_install() {
   local src=$1
@@ -442,11 +514,17 @@ build_svt_av1() {
     ${extra[@]+"${extra[@]}"}
 }
 
+build_dav1d() {
+  unpack dav1d
+  meson_install "$UNPACKED" -Dbitdepths=8,16 -Denable_asm=true -Denable_tools=false \
+    -Denable_examples=false -Denable_tests=false -Denable_docs=false
+}
+
 # ffmpeg is built twice from the same source. The full build gives ffmpeg with
 # every encoder the app uses. ffprobe only ever reads files, so the second build
 # leaves out encoders, muxers, filters and the encoder-only libraries (x264,
 # SVT-AV1, LAME, libwebp, libvpx), which would otherwise more than double its
-# size for nothing.
+# size for nothing. Both get the decoders: libjxl and dav1d.
 build_ffmpeg() {
   local hw=()
   [ "$OS" = macos ] && hw=(--enable-videotoolbox --enable-audiotoolbox)
@@ -497,6 +575,7 @@ configure_ffmpeg() {
     --disable-network
     --enable-zlib
     --enable-libjxl
+    --enable-libdav1d
     "$@"
   )
   case $OS in
@@ -692,6 +771,7 @@ build_target() {
   build_lame
   build_libwebp
   build_svt_av1
+  build_dav1d
   build_ffmpeg
   collect "$out"
   smoke_test "$out"

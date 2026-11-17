@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 
 use catconvert_core::{
     ConvertOptions, Crop, Direction, Ffmpeg, Fit, JxlOptions, Metadata, OutputFormat, Plan,
-    RunOutcome, SequenceOptions, SoundOptions,
+    RunOutcome, SequenceOptions, SoundOptions, VideoCodec,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -63,6 +63,10 @@ enum Command {
         /// 0 = smallest file, 100 = best quality.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u8).range(0..=100))]
         quality: u8,
+        /// MP4, MKV and WebM: video codec. Defaults to H.264 (VP9 for WebM);
+        /// AV1 makes smaller files and keeps HDR, but is slower. MOV is H.264 only.
+        #[arg(long, value_enum)]
+        codec: Option<Codec>,
         /// Drop the audio track.
         #[arg(long)]
         mute: bool,
@@ -133,6 +137,9 @@ enum Command {
         /// 0 = smallest file, 100 = best quality.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u8).range(0..=100))]
         quality: u8,
+        /// MP4 slideshow: video codec (H.264 unless set).
+        #[arg(long, value_enum)]
+        codec: Option<Codec>,
         /// JPEG XL: mathematically lossless.
         #[arg(long)]
         lossless: bool,
@@ -205,6 +212,24 @@ impl From<Playback> for Direction {
     }
 }
 
+/// CLI mirror of [`VideoCodec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Codec {
+    H264,
+    Vp9,
+    Av1,
+}
+
+impl From<Codec> for VideoCodec {
+    fn from(codec: Codec) -> Self {
+        match codec {
+            Codec::H264 => Self::H264,
+            Codec::Vp9 => Self::Vp9,
+            Codec::Av1 => Self::Av1,
+        }
+    }
+}
+
 /// CLI mirror of [`OutputFormat`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
@@ -257,10 +282,13 @@ fn parse_aspect(text: &str) -> Result<[u32; 2], String> {
 
 fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<(), String> {
     let ffmpeg = Ffmpeg::locate().map_err(|e| e.to_string())?;
-    if let Some(reason) = ffmpeg.missing(options.format) {
+    if let Some(reason) = ffmpeg.missing_output(options) {
         return Err(reason);
     }
     let info = ffmpeg.probe(file).map_err(|e| e.to_string())?;
+    if let Some(reason) = ffmpeg.unreadable(&info) {
+        return Err(reason);
+    }
     let output = catconvert_core::output_path(&info.path, options.format, |_| false);
     let plan = catconvert_core::plan(&info, options, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
@@ -274,7 +302,10 @@ fn animate(
     dry_run: bool,
 ) -> Result<(), String> {
     let ffmpeg = Ffmpeg::locate().map_err(|e| e.to_string())?;
-    if let Some(reason) = ffmpeg.missing_animation(options.format) {
+    if let Some(reason) = ffmpeg
+        .missing_animation(options.format)
+        .or_else(|| ffmpeg.missing_output(options))
+    {
         return Err(reason);
     }
     let infos = pictures
@@ -282,6 +313,9 @@ fn animate(
         .map(|path| ffmpeg.probe(path))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+    if let Some(reason) = infos.iter().find_map(|info| ffmpeg.unreadable(info)) {
+        return Err(reason);
+    }
     let output = catconvert_core::sequence_output_path(&infos, options.format, |_| false);
     let plan = catconvert_core::plan_sequence(&infos, options, sequence, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
@@ -351,6 +385,7 @@ fn main() -> ExitCode {
             flip,
             crop,
             quality,
+            codec,
             mute,
             normalize,
             fade_in,
@@ -378,6 +413,7 @@ fn main() -> ExitCode {
                 }),
                 quality,
                 keep_audio: !mute,
+                video_codec: codec.map(Into::into),
                 jxl: JxlOptions {
                     lossless,
                     effort,
@@ -408,6 +444,7 @@ fn main() -> ExitCode {
             rotate,
             flip,
             quality,
+            codec,
             lossless,
             effort,
             dry_run,
@@ -418,6 +455,7 @@ fn main() -> ExitCode {
                 rotate,
                 flip,
                 quality,
+                video_codec: codec.map(Into::into),
                 jxl: JxlOptions {
                     lossless,
                     effort,
@@ -564,10 +602,25 @@ mod tests {
             "9:16",
         ])
         .expect("parse");
-        let Command::Convert { crop, .. } = cli.command else {
+        let Command::Convert { crop, codec, .. } = cli.command else {
             panic!("expected convert");
         };
         assert_eq!(crop, Some([9, 16]));
+        assert_eq!(codec, None);
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "convert",
+            "a",
+            "--to",
+            "mkv",
+            "--codec",
+            "av1",
+        ])
+        .expect("parse");
+        let Command::Convert { codec, .. } = cli.command else {
+            panic!("expected convert");
+        };
+        assert_eq!(codec.map(VideoCodec::from), Some(VideoCodec::Av1));
         for bad in ["9x16", "0:1", "1:"] {
             assert!(
                 Cli::try_parse_from(["catconvert", "convert", "a", "--to", "mp4", "--crop", bad])
