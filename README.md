@@ -43,6 +43,9 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
   CatConvert" Finder Quick Action, and finished files drag straight out of the
   Queue and History.
 - **Batch and recipes:** convert many files at once with saved settings.
+- **Convert again:** History remembers what each file was made from and how.
+  Reopen the original (or an animation's pictures) with those settings, or with
+  a recipe, change what you like and convert once more.
 - **Edit the command:** tweak the ffmpeg (or libjxl) arguments by hand before
   converting, and keep the edit in a recipe. It runs without a shell, only
   with CatConvert's tools, and still writes only the chosen output.
