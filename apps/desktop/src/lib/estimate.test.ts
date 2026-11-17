@@ -16,6 +16,7 @@ const clip: MediaInfo = {
   videoCodec: "h264",
   audioCodec: "aac",
   reconstructsJpeg: false,
+  tileGrid: null,
 };
 
 const photo: MediaInfo = {
