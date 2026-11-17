@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -20,8 +21,8 @@ impl MediaKind {
     #[must_use]
     pub fn from_extension(ext: &str) -> Self {
         match ext.to_ascii_lowercase().as_str() {
-            "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "heic" | "heif" | "tif" | "tiff"
-            | "bmp" | "jxl" | "apng" => Self::Image,
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "heic" | "heif" | "hif" | "tif"
+            | "tiff" | "bmp" | "jxl" | "apng" => Self::Image,
             "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "wmv" | "mpg" | "mpeg" => Self::Video,
             "mp3" | "m4a" | "aac" | "flac" | "wav" | "ogg" | "opus" | "aiff" | "wma" => Self::Audio,
             _ => Self::Unknown,
@@ -71,6 +72,11 @@ pub struct MediaInfo {
     /// original JPEG can be restored bit for bit.
     #[serde(default)]
     pub reconstructs_jpeg: bool,
+    /// HEIF/AVIF only: index of the stream group (a tile grid) holding the
+    /// picture. Large HEIC photos are stored as tiles that ffprobe lists as
+    /// separate streams; ffmpeg stitches them back together from this group.
+    #[serde(default)]
+    pub tile_grid: Option<usize>,
 }
 
 impl MediaInfo {
@@ -79,6 +85,32 @@ impl MediaInfo {
     pub fn has_audio(&self) -> bool {
         self.audio_codec.is_some()
     }
+}
+
+/// Whether a file is HEIF (HEIC, AVIF, …), judging by the brands in its
+/// `ftyp` box. MP4 and QuickTime files share the box but not these brands.
+#[must_use]
+pub fn is_heif_file(path: &Path) -> bool {
+    const BRANDS: [&[u8; 4]; 10] = [
+        b"mif1", b"msf1", b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"avif", b"avis",
+    ];
+    let mut head = Vec::with_capacity(64);
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.take(64).read_to_end(&mut head).is_err() || head.len() < 12 || &head[4..8] != b"ftyp" {
+        return false;
+    }
+    // Box size, type, major brand, minor version, then compatible brands.
+    let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+    let (compatible, _) = head
+        .get(16..size.min(head.len()))
+        .unwrap_or_default()
+        .as_chunks::<4>();
+    let major = [head[8], head[9], head[10], head[11]];
+    std::iter::once(&major)
+        .chain(compatible)
+        .any(|brand| BRANDS.contains(&brand))
 }
 
 /// Inspect a file and return its [`MediaInfo`].
@@ -127,6 +159,7 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         audio_codec: None,
         sample_rate: None,
         reconstructs_jpeg: false,
+        tile_grid: None,
     })
 }
 
@@ -155,6 +188,7 @@ pub(crate) mod tests {
             audio_codec: None,
             sample_rate: None,
             reconstructs_jpeg: false,
+            tile_grid: None,
         }
     }
 
@@ -176,6 +210,24 @@ pub(crate) mod tests {
         assert_eq!(info.extension.as_deref(), Some("jpg"));
         assert_eq!(info.size_bytes, 1234);
         assert_eq!(info.kind, MediaKind::Image);
+    }
+
+    #[test]
+    fn recognises_heif_by_its_brands() {
+        // iPhone: major brand heic, compatible mif1, heic.
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic";
+        let (_dir, path) = temp_file("photo.jpg", heic);
+        assert!(is_heif_file(&path), "brand, not extension, decides");
+        // AVIF lists its brand among the compatible ones.
+        let avif = b"\0\0\0\x1cftypmif1\0\0\0\0mif1avifmiaf";
+        let (_dir, path) = temp_file("a.avif", avif);
+        assert!(is_heif_file(&path));
+        // MP4 and QuickTime use the same box with other brands.
+        let mp4 = b"\0\0\0\x18ftypisom\0\0\x02\0isomiso2";
+        let (_dir, path) = temp_file("clip.mp4", mp4);
+        assert!(!is_heif_file(&path));
+        let (_dir, path) = temp_file("tiny.heic", b"ftyp");
+        assert!(!is_heif_file(&path));
     }
 
     #[test]

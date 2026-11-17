@@ -68,6 +68,7 @@ const VIDEO: MediaInfo = {
   audioCodec: "aac",
   sampleRate: 48000,
   reconstructsJpeg: false,
+  tileGrid: null,
 };
 
 const PHOTO: MediaInfo = {
@@ -92,6 +93,7 @@ const PACKED: MediaInfo = {
   extension: "jxl",
   videoCodec: "jpegxl",
   reconstructsJpeg: true,
+  tileGrid: null,
 };
 
 const SONG: MediaInfo = {
@@ -236,6 +238,7 @@ describe("CatConvert", () => {
       fps: null,
       rotate: 90,
       flip: false,
+      crop: null,
       quality: 60,
       keepAudio: false,
       jxl: { lossless: false, effort: 7, progressive: false },
@@ -267,6 +270,55 @@ describe("CatConvert", () => {
     expect(api.revealInFolder).toHaveBeenCalledWith("/clips/clip.webm");
     expect(screen.getByText("All done. Purrfect.")).toBeInTheDocument();
     expect(state.history[0]?.outputBytes).toBe(3_000_000);
+  });
+
+  it("crops to a shape that follows the picture when it turns", async () => {
+    await openVideo();
+    expect(screen.queryByRole("group", { name: "Crop shape" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Crop" }));
+    expect(screen.getByRole("button", { name: "Crop" })).toHaveAttribute("aria-pressed", "true");
+    const shapes = within(screen.getByRole("group", { name: "Crop shape" }));
+    expect(shapes.getByRole("button", { name: "Free" })).toHaveAttribute("aria-pressed", "true");
+    expect(shapes.getByRole("button", { name: "Reset" })).toBeDisabled();
+
+    fireEvent.click(shapes.getByRole("button", { name: "9:16" }));
+    expect(shapes.getByRole("button", { name: "9:16" })).toHaveAttribute("aria-pressed", "true");
+    const changes = () =>
+      within(screen.getByRole("list", { name: "Changes" }))
+        .getAllByRole("listitem")
+        .map((li) => li.textContent);
+    expect(changes()).toEqual(["Cropped 9:16"]);
+    // 9:16 of 1920×1080 is 608×1080, so sizes are offered for a 608 px wide picture.
+    expect(screen.getByRole("combobox", { name: "Size" })).toHaveDisplayValue("Original (608p)");
+
+    // Turning the picture turns the crop with it.
+    fireEvent.click(screen.getByRole("button", { name: "Rotate 90°" }));
+    expect(shapes.getByRole("button", { name: "16:9" })).toHaveAttribute("aria-pressed", "true");
+    expect(changes()).toEqual(["Turned 90°", "Cropped 16:9"]);
+
+    // Free keeps the box but lets it change shape.
+    fireEvent.click(shapes.getByRole("button", { name: "Free" }));
+    expect(changes()).toEqual(["Turned 90°", "Cropped 1080×608"]);
+    fireEvent.click(shapes.getByRole("button", { name: "1:1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Done cropping" }));
+    expect(screen.queryByRole("group", { name: "Crop shape" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ rotate: 90, crop: { aspect: [1, 1], area: null } }),
+    );
+  });
+
+  it("resets a crop", async () => {
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "Crop" }));
+    const shapes = within(screen.getByRole("group", { name: "Crop shape" }));
+    fireEvent.click(shapes.getByRole("button", { name: "1:1" }));
+    fireEvent.click(shapes.getByRole("button", { name: "Reset" }));
+    expect(state.draft?.options.crop).toBeNull();
+    expect(screen.getByText("Same picture and length, fresh format.")).toBeInTheDocument();
   });
 
   it("handles progress events that arrive before startJob resolves", async () => {

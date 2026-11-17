@@ -38,6 +38,8 @@ export type MediaInfo = {
   sampleRate: number | null;
   /** JPEG XL only: a losslessly recompressed JPEG whose original can be restored. */
   reconstructsJpeg: boolean;
+  /** HEIF only: the stream group ffmpeg stitches a tiled photo from. */
+  tileGrid: number | null;
 };
 
 export type OutputFormat =
@@ -58,6 +60,20 @@ export type OutputFormat =
   | "jxl";
 
 export type Rotation = 0 | 90 | 180 | 270;
+
+/** Width to height, e.g. `[9, 16]`. */
+export type Aspect = [number, number];
+
+/** A rectangle in fractions (0 to 1) of the picture's width and height. */
+export type CropArea = { x: number; y: number; width: number; height: number };
+
+/** Part of the picture to keep, measured after the turn and mirror. */
+export type Crop = {
+  /** `null` for a free-form crop. */
+  aspect: Aspect | null;
+  /** `null` keeps the largest centred area with `aspect`, on any file. */
+  area: CropArea | null;
+};
 
 /** Settings that only matter when writing JPEG XL. */
 export type JxlOptions = {
@@ -98,6 +114,7 @@ export type ConvertOptions = {
   fps: number | null;
   rotate: Rotation;
   flip: boolean;
+  crop: Crop | null;
   /** 0 = smallest file, 100 = best quality. */
   quality: number;
   keepAudio: boolean;
@@ -282,7 +299,8 @@ export async function pickFiles(): Promise<string[]> {
         extensions: [
           ...["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpg", "mpeg", "gif", "apng"],
           ...["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "aiff", "wma"],
-          ...["jpg", "jpeg", "png", "webp", "avif", "jxl", "heic", "heif", "tif", "tiff", "bmp"],
+          ...["jpg", "jpeg", "png", "webp", "avif", "jxl", "tif", "tiff", "bmp"],
+          ...["heic", "heif", "hif"],
         ],
       },
     ],

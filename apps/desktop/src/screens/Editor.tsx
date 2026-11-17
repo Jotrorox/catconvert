@@ -10,9 +10,21 @@ import {
   Show,
 } from "solid-js";
 import { CatPeek } from "../components/Cat";
+import { CropOverlay } from "../components/CropOverlay";
 import { Icon } from "../components/Icon";
 import { TrimBar } from "../components/TrimBar";
-import { type ConvertOptions, type MediaInfo, previewCommand } from "../lib/api";
+import { type Aspect, type ConvertOptions, type MediaInfo, previewCommand } from "../lib/api";
+import {
+  ASPECTS,
+  cropBox,
+  cropLabel,
+  keptArea,
+  mirrorCrop,
+  type Size,
+  sameAspect,
+  turnCrop,
+  turnedSize,
+} from "../lib/crop";
 import { describeEstimate } from "../lib/estimate";
 import { baseName, formatBytes, formatClock, formatSpan, parseClock } from "../lib/format";
 import {
@@ -131,10 +143,62 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   const quarterTurn = () => options().rotate % 180 === 90;
 
   // Rotation is shown as a continuous spin rather than snapping back from 270 to 0.
+  // A crop turns and mirrors along with the picture, so it keeps the same pixels.
   const [spin, setSpin] = createSignal(options().rotate as number);
+  // When the picture last started to turn or mirror (not reactive).
+  let lastTurn = Number.NEGATIVE_INFINITY;
   const rotate = () => {
+    lastTurn = performance.now();
     setSpin((s) => s + 90);
-    updateOptions({ rotate: ((options().rotate + 90) % 360) as ConvertOptions["rotate"] });
+    const crop = options().crop;
+    updateOptions({
+      rotate: ((options().rotate + 90) % 360) as ConvertOptions["rotate"],
+      crop: crop && turnCrop(crop),
+    });
+  };
+  const mirror = () => {
+    lastTurn = performance.now();
+    const crop = options().crop;
+    updateOptions({ flip: !options().flip, crop: crop && mirrorCrop(crop) });
+  };
+
+  // Crop ----------------------------------------------------------------------
+
+  const picture = () => turnedSize(info(), options().rotate);
+  const [cropping, setCropping] = createSignal(false);
+  // Size of the preview image on screen, measured because small frames aren't
+  // scaled up to fill the preview.
+  const [imageSize, setImageSize] = createSignal<Size | null>(null);
+  const shown = (): Size | null => {
+    const size = imageSize();
+    if (!size) return null;
+    return quarterTurn() ? { width: size.height, height: size.width } : size;
+  };
+  let resizeObserver: ResizeObserver | undefined;
+  const watchImage = (img: HTMLImageElement) => {
+    const measure = () =>
+      setImageSize(img.offsetWidth ? { width: img.offsetWidth, height: img.offsetHeight } : null);
+    img.addEventListener("load", measure);
+    resizeObserver?.disconnect();
+    if (typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(measure);
+      resizeObserver.observe(img);
+    }
+    queueMicrotask(measure);
+  };
+  onCleanup(() => resizeObserver?.disconnect());
+
+  const chooseAspect = (aspect: Aspect | null) => {
+    const crop = options().crop;
+    const size = picture();
+    if (aspect) {
+      updateOptions({ crop: { aspect: [...aspect], area: null } });
+    } else if (crop?.aspect && size) {
+      // Free keeps the box where it is, just without a fixed shape.
+      updateOptions({
+        crop: cropBox(size, crop) ? { aspect: null, area: keptArea(size, crop) } : null,
+      });
+    }
   };
 
   // Command preview ---------------------------------------------------------
@@ -189,14 +253,14 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   // Settings ------------------------------------------------------------------
 
   const step = () => qualityStep(options().quality);
-  const sizes = createMemo(() => sizeChoices(info()));
+  const sizes = createMemo(() => sizeChoices(info(), options()));
   const rates = createMemo(() => fpsChoices(info()));
   const isJxl = () => options().format === "jxl";
   const animatedImage = () => isAnimatedImage(options().format, info().kind);
   const auto = () => autoLimits(options().format, info().kind);
   const autoSize = () => {
     const limit = auto()?.size;
-    return limit !== undefined && (shortSide(info()) ?? 0) > limit ? limit : null;
+    return limit !== undefined && (shortSide(info(), options()) ?? 0) > limit ? limit : null;
   };
   const autoFps = () => {
     const limit = auto()?.fps;
@@ -230,6 +294,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
         | "image"
         | "rotate"
         | "flip"
+        | "crop"
         | "music"
         | "clock"
         | "sparkle"
@@ -245,6 +310,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       if (size !== null) items.push({ icon: "image", text: sizeLabel(size, outKind()) });
       if (o.rotate) items.push({ icon: "rotate", text: `Turned ${o.rotate}°` });
       if (o.flip) items.push({ icon: "flip", text: "Mirrored" });
+      const cropped = cropLabel(picture(), o.crop);
+      if (cropped) items.push({ icon: "crop", text: cropped });
       const fps = o.fps ?? (outKind() === "video" ? autoFps() : null);
       if (outKind() === "video" && fps !== null) items.push({ icon: "clock", text: `${fps} fps` });
     }
@@ -320,7 +387,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               type="button"
               class="link-btn"
               disabled={!ready()}
-              title="Queue every waiting file with these settings. The trim stays with this file."
+              title="Queue every waiting file with these settings. The trim and where the crop sits stay with this file."
               onClick={() => void convertAll()}
             >
               <Icon name="paw" size={14} /> Convert all {state.inbox.length + 1} like this
@@ -337,7 +404,10 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
           <div
             class="preview"
             data-kind={info().kind}
-            classList={{ "out-audio": outKind() === "audio" && info().kind !== "audio" }}
+            classList={{
+              "out-audio": outKind() === "audio" && info().kind !== "audio",
+              cropping: cropping() && visual(),
+            }}
           >
             <Show
               when={hasPicture()}
@@ -353,6 +423,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               <Show when={frame()} fallback={<div class="preview-skeleton" />}>
                 {(src) => (
                   <img
+                    ref={watchImage}
                     class="preview-img"
                     classList={{ quarter: quarterTurn() }}
                     src={src()}
@@ -364,6 +435,64 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                   />
                 )}
               </Show>
+            </Show>
+            <Show when={visual() && picture() && shown() && (cropping() || options().crop)}>
+              {/* Recreated after a turn or mirror so it fades in once the picture settles. */}
+              <Show when={`${options().rotate}-${options().flip}`} keyed>
+                {(_turn) => (
+                  <CropOverlay
+                    picture={picture() as Size}
+                    shown={shown() as Size}
+                    crop={options().crop}
+                    editing={cropping()}
+                    settle={performance.now() - lastTurn < 600}
+                    onChange={(crop) => updateOptions({ crop })}
+                    onDone={() => setCropping(false)}
+                  />
+                )}
+              </Show>
+            </Show>
+            <Show when={visual() && cropping()}>
+              <fieldset class="crop-bar" aria-label="Crop shape">
+                <For each={ASPECTS}>
+                  {(preset) => (
+                    <button
+                      type="button"
+                      class="crop-chip"
+                      aria-pressed={sameAspect(options().crop?.aspect ?? null, preset.aspect)}
+                      onClick={() => chooseAspect(preset.aspect)}
+                    >
+                      <span
+                        class="aspect-glyph"
+                        classList={{ free: !preset.aspect }}
+                        style={
+                          preset.aspect
+                            ? { "aspect-ratio": `${preset.aspect[0]} / ${preset.aspect[1]}` }
+                            : undefined
+                        }
+                      />
+                      {preset.label}
+                    </button>
+                  )}
+                </For>
+                <span class="crop-bar-gap" />
+                <button
+                  type="button"
+                  class="crop-chip plain"
+                  disabled={!options().crop}
+                  onClick={() => updateOptions({ crop: null })}
+                >
+                  Reset
+                </button>
+                <button
+                  type="button"
+                  class="crop-chip done"
+                  aria-label="Done cropping"
+                  onClick={() => setCropping(false)}
+                >
+                  <Icon name="check" size={16} />
+                </button>
+              </fieldset>
             </Show>
             <Show when={info().kind === "video"}>
               <span class="preview-badge mono">{formatClock(scrub(), true)}</span>
@@ -390,10 +519,22 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                   aria-label="Mirror"
                   title="Mirror"
                   aria-pressed={options().flip}
-                  onClick={() => updateOptions({ flip: !options().flip })}
+                  onClick={mirror}
                 >
                   <Icon name="flip" size={20} />
                 </button>
+                <Show when={picture()}>
+                  <button
+                    type="button"
+                    class="tool-btn"
+                    aria-label="Crop"
+                    title="Crop"
+                    aria-pressed={cropping()}
+                    onClick={() => setCropping(!cropping())}
+                  >
+                    <Icon name="crop" size={20} />
+                  </button>
+                </Show>
               </div>
             </Show>
           </div>
@@ -568,7 +709,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                     <option value="" selected={options().maxSize === null}>
                       {autoSize() !== null
                         ? `Auto (${sizeLabel(autoSize() ?? 0, outKind())})`
-                        : `Original (${sizeLabel(shortSide(info()) ?? 0, info().kind)})`}
+                        : `Original (${sizeLabel(shortSide(info(), options()) ?? 0, info().kind)})`}
                     </option>
                     <For each={sizes()}>
                       {(size) => (
@@ -825,7 +966,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               </button>
             </form>
             <p class="item-meta">
-              Keeps the format and settings; trims and turns stay with each file.
+              Keeps the format, settings and crop shape; trims and turns stay with each file.
             </p>
           </Show>
 
