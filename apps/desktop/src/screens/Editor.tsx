@@ -13,6 +13,7 @@ import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
 import { TrimBar } from "../components/TrimBar";
 import { type ConvertOptions, type MediaInfo, previewCommand } from "../lib/api";
+import { describeEstimate } from "../lib/estimate";
 import { baseName, formatBytes, formatClock, formatSpan, parseClock } from "../lib/format";
 import {
   autoLimits,
@@ -209,6 +210,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     format === "jxl"
       ? "Install libjxl (brew install jpeg-xl) or an ffmpeg with libjxl to write JXL"
       : `Your ffmpeg can't write ${label(format)}`;
+  const estimate = createMemo(() => describeEstimate(info(), options()));
   const ready = () => state.ffmpeg?.found === true && isAvailable(options().format);
 
   const summary = createMemo(() => {
@@ -501,6 +503,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 type="range"
                 min="0"
                 max="100"
+                aria-describedby={estimate() ? "size-estimate" : undefined}
                 value={options().quality}
                 style={{ "--pct": `${options().quality}%` }}
                 onInput={(event) => updateOptions({ quality: event.currentTarget.valueAsNumber })}
@@ -511,6 +514,18 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 </For>
               </div>
             </div>
+          </Show>
+
+          <Show when={estimate()}>
+            {(text) => (
+              <p
+                id="size-estimate"
+                class="estimate"
+                title="A rough guess from the original and these settings. The real size depends on what's in the file."
+              >
+                {text()}
+              </p>
+            )}
           </Show>
 
           <Show when={visual() || (outKind() === "video" && info().kind === "video")}>
