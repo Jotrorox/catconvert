@@ -16,7 +16,8 @@ catconvert-core = { path = "crates/core" }
 
 # Tauri and UniFFI are pinned exactly: the Tauri crate must stay in lockstep with
 # @tauri-apps/cli and @tauri-apps/api, and uniffi with the future uniffi-bindgen.
-tauri = { version = "=2.12.6", features = [] }
+# protocol-asset: the editor plays audio straight from disk (see `playback_source`).
+tauri = { version = "=2.12.6", features = ["protocol-asset"] }
 tauri-build = { version = "=2.7.5", features = [] }
 # Official plugins, in lockstep with @tauri-apps/plugin-* in apps/desktop/package.json.
 tauri-plugin-dialog = "=2.8.4"

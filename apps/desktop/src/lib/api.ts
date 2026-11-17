@@ -6,7 +6,7 @@
  * place. The types mirror the serde output of `catconvert-core` (camelCase).
  */
 import { getVersion } from "@tauri-apps/api/app";
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -232,6 +232,8 @@ type Commands = {
     args: { path: string; width: number; height: number; color: string };
     result: ArrayBuffer;
   };
+  playback_source: { args: { path: string; decode: boolean }; result: string };
+  loudness: { args: { path: string }; result: number | null };
   preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
   save_frame: { args: { path: string; options: ConvertOptions; at: number }; result: SavedFrame };
   preview_sequence_command: {
@@ -342,6 +344,21 @@ export async function waveform(
   color: string,
 ): Promise<string> {
   return blobUrl(await command("waveform", { path, width, height, color }), "image/png");
+}
+
+/**
+ * A URL an `<audio>` element can play `path` from (Tauri's asset protocol).
+ * With `decode`, the sound is first decoded to a temporary WAV file, for
+ * formats the webview can't play itself.
+ */
+export async function playbackUrl(path: string, decode = false): Promise<string> {
+  if (!inTauri) throw new Error("Open CatConvert as an app to play files.");
+  return convertFileSrc(await command("playback_source", { path, decode }));
+}
+
+/** Integrated loudness of the sound in LUFS, or `null` when it is silent. */
+export function loudness(path: string): Promise<number | null> {
+  return command("loudness", { path });
 }
 
 /** The command(s) a conversion would run. */
