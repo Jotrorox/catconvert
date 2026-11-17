@@ -15,9 +15,14 @@
 //! asset protocol. Its scope starts empty: [`playback_source`] adds each file
 //! as it is played, so the webview can't read anything else.
 //!
-//! Results go next to the input unless the editor picked another folder or
-//! name (an [`OutputTarget`]). ffmpeg writes them from this process, so the
-//! webview needs no file system access to the chosen folder.
+//! Results go where the conversion's [`catconvert_core::Destination`] says:
+//! next to the original, into the output folder chosen in Settings, or in
+//! the original's place. The editor can refine that with an [`OutputTarget`]:
+//! another folder, a file name or a name pattern. The webview never writes
+//! files itself (there is no fs plugin), so neither folder needs a
+//! file-system scope: the core writes there, [`prepare_output_folder`]
+//! creates and checks the Settings folder, and playback and "Show in folder"
+//! work per file as above.
 //!
 //! Files can also come in from outside the window ("Open with", the Finder
 //! Quick Action, "Send to"); see [`incoming`] and [`quick_action`].
@@ -29,9 +34,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use catconvert_core::{
-    ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, Naming, OutputFormat,
-    OutputPreview, OutputTarget, QualitySummary, Queue, SavedFrame, SequenceOptions, VideoCodec,
+    ConvertOptions, Destination, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, Naming,
+    OutputFormat, OutputPreview, OutputTarget, QualitySummary, Queue, SavedFrame, SequenceOptions,
+    VideoCodec,
 };
+
+/// Folder in Downloads suggested when "Save to a folder" is first chosen.
+const OUTPUT_FOLDER_NAME: &str = "CatConvert";
 use serde::Serialize;
 use tauri::ipc::Response;
 use tauri::path::BaseDirectory;
@@ -343,8 +352,10 @@ fn preview_plan(
     match state.queue() {
         Ok(queue) => queue.preview(info, options, target),
         Err(_) => {
-            let output = Naming::conversion(info, options).resolve(target, |_| false)?;
-            catconvert_core::plan(info, options, &output, JxlSupport::default())
+            let naming = Naming::conversion(info, options);
+            let (to, _) =
+                catconvert_core::resolve_output(&naming, &options.destination, target, |_| false)?;
+            catconvert_core::plan(info, options, &to.written, JxlSupport::default())
         }
     }
 }
@@ -354,11 +365,17 @@ fn preview_plan(
 fn output_of(
     state: &AppState,
     naming: &Naming,
+    destination: &Destination,
     target: &OutputTarget,
 ) -> Result<OutputPreview, String> {
     match state.queue() {
-        Ok(queue) => queue.output_preview(naming, target),
-        Err(_) => naming.preview(target, |_| false),
+        Ok(queue) => queue.output_preview(naming, destination, target),
+        Err(_) => catconvert_core::resolve_output(naming, destination, target, |_| false).map(
+            |(to, exists)| OutputPreview {
+                path: to.output,
+                exists,
+            },
+        ),
     }
     .map_err(|err| err.to_string())
 }
@@ -373,7 +390,12 @@ fn output_preview(
     options: ConvertOptions,
     target: OutputTarget,
 ) -> Result<OutputPreview, String> {
-    output_of(&state, &Naming::conversion(&info, &options), &target)
+    output_of(
+        &state,
+        &Naming::conversion(&info, &options),
+        &options.destination,
+        &target,
+    )
 }
 
 /// Like [`output_preview`], for the animation made from `pictures`.
@@ -387,6 +409,7 @@ fn sequence_output_preview(
     output_of(
         &state,
         &catconvert_core::sequence_naming(&pictures, &options),
+        &options.destination,
         &target,
     )
 }
@@ -456,7 +479,13 @@ fn preview_sequence_command(
 ) -> Result<String, String> {
     let support = state.ffmpeg().map(|f| f.support()).unwrap_or_default();
     let naming = catconvert_core::sequence_naming(&pictures, &options);
-    let output = output_of(&state, &naming, &target.unwrap_or_default())?.path;
+    let output = output_of(
+        &state,
+        &naming,
+        &options.destination,
+        &target.unwrap_or_default(),
+    )?
+    .path;
     catconvert_core::plan_sequence(&pictures, &options, &sequence, &output, support)
         .map(|plan| plan.command_line())
         .map_err(|err| err.to_string())
@@ -513,6 +542,39 @@ async fn missing_files(paths: Vec<String>) -> Result<Vec<String>, String> {
     })
     .await
     .map_err(|err| err.to_string())
+}
+
+/// Where Settings suggests saving converted files: `CatConvert` in the
+/// Downloads folder (or the home folder, if there is no Downloads).
+#[tauri::command]
+fn default_output_folder(app: AppHandle) -> Result<PathBuf, String> {
+    let path = app.path();
+    path.download_dir()
+        .or_else(|_| path.home_dir())
+        .map(|dir| dir.join(OUTPUT_FOLDER_NAME))
+        .map_err(|err| err.to_string())
+}
+
+/// Create the output folder chosen in Settings if need be and check that
+/// files can be written there. Returns the folder.
+#[tauri::command]
+async fn prepare_output_folder(path: String) -> Result<PathBuf, String> {
+    tauri::async_runtime::spawn_blocking(move || check_output_folder(Path::new(&path)))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn check_output_folder(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("{} isn't a full path", path.display()));
+    }
+    std::fs::create_dir_all(path)
+        .map_err(|err| format!("couldn't create {}: {err}", path.display()))?;
+    let probe = path.join(".catconvert-write-test");
+    std::fs::write(&probe, b"")
+        .map_err(|err| format!("can't save files in {}: {err}", path.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(path.to_path_buf())
 }
 
 /// Files opened from outside the app before the front end was listening.
@@ -606,6 +668,8 @@ pub fn run() {
             cancel_job,
             relaunch,
             missing_files,
+            default_output_folder,
+            prepare_output_folder,
             third_party_licenses,
             take_opened_files,
             quick_action_status,
@@ -624,4 +688,23 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             let _ = (app, event);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_folders_are_created_and_checked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let folder = dir.path().join("Converted").join("Nested");
+        assert_eq!(check_output_folder(&folder), Ok(folder.clone()));
+        assert!(folder.is_dir());
+        assert!(!folder.join(".catconvert-write-test").exists());
+
+        assert!(check_output_folder(Path::new("relative")).is_err());
+        let file = dir.path().join("a file");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(check_output_folder(&file).is_err());
+    }
 }

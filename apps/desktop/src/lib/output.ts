@@ -6,7 +6,7 @@
 import type { Collision, OutputFormat, OutputTarget } from "./api";
 
 /** The editor's choice of output: like an {@link OutputTarget}, but `collision` is `null` until asked. */
-export type OutputChoice = {
+export type SaveAs = {
   folder: string | null;
   name: string | null;
   /** `null`: ask before replacing a file, if the chosen name turns out to be taken. */
@@ -14,7 +14,7 @@ export type OutputChoice = {
 };
 
 /** Next to the original, as usual; asks nothing. */
-export const USUAL_OUTPUT: OutputChoice = { folder: null, name: null, collision: null };
+export const USUAL_OUTPUT: SaveAs = { folder: null, name: null, collision: null };
 
 /** Extensions the core reads as media (`MediaKind::from_extension`). */
 const MEDIA_EXTENSIONS = new Set([
@@ -30,7 +30,7 @@ export function isUsual(choice: { folder: string | null; name: string | null }):
 }
 
 /** The choice as the backend takes it; an unasked collision keeps both files. */
-export function targetOf(choice: OutputChoice): OutputTarget {
+export function targetOf(choice: SaveAs): OutputTarget {
   const name = choice.name?.trim() ? choice.name : null;
   return { folder: choice.folder, name, collision: choice.collision ?? "keepBoth" };
 }

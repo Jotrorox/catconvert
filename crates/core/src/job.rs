@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::convert::{self, ConvertOptions, OutputFormat, Plan};
 use crate::custom;
+use crate::destination::{self, Destination, Replaced, Target};
 use crate::ffmpeg::{Ffmpeg, RunOutcome, RunProgress};
 use crate::output::{Collision, Naming, OutputPreview, OutputTarget};
 use crate::sequence::{self, SequenceOptions};
@@ -64,6 +65,12 @@ pub struct JobProgress {
     pub speed: Option<f32>,
     /// Size of the finished file (`Done` only).
     pub output_bytes: Option<u64>,
+    /// Where the finished file is (`Done` only): the ticket's output, unless
+    /// that name was taken by another file while converting.
+    pub output: Option<PathBuf>,
+    /// What became of the original the result replaced (`Done` only, for
+    /// [`Destination::ReplaceInput`]).
+    pub replaced: Option<Replaced>,
     /// What went wrong (`Failed` only).
     pub error: Option<String>,
 }
@@ -76,6 +83,8 @@ impl JobProgress {
             progress,
             speed: None,
             output_bytes: None,
+            output: None,
+            replaced: None,
             error: None,
         }
     }
@@ -88,6 +97,8 @@ pub struct JobTicket {
     pub id: JobId,
     /// Where the result will be written.
     pub output: PathBuf,
+    /// The original the result will replace, for [`Destination::ReplaceInput`].
+    pub replaces: Option<PathBuf>,
     /// The probed input, or the pictures of an animation in the order given.
     pub inputs: Vec<MediaInfo>,
     /// The exact command(s) that will run.
@@ -107,8 +118,10 @@ type Emit = dyn Fn(JobProgress) + Send + Sync;
 struct Job {
     id: JobId,
     plan: Plan,
+    /// Where `plan` writes and where the result goes.
+    target: Target,
     /// Replace a file already at the output (see [`run_plan`]).
-    replace: bool,
+    overwrite: bool,
     cancel: Arc<AtomicBool>,
 }
 
@@ -117,7 +130,8 @@ struct Shared {
     emit: Box<Emit>,
     /// Cancel flags of jobs that are queued or running.
     active: Mutex<HashMap<JobId, Arc<AtomicBool>>>,
-    /// Output paths promised to queued jobs but not on disk yet.
+    /// Output paths promised to queued jobs but not on disk yet, and the
+    /// originals they will replace.
     reserved: Mutex<HashSet<PathBuf>>,
 }
 
@@ -169,16 +183,19 @@ impl Queue {
 
     /// Probe `input`, plan the conversion and queue it.
     ///
-    /// The output goes where `target` says: by default next to the input
-    /// under a name that is not taken (see [`convert::output_path`]). Names
-    /// queued jobs will write are never reused. A `Queued` event is emitted
-    /// before this returns.
+    /// The output goes where `options.destination` says, refined by `target`
+    /// (another folder, a name or name pattern), under a name that is not
+    /// taken unless `target` says to replace it (see
+    /// [`destination::resolve_output`]); its folder is created if need be.
+    /// Names queued jobs will write are never reused. A `Queued` event is
+    /// emitted before this returns.
     ///
     /// # Errors
     ///
     /// Probe errors, [`Error::Unsupported`] if the options do not fit the input,
-    /// the tools to write the format are missing or the target is invalid
-    /// (see [`Naming::resolve`]).
+    /// the tools to write the format are missing, the target is invalid or
+    /// the file is already queued to be replaced, and [`Error::Io`] if the
+    /// output folder can't be created.
     pub fn submit(
         &self,
         input: impl AsRef<Path>,
@@ -202,20 +219,33 @@ impl Queue {
         target: &OutputTarget,
     ) -> Result<Plan> {
         let reserved = lock(&self.shared.reserved);
-        let output = Naming::conversion(info, options).resolve(target, |p| reserved.contains(p))?;
-        convert::plan(info, options, &output, self.shared.ffmpeg.support())
+        let naming = Naming::conversion(info, options);
+        let (to, _) = destination::resolve_output(&naming, &options.destination, target, |p| {
+            reserved.contains(p)
+        })?;
+        convert::plan(info, options, &to.written, self.shared.ffmpeg.support())
     }
 
-    /// Where a result named by `naming` would go with `target` right now,
-    /// and whether it would replace a file. Names queued jobs will write
-    /// count as taken.
+    /// Where a result named by `naming` would go for `destination` and
+    /// `target` right now, and whether it would replace a file there. Names
+    /// queued jobs will write count as taken.
     ///
     /// # Errors
     ///
-    /// As [`Naming::preview`].
-    pub fn output_preview(&self, naming: &Naming, target: &OutputTarget) -> Result<OutputPreview> {
+    /// As [`destination::resolve_output`].
+    pub fn output_preview(
+        &self,
+        naming: &Naming,
+        destination: &Destination,
+        target: &OutputTarget,
+    ) -> Result<OutputPreview> {
         let reserved = lock(&self.shared.reserved);
-        naming.preview(target, |p| reserved.contains(p))
+        let (to, exists) =
+            destination::resolve_output(naming, destination, target, |p| reserved.contains(p))?;
+        Ok(OutputPreview {
+            path: to.output,
+            exists,
+        })
     }
 
     /// Like [`Queue::submit`], but run `command` as edited by the user
@@ -248,7 +278,7 @@ impl Queue {
         &self,
         input: impl AsRef<Path>,
         options: &ConvertOptions,
-        target: &OutputTarget,
+        chosen: &OutputTarget,
         customize: impl FnOnce(&MediaInfo, Plan) -> Result<Plan>,
     ) -> Result<JobTicket> {
         let ffmpeg = &self.shared.ffmpeg;
@@ -265,38 +295,49 @@ impl Queue {
             return Err(Error::Unsupported { message });
         }
 
-        let plan = {
+        let (plan, target) = {
             let mut reserved = lock(&self.shared.reserved);
-            let output =
-                Naming::conversion(&info, options).resolve(target, |p| reserved.contains(p))?;
+            if options.destination == Destination::ReplaceInput && reserved.contains(&info.path) {
+                return Err(Error::unsupported(
+                    "this file is already queued to be replaced",
+                ));
+            }
+            let naming = Naming::conversion(&info, options);
+            let (target, _) =
+                destination::resolve_output(&naming, &options.destination, chosen, |p| {
+                    reserved.contains(p)
+                })?;
             let plan = customize(
                 &info,
-                convert::plan(&info, options, &output, ffmpeg.support())?,
+                convert::plan(&info, options, &target.written, ffmpeg.support())?,
             )?;
-            reserved.insert(output);
-            plan
+            destination::ensure_folder(&target.written)?;
+            reserved.extend(target.paths());
+            (plan, target)
         };
-        self.enqueue(plan, replaces(target), vec![info])
+        self.enqueue(plan, target, overwrites(chosen), vec![info])
     }
 
     /// Probe `pictures`, plan one animation from them in this order (see
     /// [`sequence::plan_sequence`]) and queue it.
     ///
-    /// The output goes where `target` says, by default next to the first
-    /// picture (see [`sequence::sequence_output_path`]). A `Queued` event is
-    /// emitted before this returns.
+    /// The output goes next to the first picture (see
+    /// [`sequence::sequence_output_path`]) or into the folder of
+    /// `options.destination`, unless `target` picks another folder or name.
+    /// A `Queued` event is emitted before this returns.
     ///
     /// # Errors
     ///
     /// Probe errors of any picture, [`Error::Unsupported`] if the request
-    /// doesn't make an animation, the tools to write it are missing or the
-    /// target is invalid.
+    /// doesn't make an animation, the tools to write it are missing, the
+    /// target is invalid or the destination is [`Destination::ReplaceInput`],
+    /// and [`Error::Io`] if the output folder can't be created.
     pub fn submit_sequence(
         &self,
         pictures: &[impl AsRef<Path>],
         options: &ConvertOptions,
         sequence: &SequenceOptions,
-        target: &OutputTarget,
+        chosen: &OutputTarget,
     ) -> Result<JobTicket> {
         let ffmpeg = &self.shared.ffmpeg;
         if let Some(message) = ffmpeg
@@ -313,27 +354,43 @@ impl Queue {
             return Err(Error::Unsupported { message });
         }
 
-        let plan = {
+        let (plan, target) = {
             let mut reserved = lock(&self.shared.reserved);
-            let output = sequence::sequence_naming(&infos, options)
-                .resolve(target, |p| reserved.contains(p))?;
-            let plan =
-                sequence::plan_sequence(&infos, options, sequence, &output, ffmpeg.support())?;
-            reserved.insert(output);
-            plan
+            let naming = sequence::sequence_naming(&infos, options);
+            let (target, _) =
+                destination::resolve_output(&naming, &options.destination, chosen, |p| {
+                    reserved.contains(p)
+                })?;
+            let plan = sequence::plan_sequence(
+                &infos,
+                options,
+                sequence,
+                &target.written,
+                ffmpeg.support(),
+            )?;
+            destination::ensure_folder(&target.written)?;
+            reserved.extend(target.paths());
+            (plan, target)
         };
-        self.enqueue(plan, replaces(target), infos)
+        self.enqueue(plan, target, overwrites(chosen), infos)
     }
 
     /// Register a planned job whose output is already reserved and hand it to
     /// the worker.
-    fn enqueue(&self, plan: Plan, replace: bool, inputs: Vec<MediaInfo>) -> Result<JobTicket> {
+    fn enqueue(
+        &self,
+        plan: Plan,
+        target: Target,
+        overwrite: bool,
+        inputs: Vec<MediaInfo>,
+    ) -> Result<JobTicket> {
         let (id, cancel) = (JobId::next(), Arc::new(AtomicBool::new(false)));
         lock(&self.shared.active).insert(id, Arc::clone(&cancel));
 
         let ticket = JobTicket {
             id,
-            output: plan.output.clone(),
+            output: target.output.clone(),
+            replaces: target.replaces.clone(),
             inputs,
             command: plan.command_line(),
         };
@@ -341,13 +398,14 @@ impl Queue {
         let job = Job {
             id,
             plan,
-            replace,
+            target: target.clone(),
+            overwrite,
             cancel,
         };
         if self.tx.send(job).is_err() {
             // The worker only stops when the queue is dropped, so this is unreachable
             // in practice; undo the bookkeeping anyway.
-            self.shared.finish(id, &ticket.output);
+            self.shared.finish(id, &target);
             return Err(Error::Ffmpeg {
                 message: "the conversion queue has stopped".into(),
             });
@@ -355,11 +413,12 @@ impl Queue {
         Ok(ticket)
     }
 
-    /// Save the frame of `input` at `at_secs` as a PNG (see
-    /// [`convert::frame_plan`]) where `target` says, by default next to the
-    /// video, right away rather than in turn: one frame takes a moment.
-    /// Blocks until the file is written. The name is kept clear of outputs
-    /// that queued jobs will write.
+    /// Save the frame of `input` at `at_secs` as a PNG next to it, or in the
+    /// folder of `options.destination`, or where `target` says (see
+    /// [`convert::frame_plan`] and [`destination::resolve_output`]), right
+    /// away rather than in turn: one frame takes a moment. A frame never
+    /// replaces its video. Blocks until the file is written. The name is kept
+    /// clear of outputs that queued jobs will write.
     ///
     /// # Errors
     ///
@@ -383,16 +442,24 @@ impl Queue {
         }
         let plan = {
             let mut reserved = lock(&self.shared.reserved);
-            let output =
-                Naming::frame(&info, options, at_secs).resolve(target, |p| reserved.contains(p))?;
+            let destination = match &options.destination {
+                folder @ Destination::Folder { .. } => folder.clone(),
+                _ => Destination::NextToInput,
+            };
+            let naming = Naming::frame(&info, options, at_secs);
+            let (to, _) = destination::resolve_output(&naming, &destination, target, |p| {
+                reserved.contains(p)
+            })?;
+            let output = to.output;
             let plan = convert::frame_plan(&info, options, at_secs, &output, ffmpeg.support())?;
+            destination::ensure_folder(&output)?;
             reserved.insert(output);
             plan
         };
         let result = run_plan(
             ffmpeg,
             &plan,
-            replaces(target),
+            overwrites(target),
             &AtomicBool::new(false),
             |_| {},
         );
@@ -420,33 +487,47 @@ impl Shared {
         let Job {
             id,
             plan,
-            replace,
+            target,
+            overwrite,
             cancel,
         } = job;
         let emit = &self.emit;
 
         if cancel.load(Ordering::Relaxed) {
             emit(JobProgress::new(id, JobStage::Cancelled, 0.0));
-            self.finish(id, &plan.output);
+            self.finish(id, &target);
             return;
         }
 
         emit(JobProgress::new(id, JobStage::Running, 0.0));
         let mut last = 0.0_f32;
-        let result = run_plan(&self.ffmpeg, &plan, replace, &cancel, |sample| {
-            last = sample.fraction.unwrap_or(last).max(last);
-            emit(JobProgress {
-                speed: sample.speed,
-                ..JobProgress::new(id, JobStage::Running, last)
-            });
+        // The output folder may have been removed since the job was queued.
+        let result = destination::ensure_folder(&plan.output).and_then(|()| {
+            run_plan(&self.ffmpeg, &plan, overwrite, &cancel, |sample| {
+                last = sample.fraction.unwrap_or(last).max(last);
+                emit(JobProgress {
+                    speed: sample.speed,
+                    ..JobProgress::new(id, JobStage::Running, last)
+                });
+            })
+        });
+        // A finished replacement takes the original's place. Until here the
+        // original is untouched, whatever happened.
+        let result = result.and_then(|outcome| match outcome {
+            RunOutcome::Done { output_bytes } => self
+                .settle(&target)
+                .map(|(output, replaced)| (Some(output_bytes), output, replaced)),
+            RunOutcome::Cancelled => Ok((None, target.output.clone(), None)),
         });
 
         let event = match result {
-            Ok(RunOutcome::Done { output_bytes }) => JobProgress {
+            Ok((Some(output_bytes), output, replaced)) => JobProgress {
                 output_bytes: Some(output_bytes),
+                output: Some(output),
+                replaced,
                 ..JobProgress::new(id, JobStage::Done, 1.0)
             },
-            Ok(RunOutcome::Cancelled) => JobProgress::new(id, JobStage::Cancelled, last),
+            Ok((None, ..)) => JobProgress::new(id, JobStage::Cancelled, last),
             Err(err) => JobProgress {
                 error: Some(err.to_string()),
                 ..JobProgress::new(id, JobStage::Failed, last)
@@ -454,19 +535,38 @@ impl Shared {
         };
         // Release bookkeeping first so a listener reacting to the final event
         // (e.g. retrying) sees a consistent queue.
-        self.finish(id, &plan.output);
+        self.finish(id, &target);
         emit(event);
     }
 
-    fn finish(&self, id: JobId, output: &Path) {
+    /// Put a finished job's result where it belongs: move it over the
+    /// original it replaces, if any. Returns where it ended up.
+    fn settle(&self, target: &Target) -> Result<(PathBuf, Option<Replaced>)> {
+        if target.replaces.is_none() {
+            return Ok((target.output.clone(), None));
+        }
+        let own = target.paths();
+        let others: HashSet<PathBuf> = lock(&self.reserved)
+            .iter()
+            .filter(|p| !own.contains(p))
+            .cloned()
+            .collect();
+        destination::replace_original(target, |p| others.contains(p))
+            .map(|(output, replaced)| (output, Some(replaced)))
+    }
+
+    fn finish(&self, id: JobId, target: &Target) {
         lock(&self.active).remove(&id);
-        lock(&self.reserved).remove(output);
+        let mut reserved = lock(&self.reserved);
+        for path in target.paths() {
+            reserved.remove(&path);
+        }
     }
 }
 
 /// Whether a job for `target` may replace a file at its output. The output
-/// was only picked at a taken name if so (see [`Naming::resolve`]).
-fn replaces(target: &OutputTarget) -> bool {
+/// was only picked at a taken name if so (see [`destination::resolve_output`]).
+fn overwrites(target: &OutputTarget) -> bool {
     target.collision == Collision::Overwrite
 }
 
@@ -539,7 +639,8 @@ mod tests {
             json,
             serde_json::json!({
                 "jobId": 7, "stage": "running", "progress": 0.5,
-                "speed": 2.0, "outputBytes": null, "error": null
+                "speed": 2.0, "outputBytes": null, "output": null,
+                "replaced": null, "error": null
             })
         );
     }
@@ -764,7 +865,11 @@ mod tests {
         // The preview agrees, and a bad name is refused before queueing.
         let naming = Naming::conversion(&ffmpeg.probe(&input).expect("probe"), &png);
         let preview = queue
-            .output_preview(&naming, &target("still", Collision::KeepBoth))
+            .output_preview(
+                &naming,
+                &Destination::NextToInput,
+                &target("still", Collision::KeepBoth),
+            )
             .expect("preview");
         assert!(preview.exists);
         assert_eq!(preview.path, out.path().join("still 3.png"));
@@ -1690,5 +1795,169 @@ mod tests {
             assert_eq!((out.width, out.height), (Some(size.0), Some(size.1)));
             std::fs::remove_file(&ticket.output).expect("remove output");
         }
+    }
+
+    /// Output folders and replacing originals, through the queue. Skipped
+    /// (passes) without an ffmpeg that writes PNG. Tests never use the real
+    /// Trash, so replaced originals are kept as `name.orig.ext` here.
+    #[test]
+    fn destinations_end_to_end() {
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping destination test");
+            return;
+        };
+        if !ffmpeg.supports(OutputFormat::Png) {
+            eprintln!("ffmpeg can't write PNG; skipping destination test");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let make = |name: &str| {
+            let path = dir.path().join(name);
+            let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+                .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x240"])
+                .args(["-frames:v", "1"])
+                .arg(&path)
+                .status()
+                .expect("run ffmpeg");
+            assert!(status.success(), "{name}");
+            path
+        };
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let png = |destination| ConvertOptions {
+            format: OutputFormat::Png,
+            destination,
+            ..ConvertOptions::default()
+        };
+
+        // A folder that doesn't exist yet, sorted by kind, collision-free.
+        let photo = make("photo.jpg");
+        let out = dir.path().join("Converted");
+        let folder = png(Destination::Folder {
+            path: out.clone(),
+            by_kind: true,
+        });
+        let first = queue
+            .submit(&photo, &folder, &OutputTarget::default())
+            .expect("submit");
+        let second = queue
+            .submit(&photo, &folder, &OutputTarget::default())
+            .expect("submit again");
+        assert_eq!(first.output, out.join("Pictures/photo.png"));
+        assert_eq!(second.output, out.join("Pictures/photo 2.png"));
+        assert_eq!(first.replaces, None);
+        for ticket in [&first, &second] {
+            let done = finish_of(&rx, ticket.id);
+            assert_eq!(done.stage, JobStage::Done, "{done:?}");
+            assert_eq!(done.output.as_ref(), Some(&ticket.output));
+            assert!(ticket.output.is_file());
+        }
+
+        // Replacing with a new extension: photo.jpg becomes photo.png.
+        let replace = png(Destination::ReplaceInput);
+        let ticket = queue
+            .submit(&photo, &replace, &OutputTarget::default())
+            .expect("submit");
+        assert_eq!(ticket.output, dir.path().join("photo.png"));
+        assert_eq!(ticket.replaces.as_ref(), Some(&photo));
+        assert!(
+            ticket.command.contains(".photo.converting.png"),
+            "{}",
+            ticket.command
+        );
+        let done = finish_of(&rx, ticket.id);
+        assert_eq!(done.stage, JobStage::Done, "{done:?}");
+        assert_eq!(done.output.as_ref(), Some(&ticket.output));
+        let kept = dir.path().join("photo.orig.jpg");
+        assert_eq!(
+            done.replaced,
+            Some(Replaced::Renamed { path: kept.clone() })
+        );
+        assert!(!photo.exists());
+        assert!(kept.is_file());
+        let out = ffmpeg.probe(&ticket.output).expect("probe");
+        assert_eq!(out.extension.as_deref(), Some("png"));
+
+        // A failed replacement leaves the original as it was.
+        let clip = make("clip.jpg");
+        let before = std::fs::read(&clip).expect("read");
+        let info = ffmpeg.probe(&clip).expect("probe");
+        let shown = queue
+            .preview(&info, &replace, &OutputTarget::default())
+            .expect("preview")
+            .command_line();
+        let broken = shown.replace("-c:v png", "-vf nosuchfilter -c:v png");
+        let ticket = queue
+            .submit_custom(&clip, &replace, &OutputTarget::default(), &broken)
+            .expect("submit");
+        let failed = finish_of(&rx, ticket.id);
+        assert_eq!(failed.stage, JobStage::Failed, "{failed:?}");
+        assert_eq!(std::fs::read(&clip).expect("read"), before);
+        assert!(!ticket.output.exists());
+
+        // So does a cancelled one. A slower job ahead keeps it waiting.
+        let video = dir.path().join("video.mov");
+        let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=3:r=25",
+            ])
+            .args(["-c:v", "mjpeg"])
+            .arg(&video)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+        let slow = ConvertOptions {
+            format: OutputFormat::Gif,
+            ..ConvertOptions::default()
+        };
+        let ahead = queue
+            .submit(&video, &slow, &OutputTarget::default())
+            .expect("submit");
+        let ticket = queue
+            .submit(&clip, &replace, &OutputTarget::default())
+            .expect("submit");
+        assert!(
+            queue
+                .submit(&clip, &replace, &OutputTarget::default())
+                .is_err(),
+            "one replacement per file at a time"
+        );
+        queue.cancel(ticket.id);
+        assert_eq!(finish_of(&rx, ahead.id).stage, JobStage::Done);
+        assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Cancelled);
+        assert_eq!(std::fs::read(&clip).expect("read"), before);
+
+        // Animations can't replace their pictures.
+        let other = make("clip 2.jpg");
+        let gif = ConvertOptions {
+            format: OutputFormat::Gif,
+            destination: Destination::ReplaceInput,
+            ..ConvertOptions::default()
+        };
+        assert!(
+            queue
+                .submit_sequence(
+                    &[&clip, &other],
+                    &gif,
+                    &SequenceOptions::default(),
+                    &OutputTarget::default(),
+                )
+                .is_err()
+        );
+
+        // No converting leftovers anywhere.
+        let hidden: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(hidden.is_empty(), "{hidden:?}");
     }
 }

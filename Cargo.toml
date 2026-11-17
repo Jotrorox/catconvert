@@ -41,6 +41,9 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 kamadak-exif = "0.6.2"
 miniz_oxide = "0.9.1"
 brotli-decompressor = "6.3.2"
+# "Replace the original" moves it to the Trash / Recycle Bin. No chrono/jiff:
+# only `delete` is used.
+trash = { version = "5.4.0", default-features = false, features = ["freedesktop", "coinit_apartmentthreaded"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

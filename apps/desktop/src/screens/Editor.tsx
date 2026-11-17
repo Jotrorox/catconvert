@@ -14,6 +14,7 @@ import {
 import { CatPeek } from "../components/Cat";
 import { CodecField } from "../components/CodecField";
 import { CropOverlay } from "../components/CropOverlay";
+import { DestinationField } from "../components/DestinationField";
 import { Icon } from "../components/Icon";
 import { OutputField } from "../components/OutputField";
 import { QualityField } from "../components/QualityField";
@@ -59,6 +60,7 @@ import {
   describeStreams,
   FADE_CHOICES,
   fadeSpans,
+  folderName,
   formatKind,
   fpsChoices,
   groupsFor,
@@ -73,6 +75,7 @@ import {
   outputHasSound,
   outputSeconds,
   repacksJpeg,
+  replacesOriginal,
   restoresJpeg,
   SPEEDS,
   shortSide,
@@ -81,7 +84,7 @@ import {
   speedLabel,
 } from "../lib/formats";
 import { FALLBACK_FPS, stepFrame } from "../lib/frames";
-import { targetOf } from "../lib/output";
+import { dirName, targetOf } from "../lib/output";
 import {
   createPlayer,
   normalizeGain,
@@ -104,6 +107,7 @@ import {
   saveFrame,
   saveRecipe,
   setCustomCommand,
+  setDraftDestination,
   skipDraft,
   state,
   updateOptions,
@@ -131,6 +135,19 @@ function stemOf(info: MediaInfo): string {
   const name = info.fileName;
   const dot = name.lastIndexOf(".");
   return dot > 0 ? name.slice(0, dot) : name;
+}
+
+/**
+ * What an edited command must write, for the hint under it: `name` (the
+ * file name it's saved as) in `folder`, or in place of the original.
+ */
+function outputHint(name: string, folder: string | null, options: ConvertOptions): string {
+  if (replacesOriginal(options)) {
+    return `The output is written to a hidden file first, then becomes ${name} in place of the original.`;
+  }
+  return folder
+    ? `The output stays ${name} in ${folderName(folder)}.`
+    : `The output stays ${name}.`;
 }
 
 /** Waiting screen while a file is being probed. */
@@ -1499,6 +1516,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
           <div class="outcome">
             <OutputField
               choice={props.draft.output}
+              destination={options().destination}
               preview={saveAt()}
               error={outputError()}
               format={options().format}
@@ -1522,6 +1540,12 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 </For>
               </ul>
             </Show>
+            <DestinationField
+              destination={options().destination}
+              picked={props.draft.output.folder}
+              allowReplace={true}
+              onChoose={(choice) => void setDraftDestination(choice)}
+            />
           </div>
 
           <Show
@@ -1615,8 +1639,14 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 )}
               </Show>
               <p id="command-hint" class="item-meta">
-                Runs ffmpeg, cjxl and djxl directly, never through a shell. It can only write the
-                file shown above, {saveAt() ? baseName(saveAt()?.path ?? "") : "the output"}.
+                Runs ffmpeg, cjxl and djxl directly, never through a shell.{" "}
+                {outputHint(
+                  saveAt()
+                    ? baseName(saveAt()?.path ?? "")
+                    : `${stemOf(info())}.${options().format}`,
+                  saveAt() ? dirName(saveAt()?.path ?? "") : null,
+                  options(),
+                )}
               </p>
               <div class="command-actions">
                 <button type="button" class="link-btn" onClick={resetCommand}>

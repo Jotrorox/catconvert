@@ -8,8 +8,10 @@ import {
   defaultFormat,
   defaultOptions,
   describeStreams,
+  destinationFor,
   fadeSpans,
   fitOptions,
+  folderName,
   formatKind,
   fpsChoices,
   initialOptions,
@@ -28,9 +30,11 @@ import {
   recipeDetail,
   recipeFrom,
   repacksJpeg,
+  replacesOriginal,
   sequenceFormat,
   sequenceFrame,
   sequenceName,
+  sequenceOptions,
   sizeChoices,
 } from "./formats";
 
@@ -113,6 +117,7 @@ describe("formats", () => {
 
   it("starts from the user's defaults when they fit the file", () => {
     const defaults = {
+      ...DEFAULTS,
       formats: { video: "webm", audio: null, image: "webp" },
       quality: 80,
       metadata: "none",
@@ -129,6 +134,45 @@ describe("formats", () => {
     expect(initialOptions(webp, all, null, custom).format).toBe("png");
     expect(initialOptions(clip, (f) => f !== "webm", null, custom).format).toBe("mp4");
     expect(initialOptions(clip, all, null, DEFAULTS).format).toBe("mp4");
+  });
+
+  it("starts files where Settings says results go", () => {
+    expect(initialOptions(clip, all, null).destination).toEqual({ kind: "nextToInput" });
+    const folder = {
+      ...DEFAULTS,
+      output: "folder",
+      outputFolder: "/out",
+      outputByKind: true,
+    } as const;
+    expect(initialOptions(clip, all, null, folder).destination).toEqual({
+      kind: "folder",
+      path: "/out",
+      byKind: true,
+    });
+    // A folder choice without a folder saves next to the original.
+    expect(destinationFor({ ...folder, outputFolder: null })).toEqual({ kind: "nextToInput" });
+    // The folder is kept for a one-off choice even when the default differs.
+    expect(destinationFor({ ...folder, output: "nextToInput" }, "folder")).toEqual({
+      kind: "folder",
+      path: "/out",
+      byKind: true,
+    });
+
+    const replace = { ...DEFAULTS, output: "replaceInput" } as const;
+    const options = initialOptions(clip, all, RECIPES[0] ?? null, replace);
+    expect(replacesOriginal(options)).toBe(true);
+    // Fitting the settings to the next file keeps where they go.
+    expect(fitOptions({ ...clip, path: "/b/other.mov" }, options, all)?.destination).toEqual({
+      kind: "replaceInput",
+    });
+    // An animation can't replace its pictures.
+    expect(sequenceOptions(() => true, replace).destination).toEqual({ kind: "nextToInput" });
+    expect(sequenceOptions(() => true, folder).destination).toMatchObject({ kind: "folder" });
+    // Recipes don't carry where results go.
+    expect(recipeFrom("r", "Mine", clip, options).options).not.toHaveProperty("destination");
+
+    expect(folderName("/Users/cat/Downloads/CatConvert/")).toBe("CatConvert");
+    expect(folderName("C:\\Users\\cat\\Converted")).toBe("Converted");
   });
 
   it("drops the location by default and reads the old on/off setting", () => {

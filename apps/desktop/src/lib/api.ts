@@ -130,6 +130,20 @@ export type JxlSupport = {
   ffmpegAnimDecoder: boolean;
 };
 
+/**
+ * Where a conversion's result goes. `folder` with `byKind` sorts into its
+ * Videos, Pictures and Audio subfolders. `replaceInput` writes a hidden file
+ * first and moves the original to the Trash only once that is done; it is
+ * refused for animations made from several pictures.
+ */
+export type Destination =
+  | { kind: "nextToInput" }
+  | { kind: "folder"; path: string; byKind: boolean }
+  | { kind: "replaceInput" };
+
+/** What became of an original a conversion replaced. */
+export type Replaced = { to: "trash" } | { to: "renamed"; path: string };
+
 export type ConvertOptions = {
   format: OutputFormat;
   trimStart: number | null;
@@ -165,6 +179,8 @@ export type ConvertOptions = {
   speed: number;
   /** Playback direction of animations. Ignored otherwise. */
   direction: Direction;
+  /** Where the result goes; next to the original when left out. */
+  destination?: Destination;
 };
 
 /** How the sound is encoded: what the quality setting becomes for it. */
@@ -263,6 +279,10 @@ export type JobProgress = {
   progress: number;
   speed: number | null;
   outputBytes: number | null;
+  /** Where the finished file is (`done` only); differs from the ticket's if that name was taken meanwhile. */
+  output?: string | null;
+  /** What became of the original it replaced (`done` only). */
+  replaced?: Replaced | null;
   error: string | null;
 };
 
@@ -275,6 +295,8 @@ export type SavedFrame = {
 export type JobTicket = {
   id: JobId;
   output: string;
+  /** The original the result will replace, if it does. */
+  replaces?: string | null;
   /** The probed file, or an animation's pictures in order. */
   inputs: MediaInfo[];
   command: string;
@@ -392,6 +414,8 @@ type Commands = {
   cancel_job: { args: { id: JobId }; result: boolean };
   relaunch: { args: Record<string, never>; result: null };
   missing_files: { args: { paths: string[] }; result: string[] };
+  default_output_folder: { args: Record<string, never>; result: string };
+  prepare_output_folder: { args: { path: string }; result: string };
   third_party_licenses: { args: Record<string, never>; result: string | null };
   take_opened_files: { args: Record<string, never>; result: string[] };
   quick_action_status: { args: Record<string, never>; result: QuickActionStatus };
@@ -679,17 +703,6 @@ export async function chooseSavePath(
   });
 }
 
-/** Native folder picker, starting in `start`. Resolves to `null` if cancelled. */
-export async function chooseFolder(start: string | null): Promise<string | null> {
-  const picked = await open({
-    title: "Save in",
-    directory: true,
-    multiple: false,
-    ...(start ? { defaultPath: start } : {}),
-  });
-  return typeof picked === "string" ? picked : null;
-}
-
 /** The answer to {@link askReplace}. */
 export type ReplaceChoice = "replace" | "keepBoth" | "cancel";
 
@@ -703,6 +716,27 @@ export async function askReplace(name: string, folder: string): Promise<ReplaceC
   if (answer === buttons.yes || answer === "Yes") return "replace";
   if (answer === buttons.no || answer === "No") return "keepBoth";
   return "cancel";
+}
+
+/** Native folder picker. Resolves to the chosen folder, or `null` if cancelled. */
+export async function pickFolder(defaultPath: string | null = null): Promise<string | null> {
+  const picked = await open({
+    multiple: false,
+    directory: true,
+    ...(defaultPath ? { defaultPath } : {}),
+  });
+  return Array.isArray(picked) ? (picked[0] ?? null) : picked;
+}
+
+/** The folder Settings suggests for converted files (`CatConvert` in Downloads). */
+export async function defaultOutputFolder(): Promise<string | null> {
+  if (!inTauri) return null;
+  return command("default_output_folder", {});
+}
+
+/** Create the output folder if need be and check files can be saved there. */
+export function prepareOutputFolder(path: string): Promise<string> {
+  return command("prepare_output_folder", { path });
 }
 
 /** Show a file in Finder / Explorer / the file manager. */

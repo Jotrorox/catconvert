@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { ConvertOptions, FfmpegStatus, MediaInfo, OutputFormat } from "./lib/api";
 import * as api from "./lib/api";
-import { applyProgress, navigate, openPaths, resetStore, state } from "./lib/store";
+import { DEFAULTS } from "./lib/formats";
+import { applyProgress, navigate, openPaths, resetStore, state, updateSettings } from "./lib/store";
 import { FakeAudio, installFakeAudio } from "./test/audio";
 
 vi.mock("./lib/api", () => ({
@@ -44,7 +45,6 @@ vi.mock("./lib/api", () => ({
     exists: false,
   })),
   chooseSavePath: vi.fn(async () => null),
-  chooseFolder: vi.fn(async () => null),
   askReplace: vi.fn(async () => "cancel"),
   saveFrame: vi.fn(),
   checkCommand: vi.fn(async (_info: unknown, _options: unknown, text: string) => text),
@@ -55,6 +55,9 @@ vi.mock("./lib/api", () => ({
   startSequence: vi.fn(),
   cancelJob: vi.fn(async () => true),
   pickFiles: vi.fn(async () => []),
+  pickFolder: vi.fn(async () => null),
+  defaultOutputFolder: vi.fn(async () => "/Users/cat/Downloads/CatConvert"),
+  prepareOutputFolder: vi.fn(async (path: string) => path),
   thirdPartyLicenses: vi.fn(async () => "ffmpeg 9.0.2 (GPL-2.0-or-later)"),
   revealInFolder: vi.fn(async () => {}),
   missingFiles: vi.fn(async () => []),
@@ -196,7 +199,7 @@ beforeEach(() => {
     exists: false,
   }));
   vi.mocked(api.chooseSavePath).mockResolvedValue(null);
-  vi.mocked(api.chooseFolder).mockResolvedValue(null);
+  vi.mocked(api.pickFolder).mockResolvedValue(null);
   vi.mocked(api.askReplace).mockResolvedValue("cancel");
   vi.mocked(api.startJob).mockImplementation(async (path, options) => ({
     id: 7,
@@ -388,6 +391,7 @@ describe("CatConvert", () => {
         metadata: "noLocation",
         speed: 1,
         direction: "forward",
+        destination: { kind: "nextToInput" },
       },
       USUAL,
     );
@@ -987,6 +991,7 @@ describe("CatConvert", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Remove everything" }));
     expect(JSON.parse(localStorage.getItem("catconvert.settings.v1") ?? "{}")).toEqual({
+      ...DEFAULTS,
       formats: { video: "mkv", audio: null, image: null },
       quality: 85,
       metadata: "none",
@@ -1015,6 +1020,7 @@ describe("CatConvert", () => {
     localStorage.setItem("catconvert.recipes.v1", JSON.stringify([recipe]));
     resetStore();
     expect(state.settings).toEqual({
+      ...DEFAULTS,
       formats: { video: null, audio: null, image: null },
       quality: 60,
       metadata: "keep",
@@ -1216,7 +1222,7 @@ describe("CatConvert", () => {
     });
 
     it("names a batch with a pattern in one folder, never replacing", async () => {
-      vi.mocked(api.chooseFolder).mockResolvedValue("/exports");
+      vi.mocked(api.pickFolder).mockResolvedValue("/exports");
       render(() => <App />);
       await ffmpegFound();
       openPaths(["/clips/a.mov", "/clips/b.mov"]);
@@ -1235,7 +1241,7 @@ describe("CatConvert", () => {
       // Only the folder is picked: each file gets its own name.
       fireEvent.click(screen.getByRole("button", { name: "Change…" }));
       await waitFor(() => expect(state.draft?.output.folder).toBe("/exports"));
-      expect(api.chooseFolder).toHaveBeenCalledWith("/clips");
+      expect(api.pickFolder).toHaveBeenCalledWith("/clips");
       expect(api.chooseSavePath).not.toHaveBeenCalled();
 
       fireEvent.click(screen.getByRole("button", { name: /Convert all 2 like this/ }));
@@ -1243,6 +1249,45 @@ describe("CatConvert", () => {
       const target = { folder: "/exports", name: "{name}-{format}", collision: "keepBoth" };
       expect(api.startJob).toHaveBeenNthCalledWith(1, "/clips/a.mov", expect.anything(), target);
       expect(api.startJob).toHaveBeenNthCalledWith(2, "/clips/b.mov", expect.anything(), target);
+    });
+
+    it("works with the Save menu: a picked folder, the output folder, replacing", async () => {
+      vi.mocked(api.chooseSavePath).mockResolvedValue("/exports/Holiday.mp4");
+      updateSettings({ replaceConfirmed: true });
+      await openVideo();
+      const save = screen.getByRole("combobox", { name: "Save" });
+
+      // Replacing keeps the original's name: no name to type.
+      fireEvent.change(save, { target: { value: "replaceInput" } });
+      await waitFor(() => expect(save).toHaveDisplayValue("In place of the original"));
+      expect(screen.queryByRole("textbox", { name: "File name" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Change…" })).not.toBeInTheDocument();
+      fireEvent.change(save, { target: { value: "nextToInput" } });
+      await waitFor(() => expect(save).toHaveDisplayValue("Next to the original"));
+
+      // A folder picked with Change… shows in the menu, and saves there.
+      fireEvent.click(screen.getByRole("button", { name: "Change…" }));
+      await waitFor(() => expect(save).toHaveDisplayValue("In exports"));
+      expect(screen.getByRole("textbox", { name: "File name" })).toHaveValue("Holiday");
+
+      // Choosing from the menu again drops the picked folder but keeps the name.
+      fireEvent.change(save, { target: { value: "nextToInput" } });
+      await waitFor(() => expect(save).toHaveDisplayValue("Next to the original"));
+      expect(state.draft?.output).toEqual({ folder: null, name: "Holiday", collision: null });
+      expect(state.lastFolder).toBeNull();
+
+      // Replacing drops a chosen name too.
+      fireEvent.change(save, { target: { value: "replaceInput" } });
+      await waitFor(() => expect(save).toHaveDisplayValue("In place of the original"));
+      expect(state.draft?.output).toEqual({ folder: null, name: null, collision: null });
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await waitFor(() =>
+        expect(api.startJob).toHaveBeenCalledWith(
+          VIDEO.path,
+          expect.objectContaining({ destination: { kind: "replaceInput" } }),
+          USUAL,
+        ),
+      );
     });
 
     it("keeps the chosen folder for frames and the next files", async () => {
@@ -1496,6 +1541,26 @@ describe("CatConvert", () => {
       within(screen.getByRole("list", { name: "Pictures in order" }))
         .getAllByRole("listitem")
         .map((li) => li.getAttribute("aria-label"));
+
+    it("never offers to replace the pictures", async () => {
+      localStorage.setItem(
+        "catconvert.settings.v1",
+        JSON.stringify({ ...DEFAULTS, output: "replaceInput", replaceConfirmed: true }),
+      );
+      resetStore();
+      await openAnimation();
+      const save = screen.getByRole("combobox", { name: "Save" });
+      expect(save).toHaveDisplayValue("Next to the first picture");
+      expect(within(save).queryByText("In place of the original")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /Make animation/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startSequence).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.objectContaining({ destination: { kind: "nextToInput" } }),
+        expect.any(Object),
+        USUAL,
+      );
+    });
 
     it("makes one animation from dropped pictures", async () => {
       await openAnimation();
@@ -1817,6 +1882,173 @@ describe("CatConvert", () => {
     fireEvent.click(screen.getByRole("button", { name: "Forget moved (1)" }));
     expect(screen.getByText("A clean slate")).toBeInTheDocument();
     expect(state.history).toHaveLength(0);
+  });
+
+  describe("where files go", () => {
+    it("saves into the suggested folder once chosen in Settings", async () => {
+      render(() => <App />);
+      await ffmpegFound();
+      fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+      const next = screen.getByRole("button", { name: "Next to the original" });
+      expect(next).toHaveAttribute("aria-pressed", "true");
+
+      fireEvent.click(screen.getByRole("button", { name: "In a folder" }));
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "In a folder" })).toHaveAttribute(
+          "aria-pressed",
+          "true",
+        ),
+      );
+      expect(api.prepareOutputFolder).toHaveBeenCalledWith("/Users/cat/Downloads/CatConvert");
+      expect(screen.getByText("/Users/cat/Downloads/CatConvert")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("switch", { name: /Sort by kind/ }));
+      expect(JSON.parse(localStorage.getItem("catconvert.settings.v1") ?? "{}")).toMatchObject({
+        output: "folder",
+        outputFolder: "/Users/cat/Downloads/CatConvert",
+        outputByKind: true,
+      });
+
+      // Another folder from the picker.
+      vi.mocked(api.pickFolder).mockResolvedValueOnce("/Volumes/Cats");
+      fireEvent.click(screen.getByRole("button", { name: "Change…" }));
+      await screen.findByText("/Volumes/Cats");
+
+      openPaths([VIDEO.path]);
+      await screen.findByRole("heading", { name: "clip.mov" });
+      expect(screen.getByRole("combobox", { name: "Save" })).toHaveDisplayValue("In Cats");
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startJob).toHaveBeenCalledWith(
+        VIDEO.path,
+        expect.objectContaining({
+          destination: { kind: "folder", path: "/Volumes/Cats", byKind: true },
+        }),
+        USUAL,
+      );
+    });
+
+    it("doesn't use a folder files can't be saved in", async () => {
+      vi.mocked(api.prepareOutputFolder).mockRejectedValueOnce("permission denied");
+      render(() => <App />);
+      await ffmpegFound();
+      fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+      fireEvent.click(screen.getByRole("button", { name: "In a folder" }));
+      expect(await screen.findByText("Can't save there: Permission denied")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Next to the original" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      expect(state.settings.outputFolder).toBeNull();
+    });
+
+    it("asks before replacing originals for the first time", async () => {
+      render(() => <App />);
+      await ffmpegFound();
+      fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+      const replace = () => screen.getByRole("button", { name: "Replace the original" });
+
+      fireEvent.click(replace());
+      expect(screen.getByRole("alertdialog", { name: /Replace originals/ })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      expect(replace()).toHaveAttribute("aria-pressed", "false");
+
+      fireEvent.click(replace());
+      fireEvent.click(screen.getByRole("button", { name: "Replace originals" }));
+      await waitFor(() => expect(replace()).toHaveAttribute("aria-pressed", "true"));
+      expect(state.settings).toMatchObject({ output: "replaceInput", replaceConfirmed: true });
+
+      // Once agreed, it doesn't ask again.
+      const next = screen.getByRole("button", { name: "Next to the original" });
+      fireEvent.click(next);
+      await waitFor(() => expect(next).toHaveAttribute("aria-pressed", "true"));
+      fireEvent.click(replace());
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      await waitFor(() => expect(replace()).toHaveAttribute("aria-pressed", "true"));
+    });
+
+    it("replaces one file from the editor and remembers it in History", async () => {
+      vi.mocked(api.startJob).mockImplementation(async (path, options) => ({
+        id: 7,
+        output: path.replace(/\.\w+$/, `.${options.format}`),
+        replaces: options.destination?.kind === "replaceInput" ? path : null,
+        inputs: [VIDEO],
+        command: "ffmpeg …",
+      }));
+      await openVideo();
+      const save = screen.getByRole("combobox", { name: "Save" });
+      expect(save).toHaveDisplayValue("Next to the original");
+
+      // The first time, it asks; the choice waits for the answer.
+      fireEvent.change(save, { target: { value: "replaceInput" } });
+      expect(screen.getByRole("alertdialog", { name: /Replace originals/ })).toBeInTheDocument();
+      expect(save).toHaveDisplayValue("Next to the original");
+      fireEvent.click(screen.getByRole("button", { name: "Replace originals" }));
+      await waitFor(() => expect(save).toHaveDisplayValue("In place of the original"));
+      expect(screen.getByText(/Replaces the original; it goes to the Trash/)).toBeInTheDocument();
+      // Only this conversion: the default stays next to the original.
+      expect(state.settings.output).toBe("nextToInput");
+
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startJob).toHaveBeenCalledWith(
+        VIDEO.path,
+        expect.objectContaining({ destination: { kind: "replaceInput" } }),
+        USUAL,
+      );
+      expect(screen.getByText("Replaces original")).toBeInTheDocument();
+      applyProgress({
+        jobId: 7,
+        stage: "running",
+        progress: 0.5,
+        speed: 1,
+        outputBytes: null,
+        error: null,
+      });
+      expect(screen.getByText("replacing the original")).toBeInTheDocument();
+
+      applyProgress({
+        jobId: 7,
+        stage: "done",
+        progress: 1,
+        speed: null,
+        outputBytes: 9,
+        output: "/clips/clip 2.mp4",
+        replaced: { to: "renamed", path: "/clips/clip.orig.mov" },
+        error: null,
+      });
+      expect(screen.getByText("clip 2.mp4")).toBeInTheDocument();
+      expect(screen.getByText("Replaced original")).toBeInTheDocument();
+      expect(
+        screen.getByText("There's no Trash here, so the original was kept as clip.orig.mov"),
+      ).toBeInTheDocument();
+      expect(state.history[0]).toEqual(
+        expect.objectContaining({
+          name: "clip 2.mp4",
+          output: "/clips/clip 2.mp4",
+          replaced: true,
+          keptAs: "/clips/clip.orig.mov",
+        }),
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "History" }));
+      expect(await screen.findByText("Replaced original")).toHaveAttribute(
+        "title",
+        "The original was kept as clip.orig.mov",
+      );
+
+      // Converting it again opens the converted file, which must not be
+      // replaced in turn: where it goes follows Settings.
+      vi.mocked(api.missingFiles).mockImplementation(async (paths) =>
+        paths.filter((p) => p === VIDEO.path),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Convert clip 2.mp4 again" }));
+      expect(await screen.findByRole("heading", { name: "clip 2.mp4" })).toBeInTheDocument();
+      expect(screen.getByRole("combobox", { name: "Save" })).toHaveDisplayValue(
+        "Next to the original",
+      );
+      expect(state.draft?.options.destination).toEqual({ kind: "nextToInput" });
+    });
   });
 
   describe("converting again from History", () => {

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::destination::Destination;
 use crate::ffmpeg::format_secs;
 use crate::jxl::is_jxl;
 pub(crate) use crate::output::file_stem;
@@ -366,6 +367,9 @@ pub struct ConvertOptions {
     pub speed: f64,
     /// Playback direction of animations. Ignored for other outputs.
     pub direction: Direction,
+    /// Where the result goes. [`crate::Queue`] picks the output path from
+    /// it; [`plan`] writes wherever it is told and ignores this.
+    pub destination: Destination,
 }
 
 /// What to carry over from the original besides the picture and sound.
@@ -406,6 +410,7 @@ impl Default for ConvertOptions {
             metadata: Metadata::default(),
             speed: 1.0,
             direction: Direction::Forward,
+            destination: Destination::NextToInput,
         }
     }
 }
@@ -1909,8 +1914,17 @@ pub fn frame_plan(
 /// `clip-frame-0m12s.png`, then `clip-frame-0m12s 2.png`, …
 #[must_use]
 pub fn frame_output_path(input: &Path, at_secs: f64, taken: impl Fn(&Path) -> bool) -> PathBuf {
-    let stem = format!("{}-frame-{}", file_stem(input), frame_stamp(at_secs));
-    free_path(input, &stem, OutputFormat::Png.extension(), taken)
+    free_path(
+        input,
+        &frame_stem(input, at_secs),
+        OutputFormat::Png.extension(),
+        taken,
+    )
+}
+
+/// `clip-frame-0m12s`: the name of the frame at `at_secs`, without extension.
+pub(crate) fn frame_stem(input: &Path, at_secs: f64) -> String {
+    format!("{}-frame-{}", file_stem(input), frame_stamp(at_secs))
 }
 
 /// `{stem}.{ext}` next to `input`, or `{stem} 2.{ext}`, `{stem} 3.{ext}`, …,
@@ -1922,6 +1936,17 @@ pub(crate) fn free_path(
     taken: impl Fn(&Path) -> bool,
 ) -> PathBuf {
     let dir = input.parent().unwrap_or_else(|| Path::new(""));
+    free_path_in(dir, input, stem, ext, taken)
+}
+
+/// Like [`free_path`], but in `dir` rather than next to `input`.
+pub(crate) fn free_path_in(
+    dir: &Path,
+    input: &Path,
+    stem: &str,
+    ext: &str,
+    taken: impl Fn(&Path) -> bool,
+) -> PathBuf {
     free_in(dir, stem, ext, |candidate| {
         candidate == input || taken(candidate)
     })
@@ -3250,7 +3275,7 @@ mod tests {
         // Without sound the section is hidden, so nothing fades.
         let muted = ConvertOptions {
             keep_audio: false,
-            ..options
+            ..options.clone()
         };
         let cmd = command(&video("garden.mov"), &muted, "/clips/garden.mp4");
         assert!(!cmd.contains("fade"), "{cmd}");

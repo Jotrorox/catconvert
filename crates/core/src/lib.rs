@@ -22,11 +22,14 @@
 //! Several pictures can also become one animation: [`plan_sequence`] plans
 //! it and [`Queue::submit_sequence`] runs it.
 //!
-//! Results go next to the input under a free name unless an [`OutputTarget`]
-//! picks another folder, name or name pattern (see [`Naming`]).
+//! Results go next to the original, into a folder, or in the original's
+//! place ([`Destination`], chosen in [`ConvertOptions::destination`]). An
+//! [`OutputTarget`] can pick another folder, name or name pattern for one
+//! conversion (see [`Naming`] and [`resolve_output`]).
 
 mod convert;
 mod custom;
+mod destination;
 mod error;
 mod ffmpeg;
 mod job;
@@ -44,6 +47,9 @@ pub use convert::{
 };
 pub use custom::{
     INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER, command_template, custom_plan, fill_command,
+};
+pub use destination::{
+    Destination, Replaced, Target, frame_target, output_target, resolve_output, sequence_target,
 };
 pub use error::{Error, Result};
 pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, RunProgress};

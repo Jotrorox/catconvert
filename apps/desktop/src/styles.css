@@ -2722,6 +2722,111 @@ button.format-chip:not(:disabled):active {
   font-weight: 600;
 }
 
+/* Where the result goes */
+
+.destination {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.destination-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.destination-label {
+  color: var(--green-ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.select-sm {
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
+  height: 36px;
+  padding-left: 12px;
+  border-radius: 12px;
+  background-color: var(--surface);
+  font-size: 13.5px;
+}
+
+.destination .path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.replace-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 12px;
+  background: var(--yellow-bg);
+  color: var(--yellow-ink);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.replace-badge.inline {
+  display: inline-flex;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  vertical-align: 1px;
+}
+
+.confirm-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: var(--yellow-bg);
+  color: var(--yellow-ink);
+}
+
+.confirm-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-weight: 800;
+}
+
+.confirm-text {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.45;
+}
+
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.folder-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.folder-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Command */
 
 .command {
