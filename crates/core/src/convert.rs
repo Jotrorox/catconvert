@@ -529,20 +529,11 @@ impl Plan {
     /// The commands as shell-quoted lines joined with `&&`, for display.
     #[must_use]
     pub fn command_line(&self) -> String {
-        self.steps
-            .iter()
-            .map(|step| {
-                std::iter::once(step.tool.name().to_owned())
-                    .chain(
-                        step.args
-                            .iter()
-                            .map(|arg| shell_quote(&arg.to_string_lossy())),
-                    )
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect::<Vec<_>>()
-            .join(" && \\\n  ")
+        render_command(
+            self.steps
+                .iter()
+                .map(|step| (step.tool, step.args.iter().map(|arg| arg.to_string_lossy()))),
+        )
     }
 
     /// Length of the output in seconds, if it is timed.
@@ -1513,7 +1504,7 @@ pub fn frame_output_path(input: &Path, at_secs: f64, taken: impl Fn(&Path) -> bo
     free_path(input, &stem, OutputFormat::Png.extension(), taken)
 }
 
-fn file_stem(input: &Path) -> String {
+pub(crate) fn file_stem(input: &Path) -> String {
     input
         .file_stem()
         .map_or_else(|| "converted".into(), |s| s.to_string_lossy().into_owned())
@@ -1769,6 +1760,23 @@ fn kind_noun(kind: MediaKind) -> &'static str {
         MediaKind::Audio => "audio",
         MediaKind::Unknown => "this file",
     }
+}
+
+/// Program calls as shell-quoted lines joined with `&&`, the way
+/// [`Plan::command_line`] shows them and [`crate::custom_plan`] reads them back.
+pub(crate) fn render_command<A: AsRef<str>>(
+    steps: impl IntoIterator<Item = (Tool, impl IntoIterator<Item = A>)>,
+) -> String {
+    steps
+        .into_iter()
+        .map(|(tool, args)| {
+            std::iter::once(tool.name().to_owned())
+                .chain(args.into_iter().map(|arg| shell_quote(arg.as_ref())))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join(" && \\\n  ")
 }
 
 fn shell_quote(arg: &str) -> String {

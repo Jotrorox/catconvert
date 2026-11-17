@@ -20,6 +20,7 @@ import { TrimBar } from "../components/TrimBar";
 import {
   type Aspect,
   type ConvertOptions,
+  checkCommand,
   loudness,
   type MediaInfo,
   previewCommand,
@@ -87,6 +88,7 @@ import {
   makeAnimation,
   saveFrame,
   saveRecipe,
+  setCustomCommand,
   skipDraft,
   state,
   updateOptions,
@@ -375,7 +377,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   // Command preview ---------------------------------------------------------
 
   const [command, setCommand] = createSignal("");
-  const [showCommand, setShowCommand] = createSignal(false);
+  // Open from the start when the file arrives with an edited command.
+  const [showCommand, setShowCommand] = createSignal(props.draft.command !== null);
   let commandTimer: ReturnType<typeof setTimeout> | undefined;
   createEffect(
     on(
@@ -397,6 +400,46 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     }),
   );
   onCleanup(() => clearTimeout(commandTimer));
+
+  // Command edited by hand ----------------------------------------------------
+
+  /** The command was edited: it runs as written and the options don't apply. */
+  const custom = () => props.draft.command !== null;
+  const [commandError, setCommandError] = createSignal<string | null>(null);
+  let commandField: HTMLTextAreaElement | undefined;
+  let checkTimer: ReturnType<typeof setTimeout> | undefined;
+  let checks = 0;
+  // Checked as it's typed, so mistakes show up before converting.
+  createEffect(
+    on(
+      () => [props.draft.command, JSON.stringify(options())] as const,
+      ([text]) => {
+        clearTimeout(checkTimer);
+        const check = ++checks;
+        if (text === null) {
+          setCommandError(null);
+          return;
+        }
+        const snapshot = { ...options() };
+        checkTimer = setTimeout(() => {
+          checkCommand(info(), snapshot, text).then(
+            () => check === checks && setCommandError(null),
+            // As written: messages can start with a program name, like "rm isn't …".
+            (error) => check === checks && setCommandError(String(error)),
+          );
+        }, 250);
+      },
+    ),
+  );
+  onCleanup(() => clearTimeout(checkTimer));
+  const canEdit = () => command() !== "" && !command().startsWith("#");
+  const editCommand = () => {
+    setCropping(false);
+    setShowCommand(true);
+    setCustomCommand(command());
+    queueMicrotask(() => commandField?.focus());
+  };
+  const resetCommand = () => setCustomCommand(null);
 
   // Trim text fields ----------------------------------------------------------
 
@@ -478,7 +521,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
         return "Dates, place, camera details and titles all go";
     }
   };
-  const estimate = createMemo(() => describeEstimate(info(), options()));
+  // A guess from the options means nothing once the command is edited.
+  const estimate = createMemo(() => (custom() ? null : describeEstimate(info(), options())));
   const codec = () => (animatedImage() ? null : codecOf(options()));
   const readable = () => canRead(info());
   const ready = () => {
@@ -487,7 +531,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       state.ffmpeg?.found === true &&
       readable() &&
       isAvailable(options().format) &&
-      (chosen === null || isCodecAvailable(chosen))
+      (chosen === null || isCodecAvailable(chosen)) &&
+      !(custom() && commandError() !== null)
     );
   };
 
@@ -506,9 +551,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
         | "sliders"
         | "fade"
         | "play"
-        | "pin";
+        | "pin"
+        | "terminal";
       text: string;
     }[] = [];
+    if (custom()) return [{ icon: "terminal" as const, text: "Custom command" }];
     if (timed() && trimmed()) {
       items.push({ icon: "scissors", text: `Keeps ${formatSpan(trimEnd() - trimStart())}` });
     }
@@ -555,7 +602,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   let nameInput: HTMLInputElement | undefined;
   const submitRecipe = (event: SubmitEvent) => {
     event.preventDefault();
-    saveRecipe(nameInput?.value ?? "");
+    void saveRecipe(nameInput?.value ?? "");
     setNaming(false);
   };
 
@@ -763,7 +810,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 <Icon name="music" size={14} /> Sound only
               </span>
             </Show>
-            <Show when={visual()}>
+            <Show when={visual() && !custom()}>
               <div class="preview-tools">
                 <button
                   type="button"
@@ -820,7 +867,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 playhead={canListen() ? player.time() : info().kind === "video" ? scrub() : null}
                 playing={player.playing()}
                 fades={hasSound() ? fades() : undefined}
-                onChange={setTrim}
+                // An edited command carries its own trim; listening and seeking still work.
+                onChange={(start, end) => !custom() && setTrim(start, end)}
                 // Moving a handle while playing leaves the sound where it is.
                 onScrub={(t) => {
                   if (!player.playing()) scrubTo(t);
@@ -908,7 +956,12 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                   )}
                 </Show>
               </Show>
-              <div class="trim-fields">
+              <div
+                class="trim-fields"
+                classList={{ locked: custom() }}
+                inert={custom()}
+                aria-disabled={custom() || undefined}
+              >
                 <label class="field">
                   <span class="field-label">Start</span>
                   <input
@@ -943,253 +996,246 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
         </div>
 
         <section class="card settings">
-          <fieldset class="field">
-            <legend class="field-label">Turn it into</legend>
-            <div class="format-groups">
-              <For each={groupsFor(info().kind)}>
-                {(group) => (
-                  <div class="format-group" data-tone={group.tone}>
-                    <span class="format-group-label">{group.label}</span>
+          <Show when={custom()}>
+            <div class="lossless-note custom-note" role="status">
+              <Icon name="terminal" size={16} />
+              <span>Your edited command runs as written, so these settings no longer apply.</span>
+              <button type="button" class="link-btn" onClick={resetCommand}>
+                Reset to generated
+              </button>
+            </div>
+          </Show>
+
+          <fieldset class="option-controls" disabled={custom()}>
+            <fieldset class="field">
+              <legend class="field-label">Turn it into</legend>
+              <div class="format-groups">
+                <For each={groupsFor(info().kind)}>
+                  {(group) => (
+                    <div class="format-group" data-tone={group.tone}>
+                      <span class="format-group-label">{group.label}</span>
+                      <div class="format-chips">
+                        <For each={group.formats}>
+                          {(format) => (
+                            <button
+                              type="button"
+                              class="format-chip"
+                              aria-pressed={options().format === format}
+                              disabled={!isAvailable(format)}
+                              title={isAvailable(format) ? undefined : unavailableReason(format)}
+                              onClick={() => updateOptions({ format })}
+                            >
+                              {label(format)}
+                            </button>
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </fieldset>
+
+            <Show when={!readable()}>
+              <p class="lossless-note warning-note" role="alert">
+                <Icon name="alert" size={16} />
+                This file is AV1, which your ffmpeg can't read. Install one built with dav1d.
+              </p>
+            </Show>
+
+            <Show when={!animatedImage()}>
+              <CodecField
+                format={options().format}
+                codec={options().videoCodec ?? null}
+                available={isCodecAvailable}
+                onChange={(videoCodec) => updateOptions({ videoCodec })}
+              />
+            </Show>
+
+            <Show
+              when={!lossless()}
+              fallback={
+                <p class="lossless-note">
+                  <Icon name="sparkle" size={16} />
+                  {restoring()
+                    ? `Restores the original JPEG, bit for bit${leftOut() ? ` apart from ${leftOut()}` : ""}.`
+                    : repacking()
+                      ? `Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly${leftOut() ? `, minus ${leftOut()}` : ""}.`
+                      : "Lossless: every pixel and sample stays put."}
+                </p>
+              }
+            >
+              <QualityField
+                quality={options().quality}
+                describedBy={estimate() ? "size-estimate" : undefined}
+                onChange={(quality) => updateOptions({ quality })}
+              />
+            </Show>
+
+            <Show when={estimate()}>
+              {(text) => (
+                <p
+                  id="size-estimate"
+                  class="estimate"
+                  title="A rough guess from the original and these settings. The real size depends on what's in the file."
+                >
+                  {text()}
+                </p>
+              )}
+            </Show>
+
+            <Show when={visual() || (outKind() === "video" && info().kind === "video")}>
+              <div class="two-col">
+                <Show when={visual() && info().width !== null}>
+                  <label class="field">
+                    <span class="field-label">Size</span>
+                    <select
+                      class="select"
+                      onChange={(e) => {
+                        const v = e.currentTarget.value;
+                        updateOptions({ maxSize: v === "" ? null : Number(v) });
+                      }}
+                    >
+                      <option value="" selected={options().maxSize === null}>
+                        {autoSize() !== null
+                          ? `Auto (${sizeLabel(autoSize() ?? 0, outKind())})`
+                          : `Original (${sizeLabel(shortSide(info(), options()) ?? 0, info().kind)})`}
+                      </option>
+                      <For each={sizes()}>
+                        {(size) => (
+                          <option value={size} selected={options().maxSize === size}>
+                            {sizeLabel(size, outKind())}
+                          </option>
+                        )}
+                      </For>
+                    </select>
+                  </label>
+                </Show>
+                <Show when={outKind() === "video" && info().kind === "video"}>
+                  <label class="field">
+                    <span class="field-label">Frame rate</span>
+                    <select
+                      class="select"
+                      onChange={(e) => {
+                        const v = e.currentTarget.value;
+                        updateOptions({ fps: v === "" ? null : Number(v) });
+                      }}
+                    >
+                      <option value="" selected={options().fps === null}>
+                        {autoFps() !== null
+                          ? `Auto (${autoFps()})`
+                          : `Keep${info().fps ? ` (${Math.round(info().fps ?? 0)})` : ""}`}
+                      </option>
+                      <For each={rates()}>
+                        {(fps) => (
+                          <option value={fps} selected={options().fps === fps}>
+                            {fps} fps
+                          </option>
+                        )}
+                      </For>
+                    </select>
+                  </label>
+                </Show>
+              </div>
+            </Show>
+
+            <Show when={animatedImage()}>
+              <fieldset class="field">
+                <legend class="field-label">Playback</legend>
+                <div class="format-groups playback" data-tone="pink">
+                  <fieldset class="format-group" aria-labelledby="playback-speed">
+                    <span class="format-group-label" id="playback-speed">
+                      Speed
+                    </span>
                     <div class="format-chips">
-                      <For each={group.formats}>
-                        {(format) => (
+                      <For each={SPEEDS}>
+                        {(speed) => (
                           <button
                             type="button"
                             class="format-chip"
-                            aria-pressed={options().format === format}
-                            disabled={!isAvailable(format)}
-                            title={isAvailable(format) ? undefined : unavailableReason(format)}
-                            onClick={() => updateOptions({ format })}
+                            aria-pressed={options().speed === speed}
+                            onClick={() => updateOptions({ speed })}
                           >
-                            {label(format)}
+                            {speedLabel(speed)}
                           </button>
                         )}
                       </For>
                     </div>
-                  </div>
-                )}
-              </For>
-            </div>
-          </fieldset>
+                  </fieldset>
+                  <fieldset class="format-group" aria-labelledby="playback-direction">
+                    <span class="format-group-label" id="playback-direction">
+                      Direction
+                    </span>
+                    <div class="format-chips">
+                      <For each={DIRECTIONS}>
+                        {(way) => (
+                          <button
+                            type="button"
+                            class="format-chip"
+                            aria-pressed={options().direction === way.direction}
+                            onClick={() => updateOptions({ direction: way.direction })}
+                          >
+                            {way.label}
+                          </button>
+                        )}
+                      </For>
+                    </div>
+                  </fieldset>
+                </div>
+              </fieldset>
+            </Show>
 
-          <Show when={!readable()}>
-            <p class="lossless-note warning-note" role="alert">
-              <Icon name="alert" size={16} />
-              This file is AV1, which your ffmpeg can't read. Install one built with dav1d.
-            </p>
-          </Show>
-
-          <Show when={!animatedImage()}>
-            <CodecField
-              format={options().format}
-              codec={options().videoCodec ?? null}
-              available={isCodecAvailable}
-              onChange={(videoCodec) => updateOptions({ videoCodec })}
-            />
-          </Show>
-
-          <Show
-            when={!lossless()}
-            fallback={
-              <p class="lossless-note">
-                <Icon name="sparkle" size={16} />
-                {restoring()
-                  ? `Restores the original JPEG, bit for bit${leftOut() ? ` apart from ${leftOut()}` : ""}.`
-                  : repacking()
-                    ? `Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly${leftOut() ? `, minus ${leftOut()}` : ""}.`
-                    : "Lossless: every pixel and sample stays put."}
-              </p>
-            }
-          >
-            <QualityField
-              quality={options().quality}
-              describedBy={estimate() ? "size-estimate" : undefined}
-              onChange={(quality) => updateOptions({ quality })}
-            />
-          </Show>
-
-          <Show when={estimate()}>
-            {(text) => (
-              <p
-                id="size-estimate"
-                class="estimate"
-                title="A rough guess from the original and these settings. The real size depends on what's in the file."
-              >
-                {text()}
-              </p>
-            )}
-          </Show>
-
-          <Show when={visual() || (outKind() === "video" && info().kind === "video")}>
-            <div class="two-col">
-              <Show when={visual() && info().width !== null}>
-                <label class="field">
-                  <span class="field-label">Size</span>
-                  <select
-                    class="select"
-                    onChange={(e) => {
-                      const v = e.currentTarget.value;
-                      updateOptions({ maxSize: v === "" ? null : Number(v) });
-                    }}
-                  >
-                    <option value="" selected={options().maxSize === null}>
-                      {autoSize() !== null
-                        ? `Auto (${sizeLabel(autoSize() ?? 0, outKind())})`
-                        : `Original (${sizeLabel(shortSide(info(), options()) ?? 0, info().kind)})`}
-                    </option>
-                    <For each={sizes()}>
-                      {(size) => (
-                        <option value={size} selected={options().maxSize === size}>
-                          {sizeLabel(size, outKind())}
-                        </option>
-                      )}
-                    </For>
-                  </select>
-                </label>
-              </Show>
-              <Show when={outKind() === "video" && info().kind === "video"}>
-                <label class="field">
-                  <span class="field-label">Frame rate</span>
-                  <select
-                    class="select"
-                    onChange={(e) => {
-                      const v = e.currentTarget.value;
-                      updateOptions({ fps: v === "" ? null : Number(v) });
-                    }}
-                  >
-                    <option value="" selected={options().fps === null}>
-                      {autoFps() !== null
-                        ? `Auto (${autoFps()})`
-                        : `Keep${info().fps ? ` (${Math.round(info().fps ?? 0)})` : ""}`}
-                    </option>
-                    <For each={rates()}>
-                      {(fps) => (
-                        <option value={fps} selected={options().fps === fps}>
-                          {fps} fps
-                        </option>
-                      )}
-                    </For>
-                  </select>
-                </label>
-              </Show>
-            </div>
-          </Show>
-
-          <Show when={animatedImage()}>
-            <fieldset class="field">
-              <legend class="field-label">Playback</legend>
-              <div class="format-groups playback" data-tone="pink">
-                <fieldset class="format-group" aria-labelledby="playback-speed">
-                  <span class="format-group-label" id="playback-speed">
-                    Speed
-                  </span>
-                  <div class="format-chips">
-                    <For each={SPEEDS}>
-                      {(speed) => (
-                        <button
-                          type="button"
-                          class="format-chip"
-                          aria-pressed={options().speed === speed}
-                          onClick={() => updateOptions({ speed })}
-                        >
-                          {speedLabel(speed)}
-                        </button>
-                      )}
-                    </For>
-                  </div>
-                </fieldset>
-                <fieldset class="format-group" aria-labelledby="playback-direction">
-                  <span class="format-group-label" id="playback-direction">
-                    Direction
-                  </span>
-                  <div class="format-chips">
-                    <For each={DIRECTIONS}>
-                      {(way) => (
-                        <button
-                          type="button"
-                          class="format-chip"
-                          aria-pressed={options().direction === way.direction}
-                          onClick={() => updateOptions({ direction: way.direction })}
-                        >
-                          {way.label}
-                        </button>
-                      )}
-                    </For>
-                  </div>
-                </fieldset>
-              </div>
-            </fieldset>
-          </Show>
-
-          <Show when={canKeepAudio()}>
-            <div class="toggle-row">
-              <div>
-                <span class="toggle-title" id="keep-audio">
-                  Keep sound
-                </span>
-                <span class="item-meta">{info().audioCodec?.toUpperCase()} track</span>
-              </div>
-              <button
-                type="button"
-                class="switch"
-                role="switch"
-                aria-checked={options().keepAudio}
-                aria-labelledby="keep-audio"
-                onClick={() => updateOptions({ keepAudio: !options().keepAudio })}
-              />
-            </div>
-          </Show>
-
-          <Show when={hasSound()}>
-            <section class="sound-settings" aria-labelledby="sound-heading">
-              <h2 class="label-strong sound-heading" id="sound-heading">
-                <Icon name="music" size={16} /> Sound
-              </h2>
+            <Show when={canKeepAudio()}>
               <div class="toggle-row">
                 <div>
-                  <span class="toggle-title" id="sound-normalize">
-                    Even out loudness
+                  <span class="toggle-title" id="keep-audio">
+                    Keep sound
                   </span>
-                  <span class="item-meta">A steady, comfortable volume, like streaming apps</span>
+                  <span class="item-meta">{info().audioCodec?.toUpperCase()} track</span>
                 </div>
                 <button
                   type="button"
                   class="switch"
                   role="switch"
-                  aria-checked={options().sound.normalize}
-                  aria-labelledby="sound-normalize"
-                  onClick={() => setSound({ normalize: !options().sound.normalize })}
+                  aria-checked={options().keepAudio}
+                  aria-labelledby="keep-audio"
+                  onClick={() => updateOptions({ keepAudio: !options().keepAudio })}
                 />
               </div>
-              <div class="two-col">
-                <fieldset class="field">
-                  <legend class="field-label">Fade in</legend>
-                  <div class="format-chips">
-                    <For each={FADE_CHOICES}>
-                      {(secs) => (
-                        <button
-                          type="button"
-                          class="format-chip"
-                          aria-pressed={options().sound.fadeIn === secs}
-                          onClick={() => setSound({ fadeIn: secs })}
-                        >
-                          {secs === 0 ? "Off" : `${secs} s`}
-                        </button>
-                      )}
-                    </For>
+            </Show>
+
+            <Show when={hasSound()}>
+              <section class="sound-settings" aria-labelledby="sound-heading">
+                <h2 class="label-strong sound-heading" id="sound-heading">
+                  <Icon name="music" size={16} /> Sound
+                </h2>
+                <div class="toggle-row">
+                  <div>
+                    <span class="toggle-title" id="sound-normalize">
+                      Even out loudness
+                    </span>
+                    <span class="item-meta">A steady, comfortable volume, like streaming apps</span>
                   </div>
-                </fieldset>
-                <Show when={keptLength() !== null}>
+                  <button
+                    type="button"
+                    class="switch"
+                    role="switch"
+                    aria-checked={options().sound.normalize}
+                    aria-labelledby="sound-normalize"
+                    onClick={() => setSound({ normalize: !options().sound.normalize })}
+                  />
+                </div>
+                <div class="two-col">
                   <fieldset class="field">
-                    <legend class="field-label">Fade out</legend>
+                    <legend class="field-label">Fade in</legend>
                     <div class="format-chips">
                       <For each={FADE_CHOICES}>
                         {(secs) => (
                           <button
                             type="button"
                             class="format-chip"
-                            aria-pressed={options().sound.fadeOut === secs}
-                            onClick={() => setSound({ fadeOut: secs })}
+                            aria-pressed={options().sound.fadeIn === secs}
+                            onClick={() => setSound({ fadeIn: secs })}
                           >
                             {secs === 0 ? "Off" : `${secs} s`}
                           </button>
@@ -1197,106 +1243,127 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                       </For>
                     </div>
                   </fieldset>
-                </Show>
-              </div>
-              <Show when={outKind() === "video" && (fades().fadeIn > 0 || fades().fadeOut > 0)}>
-                <span class="item-meta">The picture fades from and to black with the sound.</span>
-              </Show>
-            </section>
-          </Show>
-
-          <fieldset class="field metadata-field">
-            <legend class="field-label">Metadata</legend>
-            <Show when={locationLine(info())}>
-              {(line) => (
-                <p class="location-line">
-                  <span aria-hidden="true">📍</span>
-                  <span>
-                    {line()}.{" "}
-                    <span class="location-fate">
-                      {keepsLocation(info(), options()) ? "The copy will too." : "The copy won't."}
-                    </span>
-                  </span>
-                </p>
-              )}
-            </Show>
-            <Show when={canKeepMetadata()}>
-              <div class="format-chips">
-                <For each={METADATA_CHOICES}>
-                  {(choice) => (
-                    <button
-                      type="button"
-                      class="format-chip"
-                      aria-pressed={options().metadata === choice.mode}
-                      onClick={() => updateOptions({ metadata: choice.mode })}
-                    >
-                      {choice.label}
-                    </button>
-                  )}
-                </For>
-              </div>
-            </Show>
-            <span class="item-meta">{metadataHint()}</span>
-          </fieldset>
-
-          <Show when={isJxl()}>
-            <div class="jxl-settings">
-              <div class="toggle-row">
-                <div>
-                  <span class="toggle-title" id="jxl-lossless">
-                    Lossless
-                  </span>
-                  <span class="item-meta">
-                    {info().extension === "jpg" || info().extension === "jpeg"
-                      ? "Repack the JPEG exactly, about 20% smaller"
-                      : "Keep every pixel exactly"}
-                  </span>
+                  <Show when={keptLength() !== null}>
+                    <fieldset class="field">
+                      <legend class="field-label">Fade out</legend>
+                      <div class="format-chips">
+                        <For each={FADE_CHOICES}>
+                          {(secs) => (
+                            <button
+                              type="button"
+                              class="format-chip"
+                              aria-pressed={options().sound.fadeOut === secs}
+                              onClick={() => setSound({ fadeOut: secs })}
+                            >
+                              {secs === 0 ? "Off" : `${secs} s`}
+                            </button>
+                          )}
+                        </For>
+                      </div>
+                    </fieldset>
+                  </Show>
                 </div>
-                <button
-                  type="button"
-                  class="switch"
-                  role="switch"
-                  aria-checked={options().jxl.lossless}
-                  aria-labelledby="jxl-lossless"
-                  onClick={() => setJxl({ lossless: !options().jxl.lossless })}
-                />
-              </div>
-              <fieldset class="field">
-                <legend class="field-label">Effort</legend>
+                <Show when={outKind() === "video" && (fades().fadeIn > 0 || fades().fadeOut > 0)}>
+                  <span class="item-meta">The picture fades from and to black with the sound.</span>
+                </Show>
+              </section>
+            </Show>
+
+            <fieldset class="field metadata-field">
+              <legend class="field-label">Metadata</legend>
+              <Show when={locationLine(info())}>
+                {(line) => (
+                  <p class="location-line">
+                    <span aria-hidden="true">📍</span>
+                    <span>
+                      {line()}.{" "}
+                      <span class="location-fate">
+                        {keepsLocation(info(), options())
+                          ? "The copy will too."
+                          : "The copy won't."}
+                      </span>
+                    </span>
+                  </p>
+                )}
+              </Show>
+              <Show when={canKeepMetadata()}>
                 <div class="format-chips">
-                  <For each={JXL_EFFORTS}>
-                    {(preset) => (
+                  <For each={METADATA_CHOICES}>
+                    {(choice) => (
                       <button
                         type="button"
                         class="format-chip"
-                        aria-pressed={options().jxl.effort === preset.effort}
-                        onClick={() => setJxl({ effort: preset.effort })}
+                        aria-pressed={options().metadata === choice.mode}
+                        onClick={() => updateOptions({ metadata: choice.mode })}
                       >
-                        {preset.label}
+                        {choice.label}
                       </button>
                     )}
                   </For>
                 </div>
-                <span class="item-meta">More effort: smaller file, slower to make.</span>
-              </fieldset>
-              <div class="toggle-row">
-                <div>
-                  <span class="toggle-title" id="jxl-progressive">
-                    Progressive
-                  </span>
-                  <span class="item-meta">Shows a sharp preview while it loads</span>
+              </Show>
+              <span class="item-meta">{metadataHint()}</span>
+            </fieldset>
+
+            <Show when={isJxl()}>
+              <div class="jxl-settings">
+                <div class="toggle-row">
+                  <div>
+                    <span class="toggle-title" id="jxl-lossless">
+                      Lossless
+                    </span>
+                    <span class="item-meta">
+                      {info().extension === "jpg" || info().extension === "jpeg"
+                        ? "Repack the JPEG exactly, about 20% smaller"
+                        : "Keep every pixel exactly"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    class="switch"
+                    role="switch"
+                    aria-checked={options().jxl.lossless}
+                    aria-labelledby="jxl-lossless"
+                    onClick={() => setJxl({ lossless: !options().jxl.lossless })}
+                  />
                 </div>
-                <button
-                  type="button"
-                  class="switch"
-                  role="switch"
-                  aria-checked={options().jxl.progressive}
-                  aria-labelledby="jxl-progressive"
-                  onClick={() => setJxl({ progressive: !options().jxl.progressive })}
-                />
+                <fieldset class="field">
+                  <legend class="field-label">Effort</legend>
+                  <div class="format-chips">
+                    <For each={JXL_EFFORTS}>
+                      {(preset) => (
+                        <button
+                          type="button"
+                          class="format-chip"
+                          aria-pressed={options().jxl.effort === preset.effort}
+                          onClick={() => setJxl({ effort: preset.effort })}
+                        >
+                          {preset.label}
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                  <span class="item-meta">More effort: smaller file, slower to make.</span>
+                </fieldset>
+                <div class="toggle-row">
+                  <div>
+                    <span class="toggle-title" id="jxl-progressive">
+                      Progressive
+                    </span>
+                    <span class="item-meta">Shows a sharp preview while it loads</span>
+                  </div>
+                  <button
+                    type="button"
+                    class="switch"
+                    role="switch"
+                    aria-checked={options().jxl.progressive}
+                    aria-labelledby="jxl-progressive"
+                    onClick={() => setJxl({ progressive: !options().jxl.progressive })}
+                  />
+                </div>
               </div>
-            </div>
-          </Show>
+            </Show>
+          </fieldset>
 
           <div class="outcome">
             <div class="outcome-name">
@@ -1353,21 +1420,74 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               </button>
             </form>
             <p class="item-meta">
-              Keeps the format, settings and crop shape; trims and turns stay with each file.
+              {custom()
+                ? "Keeps the edited command as written, trims and turns included; only the file names change."
+                : "Keeps the format, settings and crop shape; trims and turns stay with each file."}
             </p>
           </Show>
 
           <details
             class="command"
+            classList={{ custom: custom() }}
             open={showCommand()}
             onToggle={(e) => setShowCommand(e.currentTarget.open)}
           >
             <summary>
-              <Icon name="terminal" size={16} /> Show command
+              <Icon name="terminal" size={16} /> {custom() ? "Custom command" : "Show command"}
             </summary>
-            <pre class="command-text">
-              <code>{command() || "…"}</code>
-            </pre>
+            <Show
+              when={custom()}
+              fallback={
+                <>
+                  <pre class="command-text">
+                    <code>{command() || "…"}</code>
+                  </pre>
+                  <div class="command-actions">
+                    <button
+                      type="button"
+                      class="link-btn"
+                      disabled={!canEdit()}
+                      title="Change the arguments by hand. The settings above stop applying until you reset."
+                      onClick={editCommand}
+                    >
+                      <Icon name="sliders" size={14} /> Edit
+                    </button>
+                  </div>
+                </>
+              }
+            >
+              <textarea
+                ref={commandField}
+                class="input command-text command-input"
+                aria-label="Command"
+                aria-invalid={commandError() !== null}
+                aria-describedby="command-hint"
+                aria-errormessage={commandError() ? "command-error" : undefined}
+                value={props.draft.command ?? ""}
+                rows={Math.min(12, Math.max(4, (props.draft.command ?? "").split("\n").length + 1))}
+                spellcheck={false}
+                autocomplete="off"
+                autocapitalize="off"
+                onInput={(e) => setCustomCommand(e.currentTarget.value)}
+              />
+              <Show when={commandError()}>
+                {(message) => (
+                  <p id="command-error" class="command-error" role="alert">
+                    <Icon name="alert" size={14} />
+                    {message()}
+                  </p>
+                )}
+              </Show>
+              <p id="command-hint" class="item-meta">
+                Runs ffmpeg, cjxl and djxl directly, never through a shell. The output stays{" "}
+                {outputName(info(), options())} next to the original.
+              </p>
+              <div class="command-actions">
+                <button type="button" class="link-btn" onClick={resetCommand}>
+                  <Icon name="rotate" size={14} /> Reset to generated
+                </button>
+              </div>
+            </Show>
           </details>
         </section>
       </div>

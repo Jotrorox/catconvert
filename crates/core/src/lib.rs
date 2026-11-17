@@ -15,10 +15,14 @@
 //! 3. [`Queue`] runs planned conversions one after another and reports
 //!    [`JobProgress`] events.
 //!
+//! The planned commands can also be edited by hand: [`custom_plan`] checks
+//! the edited text and turns it into a [`Plan`] ([`Queue::submit_custom`]).
+//!
 //! Several pictures can also become one animation: [`plan_sequence`] plans
 //! it and [`Queue::submit_sequence`] runs it.
 
 mod convert;
+mod custom;
 mod error;
 mod ffmpeg;
 mod job;
@@ -31,6 +35,9 @@ pub use convert::{
     ConvertOptions, Crop, CropArea, Direction, JxlOptions, JxlSupport, Metadata, OutputFormat,
     Plan, SoundOptions, Step, Support, Tool, VideoCodec, frame_output_path, frame_plan,
     output_path, plan,
+};
+pub use custom::{
+    INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER, command_template, custom_plan, fill_command,
 };
 pub use error::{Error, Result};
 pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, RunProgress};

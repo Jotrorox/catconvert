@@ -2536,6 +2536,66 @@ button.format-chip:not(:disabled):active {
   -webkit-user-select: text;
 }
 
+.command.custom {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+
+.command-input {
+  display: block;
+  height: auto;
+  min-height: 96px;
+  resize: vertical;
+}
+
+.command-input[aria-invalid="true"] {
+  border-color: var(--pink-ink);
+}
+
+.command-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 0;
+  color: var(--pink-ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.command .item-meta {
+  display: block;
+  margin-top: 8px;
+}
+
+.command-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+/* Settings that an edited command overrides. */
+.option-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.option-controls:disabled,
+.locked {
+  opacity: 0.5;
+}
+
+.custom-note {
+  flex-wrap: wrap;
+}
+
+.custom-note span {
+  flex: 1 1 200px;
+}
+
 .sticky-cta {
   position: sticky;
   bottom: 0;

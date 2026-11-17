@@ -293,11 +293,75 @@ fn preview_command(
     info: MediaInfo,
     options: ConvertOptions,
 ) -> Result<String, String> {
-    let support = state.ffmpeg().map(|f| f.support()).unwrap_or_default();
-    let output = catconvert_core::output_path(&info.path, options.format, |_| false);
-    catconvert_core::plan(&info, &options, &output, support)
+    preview_plan(&state, &info, &options)
         .map(|plan| plan.command_line())
         .map_err(|err| err.to_string())
+}
+
+/// The plan a conversion of `info` with `options` would run, for previews.
+/// The output name skips names queued jobs will write, as submitting does.
+fn preview_plan(
+    state: &AppState,
+    info: &MediaInfo,
+    options: &ConvertOptions,
+) -> Result<catconvert_core::Plan, Error> {
+    match state.queue() {
+        Ok(queue) => queue.preview(info, options),
+        Err(_) => {
+            let output = catconvert_core::output_path(&info.path, options.format, |_| false);
+            catconvert_core::plan(info, options, &output, JxlSupport::default())
+        }
+    }
+}
+
+/// Check a command edited in the editor without running it. Returns the
+/// command as it would run (with a recipe's placeholders filled in), or why
+/// it would be refused.
+#[tauri::command]
+fn check_command(
+    state: State<'_, AppState>,
+    info: MediaInfo,
+    options: ConvertOptions,
+    command: String,
+) -> Result<String, String> {
+    let support = state.ffmpeg().map(|f| f.support()).unwrap_or_default();
+    preview_plan(&state, &info, &options)
+        .and_then(|plan| catconvert_core::custom_plan(&info, &plan, &command, support))
+        .map(|plan| plan.command_line())
+        .map_err(|err| err.to_string())
+}
+
+/// A recipe's saved command with this file's paths filled in, for the editor.
+#[tauri::command]
+fn fill_command(
+    state: State<'_, AppState>,
+    info: MediaInfo,
+    options: ConvertOptions,
+    template: String,
+) -> Result<String, String> {
+    preview_plan(&state, &info, &options)
+        .and_then(|plan| catconvert_core::fill_command(&template, &info.path, &plan.output))
+        .map_err(|err| err.to_string())
+}
+
+/// An edited command with the file's paths swapped for placeholders, to save
+/// in a recipe or run for other files.
+#[tauri::command]
+fn command_template(path: String, command: String) -> Result<String, String> {
+    catconvert_core::command_template(Path::new(&path), &command).map_err(|err| err.to_string())
+}
+
+/// Queue a conversion running `command`, edited by hand, instead of the
+/// generated one. Refused commands come back as an error, unqueued.
+#[tauri::command]
+async fn start_custom_job(
+    state: State<'_, AppState>,
+    path: String,
+    options: ConvertOptions,
+    command: String,
+) -> Result<JobTicket, String> {
+    let queue = state.queue()?;
+    blocking(move || queue.submit_custom(&path, &options, &command)).await
 }
 
 /// The command(s) making one animation from `pictures` would run.
@@ -441,6 +505,10 @@ pub fn run() {
             playback_source,
             loudness,
             preview_command,
+            check_command,
+            fill_command,
+            command_template,
+            start_custom_job,
             save_frame,
             preview_sequence_command,
             start_job,
