@@ -1145,6 +1145,15 @@ code {
   color: var(--muted);
 }
 
+/* Finished files (History, Queue): press and move to drag them into another app. */
+.drag-out {
+  cursor: grab;
+}
+
+.drag-out:active {
+  cursor: grabbing;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Editor                                                                    */
 /* ------------------------------------------------------------------------ */

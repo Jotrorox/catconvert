@@ -1,12 +1,14 @@
 import { type Component, createMemo, For, Show } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
+import { dragIcon, startDragOnMove } from "../lib/drag";
 import { baseName, formatBytes, formatClock } from "../lib/format";
 import { label } from "../lib/formats";
 import {
   cancelJob,
   chooseFiles,
   clearFinished,
+  dragOut,
   isFinal,
   type JobEntry,
   removeJob,
@@ -15,6 +17,15 @@ import {
   state,
   tweakJob,
 } from "../lib/store";
+
+/** Finished files can be dragged straight into another app. */
+function dragDone(event: PointerEvent, job: JobEntry) {
+  if (job.stage !== "done") return;
+  startDragOnMove(
+    event,
+    () => void dragOut(job.output, dragIcon(job.options.format, job.input.kind)),
+  );
+}
 
 function route(job: JobEntry) {
   return `${(job.input.extension ?? "?").toUpperCase()} → ${label(job.options.format)}`;
@@ -181,7 +192,13 @@ export const QueueScreen: Component<{ compact: boolean }> = (props) => {
           <ul class="job-list">
             <For each={finished()}>
               {(job) => (
-                <li class="job-row pop" data-stage={job.stage}>
+                <li
+                  class="job-row pop"
+                  classList={{ "drag-out": job.stage === "done" }}
+                  data-stage={job.stage}
+                  title={job.stage === "done" ? "Drag into another app or folder" : undefined}
+                  onPointerDown={(event) => dragDone(event, job)}
+                >
                   <Show
                     when={job.stage === "done"}
                     fallback={

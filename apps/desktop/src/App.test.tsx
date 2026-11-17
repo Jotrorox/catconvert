@@ -25,6 +25,10 @@ vi.mock("./lib/api", () => ({
   checkForUpdate: vi.fn(),
   installUpdate: vi.fn(),
   relaunch: vi.fn(async () => {}),
+  onOpenedFiles: vi.fn(),
+  quickActionStatus: vi.fn(async () => ({ supported: false, installed: false })),
+  setQuickAction: vi.fn(),
+  dragFiles: vi.fn(async () => {}),
   NO_JXL: {},
 }));
 
@@ -115,6 +119,7 @@ beforeEach(() => {
   resetStore();
   vi.clearAllMocks();
   vi.mocked(api.ffmpegStatus).mockResolvedValue(status());
+  vi.mocked(api.quickActionStatus).mockResolvedValue({ supported: false, installed: false });
   vi.mocked(api.probeFile).mockImplementation(async (path) =>
     path.endsWith(".wav")
       ? SONG
@@ -649,6 +654,73 @@ describe("CatConvert", () => {
       "/clips/b.mov",
       expect.objectContaining({ format: "webm", trimStart: null }),
     );
+  });
+
+  it("adds and removes the Finder Quick Action in Settings", async () => {
+    vi.mocked(api.quickActionStatus).mockResolvedValue({ supported: true, installed: false });
+    vi.mocked(api.setQuickAction).mockImplementation(async (installed) => ({
+      supported: true,
+      installed,
+    }));
+    render(() => <App />);
+    navigate("settings");
+
+    const toggle = await screen.findByRole("switch", { name: "Finder Quick Action" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+    expect(api.setQuickAction).toHaveBeenLastCalledWith(true);
+    expect(screen.getByText(/Quick Actions › Convert with CatConvert/)).toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    expect(api.setQuickAction).toHaveBeenLastCalledWith(false);
+  });
+
+  it("only offers the Quick Action where there is one", async () => {
+    render(() => <App />);
+    navigate("settings");
+    expect(await screen.findByRole("heading", { name: "From other apps" })).toBeInTheDocument();
+    await waitFor(() => expect(api.quickActionStatus).toHaveBeenCalled());
+    expect(screen.queryByRole("switch", { name: "Finder Quick Action" })).not.toBeInTheDocument();
+  });
+
+  it("drags finished files out of History once the pointer moves", async () => {
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    applyProgress({
+      jobId: 7,
+      stage: "done",
+      progress: 1,
+      speed: null,
+      outputBytes: 9,
+      error: null,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    const row = (await screen.findByText("clip.mp4")).closest("li") as HTMLElement;
+
+    // A press on the folder button stays a click.
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Show clip.mp4 in folder/ }), {
+      button: 0,
+      clientX: 10,
+      clientY: 10,
+    });
+    fireEvent.pointerMove(window, { clientX: 40, clientY: 10 });
+    fireEvent.pointerUp(window);
+    // So does a press that barely moves.
+    fireEvent.pointerDown(row, { button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(window, { clientX: 12, clientY: 11 });
+    fireEvent.pointerUp(window);
+    expect(api.dragFiles).not.toHaveBeenCalled();
+
+    fireEvent.pointerDown(row, { button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(window, { clientX: 30, clientY: 14 });
+    expect(api.dragFiles).toHaveBeenCalledTimes(1);
+    expect(api.dragFiles).toHaveBeenCalledWith(["/clips/clip.mp4"], expect.any(String));
+    // Later moves belong to the native drag.
+    fireEvent.pointerMove(window, { clientX: 60, clientY: 20 });
+    expect(api.dragFiles).toHaveBeenCalledTimes(1);
   });
 
   it("marks history entries whose files were moved and can forget them", async () => {

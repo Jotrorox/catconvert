@@ -57,6 +57,30 @@ because it only runs these tools as separate processes. Don't link ffmpeg's
 libraries into the app. Every release must carry the matching source archive,
 which the release workflow attaches automatically.
 
+## Opening files from other apps
+
+Files reach a running or starting app in two ways. macOS sends
+`RunEvent::Opened`. Windows and Linux start the program with the paths as
+arguments, and `tauri-plugin-single-instance` passes a second launch's arguments
+to the running app. Both go through `src-tauri/src/incoming.rs`, which holds the
+files until the front end subscribes (`onOpenedFiles` in `api.ts`).
+
+| Where   | Entry point                    | Configured in                                               |
+| ------- | ------------------------------ | ----------------------------------------------------------- |
+| macOS   | Open With, Dock icon           | `tauri.macos.conf.json`, `Info.plist` (types macOS lacks)   |
+| macOS   | Finder Quick Action (Settings) | `quick-action/` templates, `src/quick_action.rs`            |
+| Windows | Open with, Send to             | `windows/hooks.nsh` (NSIS), `windows/shell.wxs` (MSI)       |
+| Linux   | Open With                      | `tauri.linux.conf.json` (MIME types in the `.desktop` file) |
+
+Windows doesn't use Tauri's `fileAssociations`: it would make CatConvert the
+default app for every listed type. The installers only add it to "Open with".
+
+When the core learns a new input format (`MediaKind::from_extension`), add it to
+all of these lists and to the file picker in `api.ts`.
+
+Dragging finished files out uses `tauri-plugin-drag`, which `dragFiles` in
+`api.ts` calls directly (the plugin's npm package isn't needed).
+
 ## Commit messages
 
 We use [Conventional Commits](https://www.conventionalcommits.org):

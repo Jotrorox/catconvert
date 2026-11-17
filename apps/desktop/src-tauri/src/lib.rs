@@ -10,6 +10,12 @@
 //! Release builds ship ffmpeg, ffprobe and libjxl's tools as Tauri sidecars
 //! (see `tauri.media-tools.conf.json`); without them the app falls back to an
 //! installed ffmpeg.
+//!
+//! Files can also come in from outside the window ("Open with", the Finder
+//! Quick Action, "Send to"); see [`incoming`] and [`quick_action`].
+
+mod incoming;
+mod quick_action;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -21,6 +27,9 @@ use serde::Serialize;
 use tauri::ipc::Response;
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+use crate::incoming::Incoming;
+use crate::quick_action::QuickActionStatus;
 
 /// Event name for [`catconvert_core::JobProgress`] payloads.
 const JOB_PROGRESS_EVENT: &str = "job-progress";
@@ -256,9 +265,58 @@ async fn missing_files(paths: Vec<String>) -> Result<Vec<String>, String> {
     .map_err(|err| err.to_string())
 }
 
+/// Files opened from outside the app before the front end was listening.
+/// Later ones arrive as `open-files` events.
+#[tauri::command]
+fn take_opened_files(incoming: State<'_, Incoming>) -> Vec<PathBuf> {
+    incoming.take()
+}
+
+fn quick_action_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let home = app.path().home_dir().map_err(|err| err.to_string())?;
+    Ok(quick_action::workflow_path(&home))
+}
+
+/// Whether "Convert with CatConvert" is in Finder's Quick Actions menu.
+#[tauri::command]
+fn quick_action_status(app: AppHandle) -> Result<QuickActionStatus, String> {
+    Ok(quick_action::status(&quick_action_path(&app)?))
+}
+
+/// Add or remove the Finder Quick Action.
+#[tauri::command]
+async fn set_quick_action(app: AppHandle, installed: bool) -> Result<QuickActionStatus, String> {
+    let workflow = quick_action_path(&app)?;
+    let bundle_id = app.config().identifier.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if installed {
+            quick_action::install(&workflow, &bundle_id)?;
+        } else {
+            quick_action::remove(&workflow)?;
+        }
+        Ok::<_, std::io::Error>(quick_action::status(&workflow))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // First, so a second launch hands its files to the running app and exits
+    // before anything else starts.
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            incoming::show_main_window(app);
+            let files = incoming::files_in_args(args, Path::new(&cwd));
+            app.state::<Incoming>().receive(app, files);
+        }))
+        .plugin(tauri_plugin_drag::init());
+
+    builder
+        .manage(Incoming::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -267,6 +325,12 @@ pub fn run() {
             app.manage(AppState {
                 backend: RwLock::new(backend),
             });
+            // Windows' "Open with" and "Send to" and Linux file managers pass
+            // the files as arguments.
+            if let Ok(cwd) = std::env::current_dir() {
+                let files = incoming::files_in_args(std::env::args_os(), &cwd);
+                app.state::<Incoming>().receive(app.handle(), files);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -281,7 +345,21 @@ pub fn run() {
             relaunch,
             missing_files,
             third_party_licenses,
+            take_opened_files,
+            quick_action_status,
+            set_quick_action,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // "Open with", a drop on the Dock icon, or the Quick Action.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = event {
+                incoming::show_main_window(app);
+                app.state::<Incoming>()
+                    .receive(app, incoming::files_in_urls(&urls));
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }

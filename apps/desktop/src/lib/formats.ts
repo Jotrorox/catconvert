@@ -110,6 +110,14 @@ export function isLossless(options: ConvertOptions): boolean {
 
 export const label = (format: OutputFormat) => format.toUpperCase();
 
+/** Tile colour for each kind of file. */
+export const KIND_TONE: Record<MediaKind, Tone> = {
+  video: "pink",
+  audio: "yellow",
+  image: "lavender",
+  unknown: "green",
+};
+
 /** JPEG XL effort presets (cjxl's -e). */
 export const JXL_EFFORTS = [
   { effort: 3, label: "Quick" },
@@ -396,11 +404,6 @@ export function initialOptions(
 }
 
 const KIND_WORD = { video: "VIDEO", audio: "SOUND", image: "PICTURE", unknown: "ANY" } as const;
-const KIND_TONE: Record<FormatGroup["kind"], Tone> = {
-  video: "pink",
-  audio: "yellow",
-  image: "lavender",
-};
 
 /** One line describing what a recipe does, e.g. "720p · 30 fps · Balanced". */
 export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {

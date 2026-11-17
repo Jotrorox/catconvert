@@ -2,7 +2,7 @@ import { createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { CatPeek } from "./components/Cat";
 import { Sidebar, type Tab, TabBar } from "./components/Navigation";
 import { Toasts } from "./components/Toasts";
-import { inTauri, onFileDrop, onJobProgress, type UnlistenFn } from "./lib/api";
+import { inTauri, onFileDrop, onJobProgress, onOpenedFiles, type UnlistenFn } from "./lib/api";
 import { createMediaQuery } from "./lib/media";
 import { overlayTitleBar } from "./lib/platform";
 import {
@@ -43,6 +43,8 @@ export default function App() {
     const unlisten: Promise<UnlistenFn>[] = [
       onJobProgress(applyProgress),
       onFileDrop({ onHover: setDropHover, onDrop: openPaths }),
+      // "Open with", the Finder Quick Action, "Send to"…
+      onOpenedFiles(openPaths),
     ];
     onCleanup(() => {
       for (const p of unlisten) void p.then((stop) => stop());
