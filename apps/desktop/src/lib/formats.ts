@@ -4,6 +4,7 @@
  */
 import type {
   ConvertOptions,
+  Destination,
   Direction,
   MediaInfo,
   MediaKind,
@@ -383,12 +384,23 @@ export function qualityStep(quality: number): (typeof QUALITY_STEPS)[number] {
   return QUALITY_STEPS[quality < 34 ? 0 : quality > 66 ? 2 : 1];
 }
 
+/** Where converted files go by default, chosen in Settings. */
+export type OutputChoice = Destination["kind"];
+
 /** What freshly opened files start with, set in Settings. */
 export type Defaults = {
   /** Preferred output per input kind; `null` lets CatConvert pick. */
   formats: Record<FormatGroup["kind"], OutputFormat | null>;
   quality: number;
   metadata: MetadataMode;
+  /** Where converted files go. */
+  output: OutputChoice;
+  /** The folder for `output: "folder"`, kept when another choice is made. */
+  outputFolder: string | null;
+  /** Sort the output folder into Videos, Pictures and Audio. */
+  outputByKind: boolean;
+  /** The user has agreed once that replacing moves originals to the Trash. */
+  replaceConfirmed: boolean;
 };
 
 /** Keeping all but the location suits an app that never sends files anywhere. */
@@ -396,7 +408,39 @@ export const DEFAULTS: Defaults = {
   formats: { video: null, audio: null, image: null },
   quality: 60,
   metadata: "noLocation",
+  output: "nextToInput",
+  outputFolder: null,
+  outputByKind: false,
+  replaceConfirmed: false,
 };
+
+/**
+ * The destination for `choice` (the default one unless given) with the
+ * folder from Settings. A folder choice without a folder falls back to next
+ * to the original.
+ */
+export function destinationFor(
+  defaults: Defaults,
+  choice: OutputChoice = defaults.output,
+): Destination {
+  if (choice === "folder") {
+    return defaults.outputFolder
+      ? { kind: "folder", path: defaults.outputFolder, byKind: defaults.outputByKind }
+      : { kind: "nextToInput" };
+  }
+  return { kind: choice };
+}
+
+/** Whether `options` will replace the file they convert. */
+export function replacesOriginal(options: Pick<ConvertOptions, "destination">): boolean {
+  return options.destination?.kind === "replaceInput";
+}
+
+/** The last part of a folder path, e.g. `CatConvert`. */
+export function folderName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
 
 /** Whether the editor offers `format` for an input of `kind`. */
 export function offers(kind: MediaKind, format: OutputFormat): boolean {
@@ -545,6 +589,7 @@ export function initialOptions(
     ...defaultOptions(format),
     quality: defaults.quality,
     metadata: defaults.metadata,
+    destination: destinationFor(defaults),
     jxl: { ...defaultOptions("jxl").jxl, lossless: LOSSLESS_BY_DEFAULT.has(info.extension ?? "") },
   });
   if (recipe?.accepts.includes(info.kind)) {
@@ -603,7 +648,15 @@ export function recipeFrom(
 ): Recipe {
   const out = formatKind(options.format, info.kind);
   const accepts: MediaKind[] = out === "audio" ? ["video", "audio"] : [info.kind];
-  const { trimStart: _start, trimEnd: _end, rotate: _rotate, flip: _flip, ...kept } = options;
+  // Where results go is a setting of its own, not part of a recipe.
+  const {
+    trimStart: _start,
+    trimEnd: _end,
+    rotate: _rotate,
+    flip: _flip,
+    destination: _destination,
+    ...kept
+  } = options;
   const crop = out === "audio" ? null : cropForOtherFile(options.crop);
   return {
     id,
@@ -703,6 +756,11 @@ export function sequenceOptions(
     quality: defaults.quality,
     // An animation never carries one picture's tags; the backend strips them.
     metadata: "none",
+    // One file can't take the place of several pictures.
+    destination: destinationFor(
+      defaults,
+      defaults.output === "replaceInput" ? "nextToInput" : defaults.output,
+    ),
   };
 }
 

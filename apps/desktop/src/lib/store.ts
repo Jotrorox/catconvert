@@ -11,6 +11,7 @@ import { batch } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import type {
   ConvertOptions,
+  Destination,
   FfmpegStatus,
   JobId,
   JobProgress,
@@ -29,11 +30,13 @@ import {
   DEFAULT_SEQUENCE,
   DEFAULTS,
   type Defaults,
+  destinationFor,
   fitOptions,
   initialOptions,
   looksLikePicture,
   metadataFrom,
   naturalOrder,
+  type OutputChoice,
   RECIPES,
   type Recipe,
   type RecipeId,
@@ -68,6 +71,8 @@ export type JobEntry = {
   /** Every input: just `input`, or an animation's pictures in order. */
   inputs: MediaInfo[];
   output: string;
+  /** The original the result replaces, if it does. */
+  replaces: string | null;
   options: ConvertOptions;
   /** Set for an animation made from pictures. */
   sequence: SequenceOptions | null;
@@ -94,6 +99,10 @@ export type HistoryItem = {
   finishedAt: number;
   /** How many pictures an animation was made from. */
   pictures?: number;
+  /** The result took the place of its original. */
+  replaced?: boolean;
+  /** Where the replaced original was kept when there was no Trash to put it in. */
+  keptAs?: string;
 };
 
 export type Toast = {
@@ -147,6 +156,8 @@ type State = {
   toasts: Toast[];
 };
 
+const OUTPUT_CHOICES: readonly OutputChoice[] = ["nextToInput", "folder", "replaceInput"];
+
 const HISTORY_KEY = "catconvert.history.v1";
 const SETTINGS_KEY = "catconvert.settings.v1";
 const RECIPES_KEY = "catconvert.recipes.v1";
@@ -189,6 +200,10 @@ function loadSettings(): Defaults {
     ...rest,
     formats: { ...DEFAULTS.formats, ...parsed.formats },
     metadata: metadataFrom(parsed) ?? DEFAULTS.metadata,
+    output: OUTPUT_CHOICES.includes(parsed.output as OutputChoice)
+      ? (parsed.output as OutputChoice)
+      : DEFAULTS.output,
+    outputFolder: typeof parsed.outputFolder === "string" ? parsed.outputFolder : null,
   };
 }
 
@@ -806,6 +821,7 @@ function addJob(
     input,
     inputs: ticket.inputs,
     output: ticket.output,
+    replaces: ticket.replaces ?? null,
     options,
     sequence,
     command: ticket.command,
@@ -837,6 +853,8 @@ export function applyProgress(event: JobProgress) {
   if (!job || isFinal(job.stage)) return;
 
   const finished = isFinal(event.stage);
+  // The name can move on if another file took it while converting.
+  const output = (event.stage === "done" && event.output) || job.output;
   setState(
     "jobs",
     index,
@@ -846,22 +864,31 @@ export function applyProgress(event: JobProgress) {
       draft.speed = event.speed;
       draft.outputBytes = event.outputBytes;
       draft.error = event.error;
+      draft.output = output;
       if (finished) draft.finishedAt = Date.now();
     }),
   );
 
   if (event.stage === "done") {
+    const keptAs = event.replaced?.to === "renamed" ? event.replaced.path : null;
     remember({
       id: `${job.submittedAt}-${job.id}`,
-      name: baseName(job.output),
-      output: job.output,
+      name: baseName(output),
+      output,
       format: job.options.format,
       kind: job.input.kind,
       inputBytes: inputBytes(job),
       outputBytes: event.outputBytes ?? 0,
       finishedAt: Date.now(),
       ...(job.sequence ? { pictures: job.inputs.length } : {}),
+      ...(job.replaces ? { replaced: true } : {}),
+      ...(keptAs ? { keptAs } : {}),
     });
+    if (keptAs) {
+      toast(`There's no Trash here, so the original was kept as ${baseName(keptAs)}`, {
+        action: { label: "Show in folder", run: () => void reveal(keptAs) },
+      });
+    }
   } else if (event.stage === "failed" && state.screen !== "queue") {
     toast(`${job.name} didn't convert`, {
       tone: "error",
@@ -1082,6 +1109,90 @@ export function updateSettings(patch: Partial<Defaults>) {
     save(SETTINGS_KEY, next);
     return next;
   });
+}
+
+/**
+ * Make `choice` where converted files go by default. Choosing a folder for
+ * the first time takes the suggested one (`CatConvert` in Downloads), or
+ * asks for one. Replacing needs {@link confirmReplace} first. Resolves to
+ * whether the choice was made.
+ */
+export async function setOutput(choice: OutputChoice): Promise<boolean> {
+  if (choice === "replaceInput" && !state.settings.replaceConfirmed) return false;
+  if (choice === "folder" && !(await ensureOutputFolder())) return false;
+  updateSettings({ output: choice });
+  return true;
+}
+
+/** Agree, once, that replacing moves originals to the Trash. */
+export function confirmReplace() {
+  updateSettings({ replaceConfirmed: true });
+}
+
+/** Pick another output folder with the native dialog and save there from now on. */
+export async function chooseOutputFolder(): Promise<boolean> {
+  let picked: string | null;
+  try {
+    picked = await api.pickFolder(state.settings.outputFolder);
+  } catch (error) {
+    toast(`Couldn't open the folder picker: ${errorText(error)}`, { tone: "error" });
+    return false;
+  }
+  if (!picked || !(await useOutputFolder(picked))) return false;
+  updateSettings({ output: "folder" });
+  return true;
+}
+
+/** Sort the output folder into Videos, Pictures and Audio, or not. */
+export function setOutputByKind(byKind: boolean) {
+  updateSettings({ outputByKind: byKind });
+}
+
+/** Make sure Settings has an output folder, suggesting or asking for one. */
+async function ensureOutputFolder(): Promise<boolean> {
+  if (state.settings.outputFolder) return true;
+  const suggested = await api.defaultOutputFolder().catch(() => null);
+  if (suggested) return useOutputFolder(suggested);
+  let picked: string | null = null;
+  try {
+    picked = await api.pickFolder();
+  } catch (error) {
+    toast(`Couldn't open the folder picker: ${errorText(error)}`, { tone: "error" });
+  }
+  return picked !== null && useOutputFolder(picked);
+}
+
+/** Create and check `path`, then remember it as the output folder. */
+async function useOutputFolder(path: string): Promise<boolean> {
+  try {
+    updateSettings({ outputFolder: await api.prepareOutputFolder(path) });
+    return true;
+  } catch (error) {
+    toast(`Can't save there: ${errorText(error)}`, { tone: "error" });
+    return false;
+  }
+}
+
+/** The destination for `choice` with Settings' folder, making sure there is one. */
+async function destinationOf(choice: OutputChoice): Promise<Destination | null> {
+  if (choice === "folder" && !(await ensureOutputFolder())) return null;
+  return destinationFor(state.settings, choice);
+}
+
+/**
+ * Where the open file's result goes, for this conversion only. Replacing
+ * needs {@link confirmReplace} first.
+ */
+export async function setDraftDestination(choice: OutputChoice) {
+  if (choice === "replaceInput" && !state.settings.replaceConfirmed) return;
+  const destination = await destinationOf(choice);
+  if (destination) updateOptions({ destination });
+}
+
+/** Where the animation being made goes. It can't replace its pictures. */
+export async function setSequenceDestination(choice: Exclude<OutputChoice, "replaceInput">) {
+  const destination = await destinationOf(choice);
+  if (destination) updateSequenceOptions({ destination });
 }
 
 function setRecipes(recipes: Recipe[]) {

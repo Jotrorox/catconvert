@@ -1,6 +1,7 @@
 import { type Component, createSignal, For, Match, onMount, Show, Switch } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
+import { ReplaceConfirm } from "../components/ReplaceConfirm";
 import { type OutputFormat, thirdPartyLicenses } from "../lib/api";
 import { formatBytes } from "../lib/format";
 import {
@@ -8,6 +9,7 @@ import {
   type FormatGroup,
   label,
   METADATA_CHOICES,
+  type OutputChoice,
   QUALITY_STEPS,
   qualityStep,
 } from "../lib/formats";
@@ -15,11 +17,15 @@ import { os } from "../lib/platform";
 import {
   activeCount,
   checkForUpdates,
+  chooseOutputFolder,
+  confirmReplace,
   installUpdate,
   isAvailable,
   loadQuickAction,
   refreshFfmpeg,
   restartApp,
+  setOutput,
+  setOutputByKind,
   state,
   toast,
   toggleQuickAction,
@@ -121,6 +127,114 @@ const StartingSettings: Component = () => {
           them.
         </span>
       </fieldset>
+    </section>
+  );
+};
+
+const OUTPUT_CHOICES: readonly { choice: OutputChoice; label: string; detail: string }[] = [
+  {
+    choice: "nextToInput",
+    label: "Next to the original",
+    detail:
+      "Saved next to the original, as name.mp4. If that name is taken we add a number, so nothing is overwritten.",
+  },
+  {
+    choice: "folder",
+    label: "In a folder",
+    detail: "Everything lands in one folder, under a free name.",
+  },
+  {
+    choice: "replaceInput",
+    label: "Replace the original",
+    detail:
+      "The converted file takes the original's place and the original goes to the Trash. A new format gets its own extension, like clip.mov becoming clip.mp4. Animations made from several pictures are saved next to them.",
+  },
+];
+
+/** Where converted files go by default. */
+const OutputSettings: Component = () => {
+  const settings = () => state.settings;
+  const [confirming, setConfirming] = createSignal(false);
+  const [busy, setBusy] = createSignal(false);
+  const choose = async (choice: OutputChoice) => {
+    setConfirming(false);
+    if (choice === "replaceInput" && !settings().replaceConfirmed) {
+      setConfirming(true);
+      return;
+    }
+    setBusy(true);
+    await setOutput(choice);
+    setBusy(false);
+  };
+  const detail = () => OUTPUT_CHOICES.find((c) => c.choice === settings().output)?.detail;
+
+  return (
+    <section class="card defaults">
+      <h2 class="section-title">Where files go</h2>
+      <fieldset class="field">
+        <legend class="field-label">Save converted files</legend>
+        <div class="format-chips">
+          <For each={OUTPUT_CHOICES}>
+            {(item) => (
+              <button
+                type="button"
+                class="format-chip"
+                aria-pressed={settings().output === item.choice}
+                disabled={busy()}
+                onClick={() => void choose(item.choice)}
+              >
+                {item.label}
+              </button>
+            )}
+          </For>
+        </div>
+      </fieldset>
+      <Show when={confirming()}>
+        <ReplaceConfirm
+          onConfirm={() => {
+            confirmReplace();
+            void choose("replaceInput");
+          }}
+          onCancel={() => setConfirming(false)}
+        />
+      </Show>
+      <p class="item-meta">{detail()}</p>
+      <Show when={settings().output === "folder" && settings().outputFolder}>
+        {(folder) => (
+          <>
+            <div class="folder-row">
+              <Icon name="folder" size={18} />
+              <span class="mono path folder-path" title={folder()}>
+                {folder()}
+              </span>
+              <button
+                type="button"
+                class="btn btn-outline"
+                onClick={() => void chooseOutputFolder()}
+              >
+                Change…
+              </button>
+            </div>
+            <div class="toggle-row">
+              <div>
+                <span class="toggle-title" id="output-by-kind">
+                  Sort by kind
+                </span>
+                <span class="item-meta">Into Videos, Pictures and Audio folders inside it</span>
+              </div>
+              <button
+                type="button"
+                class="switch"
+                role="switch"
+                aria-checked={settings().outputByKind}
+                aria-labelledby="output-by-kind"
+                onClick={() => setOutputByKind(!settings().outputByKind)}
+              />
+            </div>
+          </>
+        )}
+      </Show>
+      <p class="item-meta">The editor can change this for one conversion.</p>
     </section>
   );
 };
@@ -297,13 +411,7 @@ export const SettingsScreen: Component = () => {
         </section>
       </Show>
 
-      <section class="card">
-        <h2 class="section-title">Where files go</h2>
-        <p class="item-meta">
-          Converted files are saved next to the original, as <code>name.mp4</code>. If that name is
-          taken we add a number, so nothing is ever overwritten.
-        </p>
-      </section>
+      <OutputSettings />
 
       <OtherApps />
 

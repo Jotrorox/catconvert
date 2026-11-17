@@ -9,6 +9,7 @@ import {
   Show,
 } from "solid-js";
 import { CodecField } from "../components/CodecField";
+import { DestinationField } from "../components/DestinationField";
 import { Icon } from "../components/Icon";
 import { QualityField } from "../components/QualityField";
 import {
@@ -50,6 +51,7 @@ import {
   movePicture,
   removePicture,
   type SequenceDraft,
+  setSequenceDestination,
   sortPictures,
   state,
   updateSequence,
@@ -627,7 +629,14 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
                 )}
               </For>
             </ul>
-            <p class="item-meta">Saved next to the first picture.</p>
+            <DestinationField
+              destination={options().destination}
+              allowReplace={false}
+              pictures
+              onChoose={(choice) => {
+                if (choice !== "replaceInput") void setSequenceDestination(choice);
+              }}
+            />
           </div>
 
           <details
