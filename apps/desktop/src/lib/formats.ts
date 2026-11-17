@@ -3,6 +3,7 @@
  * backend validates everything again; this only decides what to offer.
  */
 import type { ConvertOptions, MediaInfo, MediaKind, OutputFormat } from "./api";
+import { aspectText, cropBox, cropForOtherFile, pictureSize, turnedSize } from "./crop";
 
 export type Tone = "pink" | "green" | "yellow" | "lavender";
 
@@ -89,8 +90,9 @@ export const JXL_EFFORTS = [
 const LOSSLESS_BY_DEFAULT = new Set(["jpg", "jpeg", "png", "apng", "gif"]);
 
 /**
- * Whether the options leave the file as it is: no trim, turn, mirror, resize or
- * new rate, and metadata kept (libjxl's tools can't drop it, see convert.rs).
+ * Whether the options leave the file as it is: no trim, turn, mirror, crop,
+ * resize or new rate, and metadata kept (libjxl's tools can't drop it, see
+ * convert.rs).
  */
 export function isUntouched(info: MediaInfo, options: ConvertOptions): boolean {
   const untrimmed =
@@ -100,12 +102,20 @@ export function isUntouched(info: MediaInfo, options: ConvertOptions): boolean {
     options.keepMetadata &&
     options.rotate === 0 &&
     !options.flip &&
-    (options.maxSize === null || !sizeChoices(info).includes(options.maxSize)) &&
+    !hasCrop(info, options) &&
+    (options.maxSize === null || !sizeChoices(info, options).includes(options.maxSize)) &&
     (options.fps === null || !fpsChoices(info).includes(options.fps))
   );
 }
 
 /** A JPEG XL that holds a recompressed JPEG, turned back into that exact JPEG. */
+/** Whether the crop cuts anything off this file. Unknown sizes count as cut. */
+export function hasCrop(info: MediaInfo, options: Pick<ConvertOptions, "rotate" | "crop">) {
+  if (!options.crop) return false;
+  const size = turnedSize(info, options.rotate);
+  return size === null || cropBox(size, options.crop) !== null;
+}
+
 export function restoresJpeg(info: MediaInfo, options: ConvertOptions): boolean {
   return info.reconstructsJpeg && options.format === "jpg" && isUntouched(info, options);
 }
@@ -145,6 +155,7 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     fps: null,
     rotate: 0,
     flip: false,
+    crop: null,
     quality: 60,
     keepAudio: true,
     jxl: { lossless: false, effort: 7, progressive: false },
@@ -177,16 +188,19 @@ export function offers(kind: MediaKind, format: OutputFormat): boolean {
   return groupsFor(kind).some((group) => group.formats.includes(format));
 }
 
-/** Short side of the picture after rotation metadata, if known. */
-export function shortSide(info: MediaInfo): number | null {
-  return info.width && info.height ? Math.min(info.width, info.height) : null;
+type Framing = Pick<ConvertOptions, "rotate" | "crop">;
+
+/** Short side of the picture after rotation metadata and the crop, if known. */
+export function shortSide(info: MediaInfo, framing?: Framing): number | null {
+  const size = pictureSize(info, framing ?? { rotate: 0, crop: null });
+  return size ? Math.min(size.width, size.height) : null;
 }
 
 const SIZES = [2160, 1440, 1080, 720, 480, 360, 240] as const;
 
-/** Downscale choices smaller than the source. */
-export function sizeChoices(info: MediaInfo): number[] {
-  const short = shortSide(info);
+/** Downscale choices smaller than the (cropped) source. */
+export function sizeChoices(info: MediaInfo, framing?: Framing): number[] {
+  const short = shortSide(info, framing);
   return SIZES.filter((size) => short === null || size < short);
 }
 
@@ -260,7 +274,8 @@ export const RECIPES: readonly Recipe[] = [
 /**
  * `options` adapted to another file, or `null` when they don't fit it: a
  * format the editor wouldn't offer for it, sound from a silent file, or an
- * encoder that isn't installed. The trim belongs to one file and is dropped.
+ * encoder that isn't installed. The trim and a hand-drawn crop belong to one
+ * file and are dropped; a crop shape is kept and centred.
  */
 export function fitOptions(
   info: MediaInfo,
@@ -269,9 +284,15 @@ export function fitOptions(
 ): ConvertOptions | null {
   if (!offers(info.kind, options.format) || !available(options.format)) return null;
   if (formatKind(options.format, info.kind) === "audio" && info.audioCodec === null) return null;
-  const fitted = { ...options, jxl: { ...options.jxl }, trimStart: null, trimEnd: null };
+  const fitted = {
+    ...options,
+    jxl: { ...options.jxl },
+    trimStart: null,
+    trimEnd: null,
+    crop: cropForOtherFile(options.crop),
+  };
   // Drop choices that would upscale or speed up this particular file.
-  if (fitted.maxSize !== null && !sizeChoices(info).includes(fitted.maxSize)) {
+  if (fitted.maxSize !== null && !sizeChoices(info, fitted).includes(fitted.maxSize)) {
     fitted.maxSize = null;
   }
   if (fitted.fps !== null && !fpsChoices(info).includes(fitted.fps)) fitted.fps = null;
@@ -326,6 +347,8 @@ const KIND_TONE: Record<FormatGroup["kind"], Tone> = {
 export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
   const out = formatKind(options.format, info.kind);
   const parts: string[] = [];
+  if (out !== "audio" && options.crop?.aspect)
+    parts.push(`${aspectText(options.crop.aspect)} crop`);
   if (out !== "audio" && options.maxSize !== null) parts.push(sizeLabel(options.maxSize, out));
   if (out === "video" && options.fps !== null) parts.push(`${options.fps} fps`);
   const video = out === "video" && !isAnimatedImage(options.format, info.kind);
@@ -338,7 +361,8 @@ export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
 
 /**
  * A user recipe from the editor's current settings. It keeps the encoding
- * choices; the trim, turn and mirror belong to the file they were made for.
+ * choices and the crop's shape; the trim, turn, mirror and where the crop
+ * sits belong to the file they were made for.
  */
 export function recipeFrom(
   id: RecipeId,
@@ -349,14 +373,15 @@ export function recipeFrom(
   const out = formatKind(options.format, info.kind);
   const accepts: MediaKind[] = out === "audio" ? ["video", "audio"] : [info.kind];
   const { trimStart: _start, trimEnd: _end, rotate: _rotate, flip: _flip, ...kept } = options;
+  const crop = out === "audio" ? null : cropForOtherFile(options.crop);
   return {
     id,
     title,
     custom: true,
-    detail: recipeDetail(info, options),
+    detail: recipeDetail(info, { ...options, crop }),
     route: `${accepts.length > 1 ? "ANY" : KIND_WORD[info.kind]} → ${label(options.format)}`,
     tone: KIND_TONE[out],
-    options: { ...kept, jxl: { ...kept.jxl } },
+    options: { ...kept, crop, jxl: { ...kept.jxl } },
     accepts,
   };
 }

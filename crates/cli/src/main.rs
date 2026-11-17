@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use catconvert_core::{ConvertOptions, Ffmpeg, JxlOptions, OutputFormat, RunOutcome};
+use catconvert_core::{ConvertOptions, Crop, Ffmpeg, JxlOptions, OutputFormat, RunOutcome};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -54,6 +54,9 @@ enum Command {
         /// Mirror horizontally.
         #[arg(long)]
         flip: bool,
+        /// Crop to this width:height, keeping the centre (e.g. 1:1, 9:16).
+        #[arg(long, value_name = "W:H", value_parser = parse_aspect)]
+        crop: Option<[u32; 2]>,
         /// 0 = smallest file, 100 = best quality.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u8).range(0..=100))]
         quality: u8,
@@ -119,6 +122,14 @@ impl From<Format> for OutputFormat {
             Format::Jxl => Self::Jxl,
         }
     }
+}
+
+/// `9:16` → `[9, 16]`.
+fn parse_aspect(text: &str) -> Result<[u32; 2], String> {
+    let parse = |part: &str| part.trim().parse::<u32>().ok().filter(|&n| n > 0);
+    text.split_once(':')
+        .and_then(|(w, h)| Some([parse(w)?, parse(h)?]))
+        .ok_or_else(|| format!("expected a shape like 1:1 or 9:16, got `{text}`"))
 }
 
 fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<(), String> {
@@ -189,6 +200,7 @@ fn main() -> ExitCode {
             fps,
             rotate,
             flip,
+            crop,
             quality,
             mute,
             lossless,
@@ -205,6 +217,10 @@ fn main() -> ExitCode {
                 fps,
                 rotate,
                 flip,
+                crop: crop.map(|aspect| Crop {
+                    aspect: Some(aspect),
+                    area: None,
+                }),
                 quality,
                 keep_audio: !mute,
                 jxl: JxlOptions {
@@ -275,6 +291,27 @@ mod tests {
         assert_eq!(start, Some(1.5));
         assert_eq!(size, Some(480));
         assert_eq!(quality, 60);
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "convert",
+            "a",
+            "--to",
+            "mp4",
+            "--crop",
+            "9:16",
+        ])
+        .expect("parse");
+        let Command::Convert { crop, .. } = cli.command else {
+            panic!("expected convert");
+        };
+        assert_eq!(crop, Some([9, 16]));
+        for bad in ["9x16", "0:1", "1:"] {
+            assert!(
+                Cli::try_parse_from(["catconvert", "convert", "a", "--to", "mp4", "--crop", bad])
+                    .is_err(),
+                "{bad}"
+            );
+        }
         assert!(
             Cli::try_parse_from([
                 "catconvert",

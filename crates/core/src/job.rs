@@ -476,6 +476,19 @@ mod tests {
         let out = ffmpeg.probe(&ticket.output).expect("probe");
         assert_eq!((out.width, out.height), (Some(240), Some(320)));
 
+        // Turned and cropped square.
+        let square = ConvertOptions {
+            crop: Some(crate::Crop {
+                aspect: Some([1, 1]),
+                area: None,
+            }),
+            ..turned
+        };
+        let ticket = queue.submit(&jpeg, &square).expect("submit");
+        assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
+        let out = ffmpeg.probe(&ticket.output).expect("probe");
+        assert_eq!((out.width, out.height), (Some(240), Some(240)));
+
         // Video → animated JXL.
         let animated = ConvertOptions {
             format: OutputFormat::Jxl,

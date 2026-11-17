@@ -9,6 +9,7 @@ import {
   initialOptions,
   RECIPES,
   recipeFrom,
+  repacksJpeg,
   sizeChoices,
 } from "./formats";
 
@@ -96,6 +97,39 @@ describe("formats", () => {
     expect(fitOptions({ ...clip, kind: "audio" }, base, all)).toBeNull();
     expect(fitOptions(clip, base, (f) => f !== "webm")).toBeNull();
     expect(fitOptions({ ...clip, audioCodec: null }, defaultOptions("mp3"), all)).toBeNull();
+  });
+
+  it("carries a crop shape to other files, but not a hand-drawn area", () => {
+    const area = { x: 0.1, y: 0, width: 0.4, height: 1 };
+    const square = { ...defaultOptions("mp4"), crop: { aspect: [1, 1] as [number, number], area } };
+    expect(fitOptions(clip, square, all)?.crop).toEqual({ aspect: [1, 1], area: null });
+    const free = { ...square, crop: { aspect: null, area } };
+    expect(fitOptions(clip, free, all)?.crop).toBeNull();
+
+    // Sizes are offered for the cropped picture: 9:16 of 640×360 is 203×360.
+    const tall = { rotate: 0 as const, crop: { aspect: [9, 16] as [number, number], area: null } };
+    expect(sizeChoices(clip, tall)).toEqual([]);
+    expect(sizeChoices({ ...clip, width: 1920, height: 1080 }, tall)).toEqual([480, 360, 240]);
+    // A size that would upscale the cropped picture is dropped for that file.
+    expect(
+      fitOptions(clip, { ...defaultOptions("mp4"), ...tall, maxSize: 240 }, all),
+    ).toMatchObject({ maxSize: null, crop: tall.crop });
+
+    const recipe = recipeFrom("custom-3", "Square", clip, { ...square, maxSize: 240 });
+    expect(recipe.options.crop).toEqual({ aspect: [1, 1], area: null });
+    expect(recipe.detail).toBe("1:1 crop · 240p · balanced");
+    expect(initialOptions(clip, all, recipe).crop).toEqual({ aspect: [1, 1], area: null });
+  });
+
+  it("counts a crop as an edit, unless it keeps the whole picture", () => {
+    const jpeg = { ...clip, kind: "image" as const, extension: "jpg" };
+    const repack = {
+      ...defaultOptions("jxl"),
+      jxl: { lossless: true, effort: 7, progressive: false },
+    };
+    expect(repacksJpeg(jpeg, repack)).toBe(true);
+    expect(repacksJpeg(jpeg, { ...repack, crop: { aspect: [1, 1], area: null } })).toBe(false);
+    expect(repacksJpeg(jpeg, { ...repack, crop: { aspect: [16, 9], area: null } })).toBe(true);
   });
 
   it("saves editor settings as a recipe without the per-file edits", () => {

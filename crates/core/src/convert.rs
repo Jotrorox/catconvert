@@ -157,6 +157,49 @@ impl Default for JxlOptions {
     }
 }
 
+/// Part of the picture to keep, measured on the picture as it looks after the
+/// turn and mirror, so it matches what the user sees in the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Crop {
+    /// Width to height to keep, e.g. `[9, 16]`. `None` for a free-form crop.
+    #[serde(default)]
+    pub aspect: Option<[u32; 2]>,
+    /// The kept area as fractions of the picture. `None` keeps the largest
+    /// centred area with `aspect`, which is how recipes and batches apply a
+    /// crop shape to files of any size.
+    #[serde(default)]
+    pub area: Option<CropArea>,
+}
+
+/// A rectangle in fractions (0 to 1) of the picture's width and height.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CropArea {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl CropArea {
+    const FULL: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    };
+}
+
+/// A crop in pixels, as ffmpeg's `crop` filter takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CropBox {
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+}
+
 /// The edits and encoding choices for one conversion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -175,6 +218,8 @@ pub struct ConvertOptions {
     pub rotate: u16,
     /// Mirror horizontally.
     pub flip: bool,
+    /// Keep only part of the picture. Applied after the turn and mirror.
+    pub crop: Option<Crop>,
     /// 0 = smallest file, 100 = best quality.
     pub quality: u8,
     /// Keep the sound when writing video.
@@ -196,6 +241,7 @@ impl Default for ConvertOptions {
             fps: None,
             rotate: 0,
             flip: false,
+            crop: None,
             quality: 60,
             keep_audio: true,
             jxl: JxlOptions::default(),
@@ -343,7 +389,7 @@ const CJXL_INPUTS: [&str; 6] = ["png", "apng", "gif", "jpg", "jpeg", "jxl"];
 /// # Errors
 ///
 /// [`Error::Unsupported`] if the format cannot be made from this input (e.g.
-/// MP3 from a silent video), the trim range or rotation is invalid, or the
+/// MP3 from a silent video), the trim range, rotation or crop is invalid, or the
 /// JPEG XL tools this needs are missing.
 pub fn plan(
     input: &MediaInfo,
@@ -366,6 +412,9 @@ pub fn plan(
         return Err(Error::unsupported(
             "rotation must be 0, 90, 180 or 270 degrees",
         ));
+    }
+    if let Some(crop) = &options.crop {
+        validate_crop(crop)?;
     }
     if output == input.path {
         return Err(Error::unsupported(
@@ -798,7 +847,7 @@ fn animation_filters(input: &MediaInfo, options: &ConvertOptions) -> Vec<String>
 }
 
 /// Whether the options leave the picture exactly as it is: no trim, turn,
-/// mirror, downscale or frame-rate change.
+/// mirror, crop, downscale or frame-rate change.
 fn is_untouched(input: &MediaInfo, options: &ConvertOptions) -> bool {
     let untrimmed = options.trim_start.is_none_or(|s| s <= 0.0) && options.trim_end.is_none();
     (input.kind == MediaKind::Image || untrimmed)
@@ -824,18 +873,18 @@ fn animation_bytes(
     Some(f64::from(w) * f64::from(h) * 4.0 * fps * length.max(0.0))
 }
 
-/// Picture size after rotation and downscaling, if the source size is known.
+/// Picture size after rotation, cropping and downscaling, if the source size
+/// is known.
 fn output_dims(
     input: &MediaInfo,
     options: &ConvertOptions,
     default_max: Option<u32>,
 ) -> Option<(u32, u32)> {
-    let (w, h) = input.width.zip(input.height)?;
-    let (w, h) = if options.rotate % 180 == 90 {
-        (h, w)
-    } else {
-        (w, h)
-    };
+    let (w, h) = turned_dims(input, options)?;
+    let (w, h) = options
+        .crop
+        .and_then(|crop| crop_box(w, h, &crop, false))
+        .map_or((w, h), |b| (b.width, b.height));
     let target = options.max_size.or(default_max).map(|t| t.max(2) & !1);
     Some(match target {
         Some(t) if t < w.min(h) => {
@@ -905,7 +954,102 @@ fn trim_range(input: &MediaInfo, options: &ConvertOptions) -> Result<(f64, Optio
     Ok((start, end))
 }
 
-/// Rotate, flip, downscale and frame-rate filters, in that order.
+fn validate_crop(crop: &Crop) -> Result<()> {
+    if crop
+        .aspect
+        .is_some_and(|[w, h]| w == 0 || h == 0 || w > 1000 || h > 1000)
+    {
+        return Err(Error::unsupported(
+            "the crop shape must be two whole numbers like 9:16",
+        ));
+    }
+    if let Some(a) = crop.area {
+        let parts = [a.x, a.y, a.width, a.height];
+        // A little slack for rounding in the front end.
+        let inside = parts
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0 + 1e-6).contains(v))
+            && a.x + a.width <= 1.0 + 1e-6
+            && a.y + a.height <= 1.0 + 1e-6;
+        if !inside || a.width <= 0.0 || a.height <= 0.0 {
+            return Err(Error::unsupported("the crop must lie inside the picture"));
+        }
+    }
+    Ok(())
+}
+
+/// Display size after our rotation, if known.
+fn turned_dims(input: &MediaInfo, options: &ConvertOptions) -> Option<(u32, u32)> {
+    let (w, h) = input.width.zip(input.height)?;
+    Some(if options.rotate % 180 == 90 {
+        (h, w)
+    } else {
+        (w, h)
+    })
+}
+
+/// The crop in pixels of a `w`×`h` picture, or `None` when it keeps the
+/// whole picture.
+///
+/// With an aspect, the largest box of that shape inside the area is kept,
+/// centred on the area, so the result has the exact shape even when the
+/// area's fractions round unevenly. `even` rounds the size down to even
+/// numbers, which yuv420p encoders need.
+fn crop_box(w: u32, h: u32, crop: &Crop, even: bool) -> Option<CropBox> {
+    let area = crop.area.unwrap_or(CropArea::FULL);
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let px = |v: f64, max: u32| (v.round().max(1.0) as u32).min(max);
+    let mut width = px(area.width * fw, w);
+    let mut height = px(area.height * fh, h);
+    if let Some([aw, ah]) = crop.aspect {
+        if u64::from(width) * u64::from(ah) <= u64::from(height) * u64::from(aw) {
+            height = px(f64::from(width) * f64::from(ah) / f64::from(aw), height);
+        } else {
+            width = px(f64::from(height) * f64::from(aw) / f64::from(ah), width);
+        }
+    }
+    if (width, height) == (w, h) {
+        return None;
+    }
+    if even {
+        width = (width & !1).max(2).min(w);
+        height = (height & !1).max(2).min(h);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let place = |start: f64, size: f64, kept: u32, total: u32| {
+        let centre = (start + size / 2.0) * f64::from(total);
+        ((centre - f64::from(kept) / 2.0).round().max(0.0) as u32).min(total - kept)
+    };
+    Some(CropBox {
+        width,
+        height,
+        x: place(area.x, area.width, width, w),
+        y: place(area.y, area.height, height, h),
+    })
+}
+
+/// The `crop` filter for a picture of unknown size: the aspect's largest
+/// centred box, or the area as fractions of the input.
+fn crop_expression(crop: &Crop) -> Option<String> {
+    let frac = |v: f64| {
+        let s = format!("{:.6}", v.clamp(0.0, 1.0));
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    };
+    match (crop.aspect, crop.area) {
+        (Some([w, h]), _) => Some(format!("crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})'")),
+        (None, Some(a)) if a != CropArea::FULL => Some(format!(
+            "crop='iw*{}':'ih*{}':'iw*{}':'ih*{}'",
+            frac(a.width),
+            frac(a.height),
+            frac(a.x),
+            frac(a.y)
+        )),
+        (None, _) => None,
+    }
+}
+
+/// Rotate, flip, crop, downscale and frame-rate filters, in that order.
 ///
 /// `default_max` caps the short side when the user picked no size (GIFs).
 /// `even` forces even dimensions, which yuv420p encoders require.
@@ -926,14 +1070,19 @@ fn video_filters(
         filters.push("hflip".to_owned());
     }
 
-    // Display size after our rotation.
-    let dims = input.width.zip(input.height).map(|(w, h)| {
-        if options.rotate % 180 == 90 {
-            (h, w)
-        } else {
-            (w, h)
+    // Display size after our rotation, then after the crop.
+    let mut dims = turned_dims(input, options);
+    if let Some(crop) = &options.crop {
+        match dims {
+            Some((w, h)) => {
+                if let Some(b) = crop_box(w, h, crop, even) {
+                    filters.push(format!("crop={}:{}:{}:{}", b.width, b.height, b.x, b.y));
+                    dims = Some((b.width, b.height));
+                }
+            }
+            None => filters.extend(crop_expression(crop)),
         }
-    });
+    }
     let target = options.max_size.or(default_max).map(|t| t.max(2) & !1);
     let scale = match (target, dims) {
         (Some(t), Some((w, h))) if t < w.min(h) => Some(if w >= h {
@@ -1090,6 +1239,179 @@ mod tests {
         assert!(cmd.contains("-c:v libvpx-vp9 -crf 28 -b:v 0"), "{cmd}");
         assert!(cmd.contains(" -an "), "{cmd}");
         assert!(!cmd.contains("0:a:0"), "{cmd}");
+    }
+
+    fn cropped(aspect: Option<[u32; 2]>, area: Option<[f64; 4]>) -> Option<Crop> {
+        Some(Crop {
+            aspect,
+            area: area.map(|[x, y, width, height]| CropArea {
+                x,
+                y,
+                width,
+                height,
+            }),
+        })
+    }
+
+    #[test]
+    fn vertical_crop_keeps_the_centre_and_skips_needless_scaling() {
+        let options = ConvertOptions {
+            crop: cropped(Some([9, 16]), None),
+            max_size: Some(720),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("wide.mov"), &options, "/clips/wide.mp4");
+        // 1080 × 9/16 = 607.5, rounded to 608 and centred; 608 is already under 720.
+        assert!(cmd.contains(" -vf crop=608:1080:656:0 "), "{cmd}");
+    }
+
+    #[test]
+    fn crop_follows_turn_and_mirror_and_stays_exact() {
+        let mut input = video("phone.mp4");
+        (input.width, input.height) = (Some(1080), Some(1920));
+        let options = ConvertOptions {
+            format: OutputFormat::Webm,
+            rotate: 90,
+            flip: true,
+            // A hair short of square at the right edge: 1080×1079 px.
+            crop: cropped(Some([1, 1]), Some([0.4374, 0.0, 0.5626, 0.999])),
+            max_size: Some(480),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &options, "/clips/phone.webm");
+        assert!(
+            // Square, rounded to even sizes, and kept inside the picture.
+            cmd.contains(" -vf transpose=clock,hflip,crop=1078:1078:841:0,scale=-2:480 "),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn free_crop_rounds_to_even_sizes_for_video_but_not_png() {
+        let crop = cropped(None, Some([0.1, 0.2, 0.3001, 0.4]));
+        let mp4 = ConvertOptions {
+            crop,
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &mp4, "/clips/a.mp4");
+        // 0.3001 × 1920 = 576.2 → 576; 0.4 × 1080 = 432.
+        assert!(cmd.contains(" -vf crop=576:432:192:216 "), "{cmd}");
+
+        let mut photo = video("odd.png");
+        photo.kind = MediaKind::Image;
+        (photo.width, photo.height) = (Some(1001), Some(1001));
+        let png = ConvertOptions {
+            format: OutputFormat::Png,
+            crop: cropped(None, Some([0.0, 0.0, 0.5, 1.0])),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&photo, &png, "/clips/odd 2.png");
+        assert!(cmd.contains(" -vf crop=501:1001:0:0 "), "{cmd}");
+    }
+
+    #[test]
+    fn crop_of_the_whole_picture_changes_nothing() {
+        let options = ConvertOptions {
+            crop: cropped(Some([16, 9]), None),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &options, "/clips/a.mp4");
+        assert!(!cmd.contains("-vf"), "{cmd}");
+        let free = ConvertOptions {
+            crop: cropped(None, None),
+            ..ConvertOptions::default()
+        };
+        assert!(!command(&video("a.mov"), &free, "/clips/a.mp4").contains("-vf"));
+    }
+
+    #[test]
+    fn crop_without_a_known_size_uses_expressions() {
+        let mut input = video("mystery.mov");
+        (input.width, input.height) = (None, None);
+        let options = ConvertOptions {
+            crop: cropped(Some([1, 1]), Some([0.2, 0.0, 0.5, 1.0])),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &options, "/clips/mystery.mp4");
+        assert!(
+            cmd.contains(
+                "-vf 'crop='\\''min(iw,ih*1/1)'\\'':'\\''min(ih,iw*1/1)'\\'',scale=trunc(iw/2)*2:trunc(ih/2)*2'"
+            ),
+            "{cmd}"
+        );
+        let free = ConvertOptions {
+            crop: cropped(None, Some([0.25, 0.0, 0.5, 1.0])),
+            ..ConvertOptions::default()
+        };
+        let plan = plan(
+            &input,
+            &free,
+            Path::new("/clips/m.mp4"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let vf = plan.steps[0]
+            .args
+            .iter()
+            .skip_while(|a| *a != "-vf")
+            .nth(1)
+            .expect("filters");
+        assert_eq!(
+            vf.to_string_lossy(),
+            "crop='iw*0.5':'ih*1':'iw*0.25':'ih*0',scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        );
+    }
+
+    #[test]
+    fn gif_caps_the_size_of_the_cropped_picture() {
+        let options = ConvertOptions {
+            format: OutputFormat::Gif,
+            crop: cropped(Some([9, 16]), None),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &options, "/clips/a.gif");
+        assert!(
+            cmd.contains("-vf 'crop=608:1080:656:0,scale=480:-2:flags=lanczos,fps=15,"),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn rejects_crops_outside_the_picture_or_without_a_shape() {
+        for crop in [
+            cropped(None, Some([0.6, 0.0, 0.5, 1.0])),
+            cropped(None, Some([0.0, 0.0, 0.0, 1.0])),
+            cropped(None, Some([f64::NAN, 0.0, 0.5, 0.5])),
+            cropped(Some([0, 1]), None),
+        ] {
+            let options = ConvertOptions {
+                crop,
+                ..ConvertOptions::default()
+            };
+            assert!(
+                plan(
+                    &video("a.mov"),
+                    &options,
+                    Path::new("/clips/a.mp4"),
+                    JxlSupport::default()
+                )
+                .is_err(),
+                "{crop:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_crops_from_the_front_end() {
+        let options: ConvertOptions = serde_json::from_value(serde_json::json!({
+            "format": "mp4",
+            "crop": {"aspect": [9, 16], "area": null}
+        }))
+        .expect("parse");
+        assert_eq!(options.crop, cropped(Some([9, 16]), None));
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp4"})).expect("parse");
+        assert_eq!(options.crop, None);
     }
 
     #[test]
