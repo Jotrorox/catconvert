@@ -177,6 +177,68 @@ impl Direction {
     }
 }
 
+/// Clean-up for the sound. Only applies when the output has sound; video
+/// fades the picture along with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SoundOptions {
+    /// Even out loudness to -16 LUFS with ffmpeg's single-pass `loudnorm`.
+    pub normalize: bool,
+    /// Seconds to fade in from silence (and black) at the start; 0 is off.
+    pub fade_in: f64,
+    /// Seconds to fade out to silence (and black) at the end; 0 is off.
+    pub fade_out: f64,
+}
+
+/// Target loudness of [`SoundOptions::normalize`]: -16 LUFS integrated,
+/// -1.5 dBTP peak ceiling, loudness range 11 LU.
+const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
+/// Sample rate after `loudnorm` when the source rate is unknown.
+const FALLBACK_SAMPLE_RATE: u32 = 48_000;
+
+/// Part of the picture to keep, measured on the picture as it looks after the
+/// turn and mirror, so it matches what the user sees in the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Crop {
+    /// Width to height to keep, e.g. `[9, 16]`. `None` for a free-form crop.
+    #[serde(default)]
+    pub aspect: Option<[u32; 2]>,
+    /// The kept area as fractions of the picture. `None` keeps the largest
+    /// centred area with `aspect`, which is how recipes and batches apply a
+    /// crop shape to files of any size.
+    #[serde(default)]
+    pub area: Option<CropArea>,
+}
+
+/// A rectangle in fractions (0 to 1) of the picture's width and height.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CropArea {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl CropArea {
+    const FULL: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    };
+}
+
+/// A crop in pixels, as ffmpeg's `crop` filter takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CropBox {
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+}
+
 /// The edits and encoding choices for one conversion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -195,12 +257,16 @@ pub struct ConvertOptions {
     pub rotate: u16,
     /// Mirror horizontally.
     pub flip: bool,
+    /// Keep only part of the picture. Applied after the turn and mirror.
+    pub crop: Option<Crop>,
     /// 0 = smallest file, 100 = best quality.
     pub quality: u8,
     /// Keep the sound when writing video.
     pub keep_audio: bool,
     /// JPEG XL settings, ignored for other formats.
     pub jxl: JxlOptions,
+    /// Loudness and fades, ignored when the output has no sound.
+    pub sound: SoundOptions,
     /// Carry over dates, location, titles and other tags where the output
     /// format can hold them. Off strips them.
     pub keep_metadata: bool,
@@ -221,9 +287,11 @@ impl Default for ConvertOptions {
             fps: None,
             rotate: 0,
             flip: false,
+            crop: None,
             quality: 60,
             keep_audio: true,
             jxl: JxlOptions::default(),
+            sound: SoundOptions::default(),
             keep_metadata: true,
             speed: 1.0,
             direction: Direction::Forward,
@@ -379,7 +447,7 @@ const CJXL_INPUTS: [&str; 6] = ["png", "apng", "gif", "jpg", "jpeg", "jxl"];
 /// # Errors
 ///
 /// [`Error::Unsupported`] if the format cannot be made from this input (e.g.
-/// MP3 from a silent video), the trim range or rotation is invalid, or the
+/// MP3 from a silent video), the trim range, rotation or crop is invalid, or the
 /// JPEG XL tools this needs are missing.
 pub fn plan(
     input: &MediaInfo,
@@ -402,6 +470,13 @@ pub fn plan(
         return Err(Error::unsupported(
             "rotation must be 0, 90, 180 or 270 degrees",
         ));
+    }
+    let fades = [options.sound.fade_in, options.sound.fade_out];
+    if fades.iter().any(|f| !f.is_finite() || *f < 0.0) {
+        return Err(Error::unsupported("fade lengths must be positive numbers"));
+    }
+    if let Some(crop) = &options.crop {
+        validate_crop(crop)?;
     }
     if output == input.path {
         return Err(Error::unsupported(
@@ -494,6 +569,7 @@ pub fn plan(
         source.path = decoded.clone();
         source.extension = Some(ext.into());
         source.video_codec = Some(ext.into());
+        source.tile_grid = None;
         scratch.push(decoded);
     }
 
@@ -604,6 +680,13 @@ fn ffmpeg_step(
     if timed_input && start > 0.0 && !seek_input && !retimed {
         args.extend(["-ss".into(), format_secs(start).into()]);
     }
+    // Where the kept range starts on the filters' clock: 0 after an input
+    // seek or a lead trim, the trim start after an output seek.
+    let t0 = if timed_input && !seek_input && !retimed {
+        start
+    } else {
+        0.0
+    };
     let duration_secs = if timed_input && out_kind != MediaKind::Image {
         if let Some(end) = trim_end.filter(|_| !retimed) {
             args.extend(["-t".into(), format_secs(end - start).into()]);
@@ -627,32 +710,31 @@ fn ffmpeg_step(
         (OutputFormat::Jxl, Sink::Frames { animated }) => {
             let filters = animation_filters(input, options, lead_trim);
             if animated {
-                push(&["-map", "0:v:0"]);
-                if !filters.is_empty() {
-                    push(&["-vf", &filters.join(",")]);
-                }
+                push_video(&mut push, input, &[], &filters);
                 // Fast zlib: this file only lives until cjxl has read it.
                 push(&["-c:v", "apng", "-compression_level", "1", "-plays", "0"]);
                 push(&["-an", "-sn", "-dn", "-f", "apng"]);
             } else {
-                push(&["-map", "0:v:0", "-frames:v", "1"]);
-                if !filters.is_empty() {
-                    push(&["-vf", &filters.join(",")]);
-                }
+                push_video(&mut push, input, &["-frames:v", "1"], &filters);
                 push(&["-c:v", "png", "-compression_level", "1"]);
                 push(&["-update", "1", "-an", "-sn", "-dn"]);
             }
         }
         (_, Sink::Frames { .. }) => unreachable!("only JPEG XL goes through intermediate frames"),
         (OutputFormat::Mp4 | OutputFormat::Mov | OutputFormat::Mkv | OutputFormat::Webm, _) => {
-            push(&["-map", "0:v:0"]);
             let keep_audio = options.keep_audio && input.has_audio();
+            let audio: &[&str] = if keep_audio { &["-map", "0:a:0"] } else { &[] };
+            let mut filters = video_filters(input, options, None, true);
             if keep_audio {
-                push(&["-map", "0:a:0"]);
+                // The sound's fades take the picture along, from and to black.
+                filters.extend(fades("fade", options.sound, t0, duration_secs));
             }
-            let filters = video_filters(input, options, None, true);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
+            push_video(&mut push, input, audio, &filters);
+            if keep_audio {
+                let audio = audio_filters(input, options.sound, t0, duration_secs);
+                if !audio.is_empty() {
+                    push(&["-af", &audio.join(",")]);
+                }
             }
             if format == OutputFormat::Webm {
                 let crf = lerp(q, 48.0, 28.0).to_string();
@@ -683,26 +765,14 @@ fn ffmpeg_step(
             filters.push(format!(
                 "split[a][b];[a]palettegen=max_colors={colors}:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4"
             ));
-            push(&[
-                "-map",
-                "0:v:0",
-                "-vf",
-                &filters.join(","),
-                "-loop",
-                "0",
-                "-an",
-                "-sn",
-                "-dn",
-            ]);
+            push_video(&mut push, input, &[], &filters);
+            push(&["-loop", "0", "-an", "-sn", "-dn"]);
         }
         (OutputFormat::Jxl, Sink::Output) if animated => {
             // ffmpeg's libjxl_anim emits the codestream frame by frame; the
             // data muxer writes the packets back to back as one file.
             let filters = animation_filters(input, options, lead_trim);
-            push(&["-map", "0:v:0"]);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
-            }
+            push_video(&mut push, input, &[], &filters);
             push(&["-c:v", "libjxl_anim"]);
             push_ffmpeg_jxl(&mut push, options);
             push(&["-an", "-sn", "-dn", "-f", "data"]);
@@ -716,6 +786,10 @@ fn ffmpeg_step(
             _,
         ) => {
             push(&["-map", "0:a:0", "-vn", "-sn", "-dn"]);
+            let audio = audio_filters(input, options.sound, t0, duration_secs);
+            if !audio.is_empty() {
+                push(&["-af", &audio.join(",")]);
+            }
             match format {
                 OutputFormat::Mp3 => {
                     let vbr = lerp(q, 7.0, 0.0).to_string();
@@ -740,10 +814,7 @@ fn ffmpeg_step(
         ) => {
             let needs_even = format == OutputFormat::Avif;
             let filters = video_filters(input, options, None, needs_even);
-            push(&["-map", "0:v:0", "-frames:v", "1"]);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
-            }
+            push_video(&mut push, input, &["-frames:v", "1"], &filters);
             match format {
                 OutputFormat::Png => push(&["-c:v", "png"]),
                 OutputFormat::Jpg => {
@@ -786,6 +857,85 @@ fn ffmpeg_step(
         args,
         duration_secs,
         weight,
+    }
+}
+
+/// Loudness, fade and resampling filters for the sound. `t0` is where the
+/// kept range starts on the filters' clock and `length` how long it is.
+fn audio_filters(
+    input: &MediaInfo,
+    sound: SoundOptions,
+    t0: f64,
+    length: Option<f64>,
+) -> Vec<String> {
+    let mut filters = Vec::new();
+    // Normalize first: fading afterwards keeps loudnorm from lifting the fades.
+    if sound.normalize {
+        filters.push(LOUDNORM.to_owned());
+    }
+    filters.extend(fades("afade", sound, t0, length));
+    if sound.normalize {
+        // loudnorm resamples to 192 kHz and passes that on. Asking for the
+        // source rate in the graph rather than with -ar lets ffmpeg settle on
+        // the nearest rate the encoder takes (Opus only does 48 kHz).
+        let rate = input.sample_rate.unwrap_or(FALLBACK_SAMPLE_RATE);
+        filters.push(format!("aresample={rate}"));
+    }
+    filters
+}
+
+/// Fade-in and fade-out with ffmpeg's `fade` (picture) or `afade` (sound)
+/// filter. A fade-out needs the output's `length`, and neither fade runs
+/// longer than the clip.
+fn fades(filter: &str, sound: SoundOptions, t0: f64, length: Option<f64>) -> Vec<String> {
+    let mut filters = Vec::new();
+    let fade_in = length.map_or(sound.fade_in, |l| sound.fade_in.min(l));
+    if fade_in > 0.0 {
+        let st = if t0 > 0.0 {
+            format!(":st={}", format_secs(t0))
+        } else {
+            String::new()
+        };
+        filters.push(format!("{filter}=t=in{st}:d={}", format_secs(fade_in)));
+    }
+    if let Some(length) = length {
+        let fade_out = sound.fade_out.min(length);
+        if fade_out > 0.0 {
+            filters.push(format!(
+                "{filter}=t=out:st={}:d={}",
+                format_secs(t0 + length - fade_out),
+                format_secs(fade_out)
+            ));
+        }
+    }
+    filters
+}
+
+/// Pick the picture of `input`, push `extra`, and run `filters` on the picture.
+///
+/// HEIF tile grids come out of a filtergraph ffmpeg builds itself (stitching
+/// the tiles, then applying the rotation), and `-vf` can't be added to that,
+/// so their filters go into a complex filtergraph fed by the grid instead.
+fn push_video(
+    push: &mut impl FnMut(&[&str]),
+    input: &MediaInfo,
+    extra: &[&str],
+    filters: &[String],
+) {
+    let chain = filters.join(",");
+    match input.tile_grid {
+        Some(group) if chain.is_empty() => push(&["-map", &format!("[0:g:{group}]")]),
+        Some(group) => push(&[
+            "-filter_complex",
+            &format!("[0:g:{group}]{chain}[v]"),
+            "-map",
+            "[v]",
+        ]),
+        None => push(&["-map", "0:v:0"]),
+    }
+    push(extra);
+    if input.tile_grid.is_none() && !chain.is_empty() {
+        push(&["-vf", &chain]);
     }
 }
 
@@ -895,8 +1045,8 @@ fn animation_filters(
 }
 
 /// Whether the options leave the picture exactly as it is: no trim, turn,
-/// mirror, downscale, frame-rate change or (for animations) new speed or
-/// direction.
+/// mirror, crop, downscale, frame-rate change or (for animations) new speed
+/// or direction.
 fn is_untouched(input: &MediaInfo, options: &ConvertOptions) -> bool {
     let untrimmed = options.trim_start.is_none_or(|s| s <= 0.0) && options.trim_end.is_none();
     let replayed = options.format.animates(input.kind) && options.changes_playback();
@@ -924,18 +1074,18 @@ fn animation_bytes(
     Some(f64::from(w) * f64::from(h) * 4.0 * fps * length.max(0.0))
 }
 
-/// Picture size after rotation and downscaling, if the source size is known.
+/// Picture size after rotation, cropping and downscaling, if the source size
+/// is known.
 fn output_dims(
     input: &MediaInfo,
     options: &ConvertOptions,
     default_max: Option<u32>,
 ) -> Option<(u32, u32)> {
-    let (w, h) = input.width.zip(input.height)?;
-    let (w, h) = if options.rotate % 180 == 90 {
-        (h, w)
-    } else {
-        (w, h)
-    };
+    let (w, h) = turned_dims(input, options)?;
+    let (w, h) = options
+        .crop
+        .and_then(|crop| crop_box(w, h, &crop, false))
+        .map_or((w, h), |b| (b.width, b.height));
     let target = options.max_size.or(default_max).map(|t| t.max(2) & !1);
     Some(match target {
         Some(t) if t < w.min(h) => {
@@ -1005,7 +1155,102 @@ fn trim_range(input: &MediaInfo, options: &ConvertOptions) -> Result<(f64, Optio
     Ok((start, end))
 }
 
-/// Rotate, flip, downscale and frame-rate filters, in that order.
+fn validate_crop(crop: &Crop) -> Result<()> {
+    if crop
+        .aspect
+        .is_some_and(|[w, h]| w == 0 || h == 0 || w > 1000 || h > 1000)
+    {
+        return Err(Error::unsupported(
+            "the crop shape must be two whole numbers like 9:16",
+        ));
+    }
+    if let Some(a) = crop.area {
+        let parts = [a.x, a.y, a.width, a.height];
+        // A little slack for rounding in the front end.
+        let inside = parts
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0 + 1e-6).contains(v))
+            && a.x + a.width <= 1.0 + 1e-6
+            && a.y + a.height <= 1.0 + 1e-6;
+        if !inside || a.width <= 0.0 || a.height <= 0.0 {
+            return Err(Error::unsupported("the crop must lie inside the picture"));
+        }
+    }
+    Ok(())
+}
+
+/// Display size after our rotation, if known.
+fn turned_dims(input: &MediaInfo, options: &ConvertOptions) -> Option<(u32, u32)> {
+    let (w, h) = input.width.zip(input.height)?;
+    Some(if options.rotate % 180 == 90 {
+        (h, w)
+    } else {
+        (w, h)
+    })
+}
+
+/// The crop in pixels of a `w`×`h` picture, or `None` when it keeps the
+/// whole picture.
+///
+/// With an aspect, the largest box of that shape inside the area is kept,
+/// centred on the area, so the result has the exact shape even when the
+/// area's fractions round unevenly. `even` rounds the size down to even
+/// numbers, which yuv420p encoders need.
+fn crop_box(w: u32, h: u32, crop: &Crop, even: bool) -> Option<CropBox> {
+    let area = crop.area.unwrap_or(CropArea::FULL);
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let px = |v: f64, max: u32| (v.round().max(1.0) as u32).min(max);
+    let mut width = px(area.width * fw, w);
+    let mut height = px(area.height * fh, h);
+    if let Some([aw, ah]) = crop.aspect {
+        if u64::from(width) * u64::from(ah) <= u64::from(height) * u64::from(aw) {
+            height = px(f64::from(width) * f64::from(ah) / f64::from(aw), height);
+        } else {
+            width = px(f64::from(height) * f64::from(aw) / f64::from(ah), width);
+        }
+    }
+    if (width, height) == (w, h) {
+        return None;
+    }
+    if even {
+        width = (width & !1).max(2).min(w);
+        height = (height & !1).max(2).min(h);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let place = |start: f64, size: f64, kept: u32, total: u32| {
+        let centre = (start + size / 2.0) * f64::from(total);
+        ((centre - f64::from(kept) / 2.0).round().max(0.0) as u32).min(total - kept)
+    };
+    Some(CropBox {
+        width,
+        height,
+        x: place(area.x, area.width, width, w),
+        y: place(area.y, area.height, height, h),
+    })
+}
+
+/// The `crop` filter for a picture of unknown size: the aspect's largest
+/// centred box, or the area as fractions of the input.
+fn crop_expression(crop: &Crop) -> Option<String> {
+    let frac = |v: f64| {
+        let s = format!("{:.6}", v.clamp(0.0, 1.0));
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    };
+    match (crop.aspect, crop.area) {
+        (Some([w, h]), _) => Some(format!("crop='min(iw,ih*{w}/{h})':'min(ih,iw*{h}/{w})'")),
+        (None, Some(a)) if a != CropArea::FULL => Some(format!(
+            "crop='iw*{}':'ih*{}':'iw*{}':'ih*{}'",
+            frac(a.width),
+            frac(a.height),
+            frac(a.x),
+            frac(a.y)
+        )),
+        (None, _) => None,
+    }
+}
+
+/// Rotate, flip, crop, downscale and frame-rate filters, in that order.
 ///
 /// `default_max` caps the short side when the user picked no size.
 /// `even` forces even dimensions, which yuv420p encoders require.
@@ -1028,7 +1273,7 @@ fn fps_filter(target: Option<f64>, source: Option<f64>) -> Option<String> {
         .map(|fps| format!("fps={}", format_secs(fps)))
 }
 
-/// Rotate, flip and downscale filters, in that order.
+/// Rotate, flip, crop and downscale filters, in that order.
 fn picture_filters(
     input: &MediaInfo,
     options: &ConvertOptions,
@@ -1046,14 +1291,19 @@ fn picture_filters(
         filters.push("hflip".to_owned());
     }
 
-    // Display size after our rotation.
-    let dims = input.width.zip(input.height).map(|(w, h)| {
-        if options.rotate % 180 == 90 {
-            (h, w)
-        } else {
-            (w, h)
+    // Display size after our rotation, then after the crop.
+    let mut dims = turned_dims(input, options);
+    if let Some(crop) = &options.crop {
+        match dims {
+            Some((w, h)) => {
+                if let Some(b) = crop_box(w, h, crop, even) {
+                    filters.push(format!("crop={}:{}:{}:{}", b.width, b.height, b.x, b.y));
+                    dims = Some((b.width, b.height));
+                }
+            }
+            None => filters.extend(crop_expression(crop)),
         }
-    });
+    }
     let target = options.max_size.or(default_max).map(|t| t.max(2) & !1);
     let scale = match (target, dims) {
         (Some(t), Some((w, h))) if t < w.min(h) => Some(if w >= h {
@@ -1133,7 +1383,9 @@ mod tests {
             fps: Some(30.0),
             video_codec: Some("h264".into()),
             audio_codec: Some("aac".into()),
+            sample_rate: Some(44_100),
             reconstructs_jpeg: false,
+            tile_grid: None,
         }
     }
 
@@ -1204,6 +1456,179 @@ mod tests {
         assert!(cmd.contains("-c:v libvpx-vp9 -crf 28 -b:v 0"), "{cmd}");
         assert!(cmd.contains(" -an "), "{cmd}");
         assert!(!cmd.contains("0:a:0"), "{cmd}");
+    }
+
+    fn cropped(aspect: Option<[u32; 2]>, area: Option<[f64; 4]>) -> Option<Crop> {
+        Some(Crop {
+            aspect,
+            area: area.map(|[x, y, width, height]| CropArea {
+                x,
+                y,
+                width,
+                height,
+            }),
+        })
+    }
+
+    #[test]
+    fn vertical_crop_keeps_the_centre_and_skips_needless_scaling() {
+        let options = ConvertOptions {
+            crop: cropped(Some([9, 16]), None),
+            max_size: Some(720),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("wide.mov"), &options, "/clips/wide.mp4");
+        // 1080 × 9/16 = 607.5, rounded to 608 and centred; 608 is already under 720.
+        assert!(cmd.contains(" -vf crop=608:1080:656:0 "), "{cmd}");
+    }
+
+    #[test]
+    fn crop_follows_turn_and_mirror_and_stays_exact() {
+        let mut input = video("phone.mp4");
+        (input.width, input.height) = (Some(1080), Some(1920));
+        let options = ConvertOptions {
+            format: OutputFormat::Webm,
+            rotate: 90,
+            flip: true,
+            // A hair short of square at the right edge: 1080×1079 px.
+            crop: cropped(Some([1, 1]), Some([0.4374, 0.0, 0.5626, 0.999])),
+            max_size: Some(480),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &options, "/clips/phone.webm");
+        assert!(
+            // Square, rounded to even sizes, and kept inside the picture.
+            cmd.contains(" -vf transpose=clock,hflip,crop=1078:1078:841:0,scale=-2:480 "),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn free_crop_rounds_to_even_sizes_for_video_but_not_png() {
+        let crop = cropped(None, Some([0.1, 0.2, 0.3001, 0.4]));
+        let mp4 = ConvertOptions {
+            crop,
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &mp4, "/clips/a.mp4");
+        // 0.3001 × 1920 = 576.2 → 576; 0.4 × 1080 = 432.
+        assert!(cmd.contains(" -vf crop=576:432:192:216 "), "{cmd}");
+
+        let mut photo = video("odd.png");
+        photo.kind = MediaKind::Image;
+        (photo.width, photo.height) = (Some(1001), Some(1001));
+        let png = ConvertOptions {
+            format: OutputFormat::Png,
+            crop: cropped(None, Some([0.0, 0.0, 0.5, 1.0])),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&photo, &png, "/clips/odd 2.png");
+        assert!(cmd.contains(" -vf crop=501:1001:0:0 "), "{cmd}");
+    }
+
+    #[test]
+    fn crop_of_the_whole_picture_changes_nothing() {
+        let options = ConvertOptions {
+            crop: cropped(Some([16, 9]), None),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &options, "/clips/a.mp4");
+        assert!(!cmd.contains("-vf"), "{cmd}");
+        let free = ConvertOptions {
+            crop: cropped(None, None),
+            ..ConvertOptions::default()
+        };
+        assert!(!command(&video("a.mov"), &free, "/clips/a.mp4").contains("-vf"));
+    }
+
+    #[test]
+    fn crop_without_a_known_size_uses_expressions() {
+        let mut input = video("mystery.mov");
+        (input.width, input.height) = (None, None);
+        let options = ConvertOptions {
+            crop: cropped(Some([1, 1]), Some([0.2, 0.0, 0.5, 1.0])),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &options, "/clips/mystery.mp4");
+        assert!(
+            cmd.contains(
+                "-vf 'crop='\\''min(iw,ih*1/1)'\\'':'\\''min(ih,iw*1/1)'\\'',scale=trunc(iw/2)*2:trunc(ih/2)*2'"
+            ),
+            "{cmd}"
+        );
+        let free = ConvertOptions {
+            crop: cropped(None, Some([0.25, 0.0, 0.5, 1.0])),
+            ..ConvertOptions::default()
+        };
+        let plan = plan(
+            &input,
+            &free,
+            Path::new("/clips/m.mp4"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let vf = plan.steps[0]
+            .args
+            .iter()
+            .skip_while(|a| *a != "-vf")
+            .nth(1)
+            .expect("filters");
+        assert_eq!(
+            vf.to_string_lossy(),
+            "crop='iw*0.5':'ih*1':'iw*0.25':'ih*0',scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        );
+    }
+
+    #[test]
+    fn gif_caps_the_size_of_the_cropped_picture() {
+        let options = ConvertOptions {
+            format: OutputFormat::Gif,
+            crop: cropped(Some([9, 16]), None),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("a.mov"), &options, "/clips/a.gif");
+        assert!(
+            cmd.contains("-vf 'fps=15,crop=608:1080:656:0,scale=480:-2:flags=lanczos,split"),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn rejects_crops_outside_the_picture_or_without_a_shape() {
+        for crop in [
+            cropped(None, Some([0.6, 0.0, 0.5, 1.0])),
+            cropped(None, Some([0.0, 0.0, 0.0, 1.0])),
+            cropped(None, Some([f64::NAN, 0.0, 0.5, 0.5])),
+            cropped(Some([0, 1]), None),
+        ] {
+            let options = ConvertOptions {
+                crop,
+                ..ConvertOptions::default()
+            };
+            assert!(
+                plan(
+                    &video("a.mov"),
+                    &options,
+                    Path::new("/clips/a.mp4"),
+                    JxlSupport::default()
+                )
+                .is_err(),
+                "{crop:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_crops_from_the_front_end() {
+        let options: ConvertOptions = serde_json::from_value(serde_json::json!({
+            "format": "mp4",
+            "crop": {"aspect": [9, 16], "area": null}
+        }))
+        .expect("parse");
+        assert_eq!(options.crop, cropped(Some([9, 16]), None));
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp4"})).expect("parse");
+        assert_eq!(options.crop, None);
     }
 
     #[test]
@@ -1571,6 +1996,117 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Sound clean-up
+    // -----------------------------------------------------------------------
+
+    fn sound(normalize: bool, fade_in: f64, fade_out: f64) -> SoundOptions {
+        SoundOptions {
+            normalize,
+            fade_in,
+            fade_out,
+        }
+    }
+
+    #[test]
+    fn trimmed_song_is_normalized_and_faded() {
+        let options = ConvertOptions {
+            format: OutputFormat::Mp3,
+            trim_start: Some(2.0),
+            trim_end: Some(12.0),
+            quality: 100,
+            sound: sound(true, 1.0, 3.0),
+            ..ConvertOptions::default()
+        };
+        assert_eq!(
+            command(&video("talk.mov"), &options, "/clips/talk.mp3"),
+            "ffmpeg -ss 2 -i /clips/talk.mov -t 10 -map 0:a:0 -vn -sn -dn \
+             -af loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=1,afade=t=out:st=7:d=3,aresample=44100 \
+             -c:a libmp3lame -q:a 0 /clips/talk.mp3"
+        );
+    }
+
+    #[test]
+    fn video_fades_picture_and_sound_together() {
+        let options = ConvertOptions {
+            sound: sound(false, 1.0, 1.0),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("garden.mov"), &options, "/clips/garden.mp4");
+        assert!(
+            cmd.contains(
+                "-vf fade=t=in:d=1,fade=t=out:st=41:d=1 -af afade=t=in:d=1,afade=t=out:st=41:d=1 "
+            ),
+            "{cmd}"
+        );
+
+        // Without sound the section is hidden, so nothing fades.
+        let muted = ConvertOptions {
+            keep_audio: false,
+            ..options
+        };
+        let cmd = command(&video("garden.mov"), &muted, "/clips/garden.mp4");
+        assert!(!cmd.contains("fade"), "{cmd}");
+        let gif = ConvertOptions {
+            format: OutputFormat::Gif,
+            ..options
+        };
+        let cmd = command(&video("garden.mov"), &gif, "/clips/garden.gif");
+        assert!(!cmd.contains("fade="), "{cmd}");
+    }
+
+    #[test]
+    fn fades_fit_the_clip_and_need_a_known_length() {
+        let options = ConvertOptions {
+            format: OutputFormat::Ogg,
+            trim_end: Some(2.0),
+            sound: sound(false, 3.0, 3.0),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("short.mov"), &options, "/clips/short.ogg");
+        assert!(
+            cmd.contains("-af afade=t=in:d=2,afade=t=out:st=0:d=2 "),
+            "{cmd}"
+        );
+
+        // Unknown length: fade in only, and the default 48 kHz after loudnorm.
+        let input = MediaInfo {
+            duration_secs: None,
+            sample_rate: None,
+            ..video("stream.mkv")
+        };
+        let options = ConvertOptions {
+            format: OutputFormat::Flac,
+            sound: sound(true, 1.0, 3.0),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &options, "/clips/stream.flac");
+        assert!(
+            cmd.contains("-af loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=1,aresample=48000 "),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_fades_and_reads_old_recipes() {
+        let options = ConvertOptions {
+            format: OutputFormat::Mp3,
+            sound: sound(false, -1.0, 0.0),
+            ..ConvertOptions::default()
+        };
+        let err = plan_err(&video("a.mov"), &options, JxlSupport::default());
+        assert!(err.contains("fade"), "{err}");
+
+        let old: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp3", "keepAudio": true}))
+                .expect("parse");
+        assert_eq!(old.sound, SoundOptions::default());
+        let partial: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp3", "sound": {"fadeIn": 1}}))
+                .expect("parse");
+        assert_eq!(partial.sound, sound(false, 1.0, 0.0));
+    }
+
+    // -----------------------------------------------------------------------
     // JPEG XL
     // -----------------------------------------------------------------------
 
@@ -1729,6 +2265,38 @@ mod tests {
             "ffmpeg -i /clips/cat.heic -map 0:v:0 -frames:v 1 -vf transpose=clock,scale=1080:-2:flags=lanczos \
              -c:v png -compression_level 1 -update 1 -an -sn -dn /clips/.cat.jxl.frames.png && \\\n  \
              cjxl /clips/.cat.jxl.frames.png /clips/cat.jxl -d 0.5 -e 7 --quiet"
+        );
+    }
+
+    #[test]
+    fn tiled_heic_is_read_through_its_grid() {
+        let photo = MediaInfo {
+            tile_grid: Some(0),
+            ..image("IMG_0001.heic", 3024, 4032)
+        };
+        // Edits go into a complex filtergraph fed by the stitched grid.
+        let options = ConvertOptions {
+            format: OutputFormat::Jpg,
+            max_size: Some(1080),
+            quality: 100,
+            ..ConvertOptions::default()
+        };
+        let jpg = plan(&photo, &options, Path::new("/clips/IMG_0001.jpg"), LIBJXL).expect("plan");
+        assert_eq!(
+            jpg.command_line(),
+            "ffmpeg -i /clips/IMG_0001.heic -filter_complex '[0:g:0]scale=1080:-2:flags=lanczos[v]' \
+             -map '[v]' -frames:v 1 -c:v mjpeg -q:v 2 -update 1 -an -sn -dn /clips/IMG_0001.jpg"
+        );
+        // Without edits the grid is mapped directly.
+        let options = ConvertOptions {
+            format: OutputFormat::Png,
+            ..ConvertOptions::default()
+        };
+        let png = plan(&photo, &options, Path::new("/clips/IMG_0001.png"), LIBJXL).expect("plan");
+        let cmd = png.command_line();
+        assert!(
+            cmd.starts_with("ffmpeg -i /clips/IMG_0001.heic -map '[0:g:0]' -frames:v 1 -c:v png "),
+            "{cmd}"
         );
     }
 

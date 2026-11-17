@@ -252,14 +252,18 @@ impl Ffmpeg {
         let path = path.as_ref();
         let mut info = media::probe(path)?;
         let is_jxl = info.extension.as_deref() == Some("jxl") || jxl::is_jxl_file(path);
-        let probed = capture(
-            base_command(&self.ffprobe)
-                .args(["-v", "error", "-print_format", "json"])
-                .args(["-show_format", "-show_streams"])
-                .arg(path),
-            &self.ffprobe,
-        )
-        .and_then(|out| {
+        let ffprobe = |groups: bool| {
+            let mut cmd = base_command(&self.ffprobe);
+            cmd.args(["-v", "error", "-print_format", "json"])
+                .args(["-show_format", "-show_streams"]);
+            if groups {
+                cmd.arg("-show_stream_groups");
+            }
+            capture(cmd.arg(path), &self.ffprobe)
+        };
+        // Stream groups (HEIF tile grids) are new in ffprobe 7; older ones
+        // reject the option, so ask again without it.
+        let probed = ffprobe(true).or_else(|_| ffprobe(false)).and_then(|out| {
             serde_json::from_slice::<Value>(&out).map_err(|err| Error::Ffmpeg {
                 message: format!("ffprobe returned unreadable output: {err}"),
             })
@@ -326,6 +330,30 @@ impl Ffmpeg {
         Ok(decoded)
     }
 
+    /// The tile grid of a HEIF/AVIF picture (see [`MediaInfo::tile_grid`]).
+    /// Only those files are asked of ffprobe, so previews of anything else
+    /// cost no extra process.
+    fn tile_grid(&self, input: &Path) -> Option<usize> {
+        if !media::is_heif_file(input) {
+            return None;
+        }
+        let out = capture(
+            base_command(&self.ffprobe)
+                .args([
+                    "-v",
+                    "error",
+                    "-print_format",
+                    "json",
+                    "-show_stream_groups",
+                ])
+                .arg(input),
+            &self.ffprobe,
+        )
+        .ok()?;
+        let json = serde_json::from_slice::<Value>(&out).ok()?;
+        tile_grid(&json).map(|(index, _)| index)
+    }
+
     /// Grab one frame as a JPEG, scaled down to at most `max_height` pixels.
     ///
     /// Works for videos (any time within the clip) and still images (`at_secs`
@@ -336,6 +364,7 @@ impl Ffmpeg {
     /// [`Error::Ffmpeg`] if decoding fails or there is no frame at `at_secs`.
     pub fn frame(&self, input: &Path, at_secs: f64, max_height: u32) -> Result<Vec<u8>> {
         let input = &self.readable(input)?;
+        let grid = self.tile_grid(input);
         // ffmpeg can't seek in animated JPEG XL; decode up to the frame instead.
         let seek_input = !jxl::is_jxl_file(input);
         let at = (at_secs > 0.0).then(|| format_secs(at_secs));
@@ -348,10 +377,17 @@ impl Ffmpeg {
         if let Some(at) = at.as_deref().filter(|_| !seek_input) {
             cmd.args(["-ss", at]);
         }
-        cmd.args(["-frames:v", "1", "-an", "-sn"])
-            .arg("-vf")
-            .arg(format!("scale=-2:'min(ih,{})'", even(max_height)))
-            .args(["-c:v", "mjpeg", "-q:v", "4", "-f", "image2pipe", "pipe:1"]);
+        cmd.args(["-frames:v", "1", "-an", "-sn"]);
+        let scale = format!("scale=-2:'min(ih,{})'", even(max_height));
+        // `-vf` can't follow the filtergraph that stitches a tile grid.
+        match grid {
+            Some(group) => cmd
+                .arg("-filter_complex")
+                .arg(format!("[0:g:{group}]{scale}[v]"))
+                .args(["-map", "[v]"]),
+            None => cmd.arg("-vf").arg(scale),
+        };
+        cmd.args(["-c:v", "mjpeg", "-q:v", "4", "-f", "image2pipe", "pipe:1"]);
         let bytes = capture(&mut cmd, &self.ffmpeg)?;
         if bytes.is_empty() {
             return Err(Error::Ffmpeg {
@@ -890,7 +926,28 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
                 .or_else(|| v["r_frame_rate"].as_str().and_then(parse_ratio));
         }
     }
+    // A tiled HEIF picture: each tile is a stream, the grid has the real size.
+    if info.kind == MediaKind::Image
+        && let Some((index, grid)) = tile_grid(json)
+    {
+        info.tile_grid = Some(index);
+        let width = grid["width"].as_u64().and_then(|w| u32::try_from(w).ok());
+        let height = grid["height"].as_u64().and_then(|h| u32::try_from(h).ok());
+        (info.width, info.height) = if is_quarter_turn(grid) {
+            (height, width)
+        } else {
+            (width, height)
+        };
+    }
     info.audio_codec = audio.and_then(|a| a["codec_name"].as_str().map(str::to_owned));
+    info.sample_rate = audio
+        .and_then(|a| as_f64(&a["sample_rate"]))
+        .filter(|rate| rate.is_finite() && *rate >= 1.0 && *rate <= f64::from(u32::MAX))
+        .map(|rate| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let rate = rate.round() as u32;
+            rate
+        });
     info.duration_secs = if info.kind == MediaKind::Image {
         None
     } else {
@@ -898,11 +955,27 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
     };
 }
 
+/// The tile grid ffmpeg would show by default, as its stream group index and
+/// its component (size, rotation), from ffprobe's `-show_stream_groups`.
+fn tile_grid(json: &Value) -> Option<(usize, &Value)> {
+    let grids = json["stream_groups"]
+        .as_array()?
+        .iter()
+        .filter(|g| g["type"] == "Tile Grid");
+    let group = grids
+        .clone()
+        .find(|g| g["disposition"]["default"] == 1)
+        .or_else(|| grids.clone().next())?;
+    let index = usize::try_from(group["index"].as_u64()?).ok()?;
+    Some((index, &group["components"][0]))
+}
+
 fn is_still_image(stream: &Value, format_name: &str) -> bool {
     format_name.ends_with("_pipe") || format_name == "image2" || stream["nb_frames"] == "1"
 }
 
-/// Rotation of ±90° (phone videos) swaps the displayed width and height.
+/// Rotation of ±90° (phone videos and photos) swaps the displayed width and
+/// height. Takes a stream or a tile grid component.
 fn is_quarter_turn(stream: &Value) -> bool {
     let from_side_data = stream["side_data_list"]
         .as_array()
@@ -1011,7 +1084,9 @@ mod tests {
             fps: None,
             video_codec: None,
             audio_codec: None,
+            sample_rate: None,
             reconstructs_jpeg: false,
+            tile_grid: None,
         }
     }
 
@@ -1059,7 +1134,7 @@ mod tests {
                     {"codec_type": "video", "codec_name": "hevc", "width": 1920, "height": 1080,
                      "avg_frame_rate": "30000/1001", "side_data_list": [{"rotation": -90}],
                      "disposition": {"attached_pic": 0}},
-                    {"codec_type": "audio", "codec_name": "aac"}
+                    {"codec_type": "audio", "codec_name": "aac", "sample_rate": "48000"}
                 ],
                 "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "42.5"}
             }),
@@ -1070,6 +1145,57 @@ mod tests {
         assert!((info.fps.unwrap() - 29.97).abs() < 0.01);
         assert_eq!(info.video_codec.as_deref(), Some("hevc"));
         assert!(info.has_audio());
+        assert_eq!(info.sample_rate, Some(48_000));
+    }
+
+    #[test]
+    fn probe_json_for_tiled_iphone_photo() {
+        // What ffprobe -show_stream_groups says about a portrait iPhone HEIC:
+        // 48 tiles of 512×512, a thumbnail, and the grid that joins the tiles.
+        let tile = json!({"codec_type": "video", "codec_name": "hevc", "width": 512,
+                          "height": 512, "nb_frames": "1", "disposition": {"default": 0}});
+        let mut streams = vec![tile; 48];
+        streams.push(
+            json!({"codec_type": "video", "codec_name": "hevc", "width": 320,
+                            "height": 240, "nb_frames": "1", "disposition": {"default": 0}}),
+        );
+        let mut info = base("IMG_0001.HEIC");
+        apply_probe(
+            &mut info,
+            &json!({
+                "streams": streams,
+                "stream_groups": [
+                    {"index": 0, "id": "0x31", "type": "Tile Grid",
+                     "disposition": {"default": 1},
+                     "components": [{"nb_tiles": 48, "width": 4032, "height": 3024,
+                                     "side_data_list": [{"side_data_type": "Display Matrix",
+                                                         "rotation": -90}]}]}
+                ],
+                "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"}
+            }),
+        );
+        assert_eq!(info.kind, MediaKind::Image);
+        assert_eq!(info.tile_grid, Some(0));
+        assert_eq!((info.width, info.height), (Some(3024), Some(4032)));
+        assert_eq!(info.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(info.duration_secs, None);
+    }
+
+    #[test]
+    fn probe_json_for_small_untiled_heic() {
+        let mut info = base("small.heic");
+        apply_probe(
+            &mut info,
+            &json!({
+                "streams": [{"codec_type": "video", "codec_name": "hevc", "width": 400,
+                             "height": 300, "nb_frames": "1"}],
+                "stream_groups": [],
+                "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"}
+            }),
+        );
+        assert_eq!(info.kind, MediaKind::Image);
+        assert_eq!(info.tile_grid, None);
+        assert_eq!((info.width, info.height), (Some(400), Some(300)));
     }
 
     #[test]

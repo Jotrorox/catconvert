@@ -73,6 +73,7 @@ const ICONS = {
       <path d="M9 7 3.5 17H9ZM15 7l5.5 10H15Z" />
     </>
   ),
+  crop: () => <path d="M6.5 3v12.5a2 2 0 0 0 2 2H21M3 6.5h12.5a2 2 0 0 1 2 2V21" />,
   folder: () => (
     <path d="M3.5 7.5a2 2 0 0 1 2-2h3.8l2 2.2h7.2a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z" />
   ),
@@ -93,6 +94,7 @@ const ICONS = {
       <path d="M4.5 19.5V15H9" />
     </>
   ),
+  fade: () => <path d="M3 18.5 9 6h6l6 12.5" />,
   "arrow-right": () => <path d="M4.5 12h15M13.5 6l6 6-6 6" />,
   skip: () => <path d="m6 6 7 6-7 6ZM17.5 6v12" />,
   alert: () => (

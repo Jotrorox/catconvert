@@ -4,13 +4,17 @@ import {
   DEFAULTS,
   defaultFormat,
   defaultOptions,
+  fadeSpans,
   fitOptions,
   fpsChoices,
   initialOptions,
   isUntouched,
+  outputHasSound,
   outputSeconds,
   RECIPES,
+  recipeDetail,
   recipeFrom,
+  repacksJpeg,
   sizeChoices,
 } from "./formats";
 
@@ -26,12 +30,45 @@ const clip: MediaInfo = {
   fps: 24,
   videoCodec: "h264",
   audioCodec: "aac",
+  sampleRate: 48000,
   reconstructsJpeg: false,
+  tileGrid: null,
 };
 
 const all = () => true;
 
 describe("formats", () => {
+  it("knows when the output carries sound", () => {
+    expect(outputHasSound(clip, defaultOptions("mp4"))).toBe(true);
+    expect(outputHasSound(clip, defaultOptions("mp3"))).toBe(true);
+    expect(outputHasSound(clip, { ...defaultOptions("mp4"), keepAudio: false })).toBe(false);
+    expect(outputHasSound(clip, defaultOptions("gif"))).toBe(false);
+    expect(outputHasSound(clip, defaultOptions("jxl"))).toBe(false);
+    expect(outputHasSound({ ...clip, audioCodec: null }, defaultOptions("mp4"))).toBe(false);
+  });
+
+  it("clips fades to the kept length like the planner", () => {
+    const sound = { normalize: false, fadeIn: 3, fadeOut: 3 };
+    expect(fadeSpans(sound, 10)).toEqual({ fadeIn: 3, fadeOut: 3 });
+    expect(fadeSpans(sound, 2)).toEqual({ fadeIn: 2, fadeOut: 2 });
+    // A fade-out needs to know where the end is.
+    expect(fadeSpans(sound, null)).toEqual({ fadeIn: 3, fadeOut: 0 });
+  });
+
+  it("describes and keeps sound clean-up in recipes", () => {
+    const options = {
+      ...defaultOptions("mp3"),
+      sound: { normalize: true, fadeIn: 1, fadeOut: 0 },
+    };
+    expect(recipeDetail(clip, options)).toBe("Balanced · even loudness · fades");
+    // Muted video ignores the sound settings.
+    const muted = { ...defaultOptions("mp4"), keepAudio: false, sound: options.sound };
+    expect(recipeDetail(clip, muted)).toBe("No sound · balanced");
+    const recipe = recipeFrom("r", "Podcast", clip, options);
+    expect(recipe.options.sound).toEqual(options.sound);
+    expect(recipe.options.sound).not.toBe(options.sound);
+  });
+
   it("only offers downscales and slower frame rates", () => {
     expect(sizeChoices(clip)).toEqual([240]);
     expect(fpsChoices(clip)).toEqual([15, 10]);
@@ -111,6 +148,39 @@ describe("formats", () => {
     expect(isUntouched(clip, jxl)).toBe(true);
     expect(isUntouched(clip, { ...jxl, direction: "reverse" })).toBe(false);
     expect(isUntouched(clip, { ...defaultOptions("mp4"), direction: "reverse" })).toBe(true);
+  });
+
+  it("carries a crop shape to other files, but not a hand-drawn area", () => {
+    const area = { x: 0.1, y: 0, width: 0.4, height: 1 };
+    const square = { ...defaultOptions("mp4"), crop: { aspect: [1, 1] as [number, number], area } };
+    expect(fitOptions(clip, square, all)?.crop).toEqual({ aspect: [1, 1], area: null });
+    const free = { ...square, crop: { aspect: null, area } };
+    expect(fitOptions(clip, free, all)?.crop).toBeNull();
+
+    // Sizes are offered for the cropped picture: 9:16 of 640×360 is 203×360.
+    const tall = { rotate: 0 as const, crop: { aspect: [9, 16] as [number, number], area: null } };
+    expect(sizeChoices(clip, tall)).toEqual([]);
+    expect(sizeChoices({ ...clip, width: 1920, height: 1080 }, tall)).toEqual([480, 360, 240]);
+    // A size that would upscale the cropped picture is dropped for that file.
+    expect(
+      fitOptions(clip, { ...defaultOptions("mp4"), ...tall, maxSize: 240 }, all),
+    ).toMatchObject({ maxSize: null, crop: tall.crop });
+
+    const recipe = recipeFrom("custom-3", "Square", clip, { ...square, maxSize: 240 });
+    expect(recipe.options.crop).toEqual({ aspect: [1, 1], area: null });
+    expect(recipe.detail).toBe("1:1 crop · 240p · balanced");
+    expect(initialOptions(clip, all, recipe).crop).toEqual({ aspect: [1, 1], area: null });
+  });
+
+  it("counts a crop as an edit, unless it keeps the whole picture", () => {
+    const jpeg = { ...clip, kind: "image" as const, extension: "jpg" };
+    const repack = {
+      ...defaultOptions("jxl"),
+      jxl: { lossless: true, effort: 7, progressive: false },
+    };
+    expect(repacksJpeg(jpeg, repack)).toBe(true);
+    expect(repacksJpeg(jpeg, { ...repack, crop: { aspect: [1, 1], area: null } })).toBe(false);
+    expect(repacksJpeg(jpeg, { ...repack, crop: { aspect: [16, 9], area: null } })).toBe(true);
   });
 
   it("saves editor settings as a recipe without the per-file edits", () => {
