@@ -16,6 +16,7 @@ const clip: MediaInfo = {
   videoCodec: "h264",
   audioCodec: "aac",
   reconstructsJpeg: false,
+  tileGrid: null,
 };
 
 const photo: MediaInfo = {
@@ -94,6 +95,10 @@ describe("estimateBytes", () => {
     expect(size(clip, "mp4", { keepAudio: false })).toBeLessThan(full);
     expect(size(clip, "mp4", { fps: 15 })).toBeLessThan(full);
     expect(size(clip, "mp4", { maxSize: 480 })).toBeLessThan(size(clip, "mp4", { maxSize: 720 }));
+    // A 9:16 crop keeps under a third of a 16:9 picture; smaller frames cost
+    // more bits per pixel, so the file shrinks a little less than that.
+    const vertical = size(clip, "mp4", { keepAudio: false, crop: { aspect: [9, 16], area: null } });
+    expect(vertical).toBeLessThan(size(clip, "mp4", { keepAudio: false }) / 2);
   });
 
   it("uses the source for lossless sound", () => {

@@ -59,6 +59,20 @@ export type OutputFormat =
 
 export type Rotation = 0 | 90 | 180 | 270;
 
+/** Width to height, e.g. `[9, 16]`. */
+export type Aspect = [number, number];
+
+/** A rectangle in fractions (0 to 1) of the picture's width and height. */
+export type CropArea = { x: number; y: number; width: number; height: number };
+
+/** Part of the picture to keep, measured after the turn and mirror. */
+export type Crop = {
+  /** `null` for a free-form crop. */
+  aspect: Aspect | null;
+  /** `null` keeps the largest centred area with `aspect`, on any file. */
+  area: CropArea | null;
+};
+
 /** Settings that only matter when writing JPEG XL. */
 export type JxlOptions = {
   /** Mathematically lossless; an unedited JPEG is recompressed and can be restored exactly. */
@@ -88,6 +102,7 @@ export type ConvertOptions = {
   fps: number | null;
   rotate: Rotation;
   flip: boolean;
+  crop: Crop | null;
   /** 0 = smallest file, 100 = best quality. */
   quality: number;
   keepAudio: boolean;
