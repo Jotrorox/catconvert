@@ -37,8 +37,8 @@ use crate::convert::{
 use crate::ffmpeg::format_secs;
 use crate::jxl::is_jxl;
 use crate::{
-    ConvertOptions, Direction, Error, MediaInfo, MediaKind, OutputFormat, Plan, Result, Step,
-    Support, Tool, VideoCodec,
+    ConvertOptions, Direction, Error, MediaInfo, MediaKind, Naming, OutputFormat, Plan, Result,
+    Step, Support, Tool, VideoCodec,
 };
 
 /// How pictures of another shape fit the frame, which takes the size of the
@@ -416,6 +416,14 @@ pub fn sequence_output_path(
     free_path(first, &sequence_name(inputs), format.extension(), |p| {
         inputs.iter().any(|info| info.path == p) || taken(p)
     })
+}
+
+/// How to name an animation made from `inputs` with `options`: next to
+/// the first picture, called as [`sequence_output_path`] would, unless an
+/// [`crate::OutputTarget`] says otherwise.
+#[must_use]
+pub fn sequence_naming(inputs: &[MediaInfo], options: &ConvertOptions) -> Naming {
+    Naming::sequence(inputs, options, sequence_name(inputs))
 }
 
 /// The shared start of the pictures' names, without trailing numbers and

@@ -9,9 +9,13 @@ import { ReplaceConfirm } from "./ReplaceConfirm";
  * Where one conversion's result goes, under the editor's outcome: next to
  * the original, the output folder from Settings, or (for single files) in
  * place of the original, with the same first-time confirmation as Settings.
+ * A folder picked with "Change…" shows as a choice of its own until another
+ * is made.
  */
 export const DestinationField: Component<{
   destination: Destination | undefined;
+  /** A folder picked for this conversion, which wins over `destination`'s. */
+  picked?: string | null;
   onChoose: (choice: OutputChoice) => void;
   /** Animations made from several pictures can't replace them. */
   allowReplace: boolean;
@@ -19,11 +23,14 @@ export const DestinationField: Component<{
   pictures?: boolean;
 }> = (props) => {
   const [confirming, setConfirming] = createSignal(false);
-  const current = (): OutputChoice => props.destination?.kind ?? "nextToInput";
+  const kind = (): OutputChoice => props.destination?.kind ?? "nextToInput";
+  const current = (): OutputChoice | "picked" => (props.picked ? "picked" : kind());
   const folder = () => state.settings.outputFolder;
-  const inFolder = () => (props.destination?.kind === "folder" ? props.destination : null);
-  const choose = (choice: OutputChoice, select?: HTMLSelectElement) => {
+  const inFolder = () =>
+    !props.picked && props.destination?.kind === "folder" ? props.destination : null;
+  const choose = (choice: OutputChoice | "picked", select?: HTMLSelectElement) => {
     setConfirming(false);
+    if (choice === "picked") return;
     if (choice === "replaceInput" && !state.settings.replaceConfirmed) {
       // Stay on the current choice until confirmed.
       if (select) select.value = current();
@@ -41,6 +48,13 @@ export const DestinationField: Component<{
           class="select select-sm"
           onChange={(e) => choose(e.currentTarget.value as OutputChoice, e.currentTarget)}
         >
+          <Show when={props.picked}>
+            {(picked) => (
+              <option value="picked" selected>
+                In {folderName(picked())}
+              </option>
+            )}
+          </Show>
           <option value="nextToInput" selected={current() === "nextToInput"}>
             {props.pictures ? "Next to the first picture" : "Next to the original"}
           </option>

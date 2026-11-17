@@ -47,6 +47,10 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
   file first and only moves the original to the Trash once that file is
   finished; a failed or cancelled conversion leaves the original untouched.
   Animations made from several pictures are never allowed to replace them.
+- **Your folder, your name:** in the editor, pick another folder and file name
+  for one conversion. Batches take a name pattern such as `{name}-{format}` or
+  `{name}_{height}p`. A taken name gets a number unless you choose to replace
+  that file.
 - **Works from other apps:** photos, videos and songs offer CatConvert under
   "Open With" (plus "Send to" on Windows), macOS can add a "Convert with
   CatConvert" Finder Quick Action, and finished files drag straight out of the
@@ -146,6 +150,7 @@ mise run cli -- convert clip.mov --to mp3            # pull the audio
 mise run cli -- convert clip.mov --to mp4 --crop 9:16 --size 1080  # vertical, centred
 mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print the ffmpeg command
 mise run cli -- convert clip.mov --to mp4 --bitrate 4M          # exact video bitrate, two passes
+mise run cli -- convert clip.mov --to mp4 --out-dir ~/Movies --name "{name}_{height}p"  # elsewhere, renamed
 mise run cli -- animate cat*.jpg --to gif --frame 0.25 --direction boomerang  # pictures → animation
 ```
 

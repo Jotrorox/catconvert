@@ -18,6 +18,8 @@ import type {
   JobStage,
   MediaInfo,
   OutputFormat,
+  OutputPreview,
+  OutputTarget,
   QuickActionStatus,
   SequenceOptions,
   UpdateInfo,
@@ -41,8 +43,18 @@ import {
   type Recipe,
   type RecipeId,
   recipeFrom,
+  replacesOriginal,
   sequenceOptions,
 } from "./formats";
+import {
+  dirName,
+  isUsual,
+  type SaveAs,
+  splitChosen,
+  targetOf,
+  USUAL_OUTPUT,
+  withoutExtension,
+} from "./output";
 
 export type Screen = "convert" | "edit" | "queue" | "recipes" | "history" | "settings";
 
@@ -54,6 +66,8 @@ export type Draft = {
    * `null` while the generated command applies.
    */
   command: string | null;
+  /** Where to save and under which name (a pattern when several files share the settings). */
+  output: SaveAs;
 };
 
 /** Pictures being made into one animation, in the order they play. */
@@ -61,6 +75,7 @@ export type SequenceDraft = {
   pictures: MediaInfo[];
   options: ConvertOptions;
   sequence: SequenceOptions;
+  output: SaveAs;
 };
 
 export type JobEntry = {
@@ -76,6 +91,8 @@ export type JobEntry = {
   options: ConvertOptions;
   /** Set for an animation made from pictures. */
   sequence: SequenceOptions | null;
+  /** Where it was asked to save; a retry saves there too. */
+  target: OutputTarget;
   command: string;
   /** `command` was edited by hand rather than made from `options`. */
   custom: boolean;
@@ -176,6 +193,8 @@ type State = {
   recipes: Recipe[];
   /** Waiting files being queued with one set of settings. */
   batch: { done: number; total: number } | null;
+  /** The folder last chosen to save in, for the next files opened while the app runs. */
+  lastFolder: string | null;
   /** The Finder Quick Action, once Settings has looked. */
   quickAction: QuickActionStatus | null;
   toasts: Toast[];
@@ -316,6 +335,7 @@ const [state, setState] = createStore<State>({
   settings: loadSettings(),
   recipes: loadRecipes(),
   batch: null,
+  lastFolder: null,
   quickAction: null,
   toasts: [],
 });
@@ -581,6 +601,7 @@ export async function makeAnimation() {
       pictures,
       options: sequenceOptions(isAnimated, state.settings),
       sequence: { ...DEFAULT_SEQUENCE },
+      output: freshOutput({}),
     },
   });
 }
@@ -630,8 +651,14 @@ export async function openNext(): Promise<void> {
     if (info.kind === "unknown") throw new Error("That doesn't look like a photo, video or song.");
     const recipe = currentRecipe();
     const options = initialOptions(info, isAvailable, recipe, state.settings);
+    const output = freshOutput(options);
     setState({
-      draft: { info, options, command: await recipeCommand(recipe, info, options) },
+      draft: {
+        info,
+        options,
+        command: await recipeCommand(recipe, info, options, targetOf(output)),
+        output,
+      },
       opening: null,
     });
   } catch (error) {
@@ -649,10 +676,11 @@ async function recipeCommand(
   recipe: Recipe | null,
   info: MediaInfo,
   options: ConvertOptions,
+  target: OutputTarget,
 ): Promise<string | null> {
   if (!recipe?.command || recipe.options.format !== options.format) return null;
   try {
-    return await api.fillCommand(info, options, recipe.command);
+    return await api.fillCommand(info, options, recipe.command, target);
   } catch (error) {
     toast(`${info.fileName}: couldn't use the recipe's command: ${errorText(error)}`, {
       tone: "error",
@@ -694,6 +722,115 @@ export function updateOptions(patch: Partial<ConvertOptions>) {
 export function setCustomCommand(command: string | null) {
   if (!state.draft) return;
   setState("draft", "command", command);
+}
+
+// ---------------------------------------------------------------------------
+// Where results are saved
+// ---------------------------------------------------------------------------
+
+/**
+ * A new file's output: the folder chosen last while the app runs, the usual
+ * name. A file that replaces its original (`options.destination`) keeps the
+ * original's name and folder.
+ */
+function freshOutput(options: { destination?: Destination }): SaveAs {
+  if (replacesOriginal(options)) return { ...USUAL_OUTPUT };
+  return { ...USUAL_OUTPUT, folder: state.lastFolder };
+}
+
+/** The destination for saving next to the original, as Settings words it. */
+function besideOriginal(): Destination {
+  return destinationFor(state.settings, "nextToInput");
+}
+
+/**
+ * Change where the open file or animation is saved. A new name or folder
+ * asks again before replacing a file, unless `patch` says otherwise.
+ */
+export function updateOutput(patch: Partial<SaveAs>) {
+  const next = (output: SaveAs) => ({ ...output, collision: null, ...patch });
+  if (state.draft) setState("draft", "output", next);
+  else if (state.sequence) setState("sequence", "output", next);
+}
+
+/** Save the open file or animation next to the original again, under the usual name. */
+export function resetOutput() {
+  batch(() => {
+    setState("lastFolder", null);
+    updateOutput({ ...USUAL_OUTPUT });
+  });
+}
+
+/**
+ * "Change…": pick where the open file or animation is saved. One file gets
+ * the system's save dialog, starting at `current` (the path it would be
+ * saved at now); with files waiting to share the settings, only the folder
+ * is picked, as each gets its own name. The folder is remembered for the
+ * next files while the app runs.
+ */
+export async function chooseOutputLocation(current: OutputPreview | null, label: string) {
+  const editing = state.draft ?? state.sequence;
+  if (!editing) return;
+  const { output, options } = editing;
+  const start = current ? dirName(current.path) : output.folder;
+  try {
+    if (state.draft && state.inbox.length > 0) {
+      const folder = await api.pickFolder(start);
+      if (!folder) return;
+      batch(() => {
+        setState("lastFolder", folder);
+        leaveOriginal();
+        updateOutput({ folder });
+      });
+      return;
+    }
+    const suggested = current?.path ?? `${start ?? ""}/${output.name ?? ""}.${options.format}`;
+    const path = await api.chooseSavePath(suggested, options.format, label);
+    if (!path) return;
+    const { folder, name } = splitChosen(path);
+    batch(() => {
+      setState("lastFolder", folder);
+      leaveOriginal();
+      // The system already asked before replacing a file there.
+      updateOutput({ folder, name: withoutExtension(name), collision: "overwrite" });
+    });
+  } catch (error) {
+    toast(`Couldn't open the save dialog: ${errorText(error)}`, { tone: "error" });
+  }
+}
+
+/**
+ * A picked folder or name can't go with replacing the original, which keeps
+ * the original's: the open file is then saved next to it instead.
+ */
+function leaveOriginal() {
+  if (state.draft && replacesOriginal(state.draft.options)) {
+    updateOptions({ destination: besideOriginal() });
+  }
+}
+
+/**
+ * The target to save with: when a chosen name is taken and nobody said what
+ * to do yet, ask whether to replace the file, keep both or not convert
+ * (`null`). The usual place never asks: it always picks a free name.
+ */
+async function settleTarget(
+  output: SaveAs,
+  preview: (target: OutputTarget) => Promise<OutputPreview>,
+): Promise<OutputTarget | null> {
+  const target = targetOf(output);
+  if (output.collision !== null || isUsual(output)) return target;
+  let found: OutputPreview;
+  try {
+    found = await preview({ ...target, collision: "overwrite" });
+  } catch {
+    // Starting the job says what's wrong with the name or folder.
+    return target;
+  }
+  if (!found.exists) return target;
+  const choice = await api.askReplace(baseName(found.path), dirName(found.path));
+  if (choice === "cancel") return null;
+  return { ...target, collision: choice === "replace" ? "overwrite" : "keepBoth" };
 }
 
 // ---------------------------------------------------------------------------
@@ -749,12 +886,17 @@ export async function convertSequence() {
   const options = { ...draft.options, jxl: { ...draft.options.jxl } };
   const sequence = { ...draft.sequence };
   try {
+    const target = await settleTarget({ ...draft.output }, (t) =>
+      api.sequenceOutputPreview([...draft.pictures], options, t),
+    );
+    if (!target) return;
     const ticket = await api.startSequence(
       draft.pictures.map((p) => p.path),
       options,
       sequence,
+      target,
     );
-    addJob(ticket, options, sequence, false, recipeTitle());
+    addJob(ticket, options, target, sequence, false, recipeTitle());
     setState("sequence", null);
     if (state.inbox.length > 0) {
       toast("The animation is in the queue", {
@@ -809,11 +951,15 @@ export async function convertDraft() {
   const options = { ...draft.options };
   const custom = draft.command;
   try {
+    const target = await settleTarget({ ...draft.output }, (t) =>
+      api.outputPreview(draft.info, options, t),
+    );
+    if (!target) return;
     const ticket =
       custom === null
-        ? await api.startJob(draft.info.path, options)
-        : await api.startCustomJob(draft.info.path, options, custom);
-    addJob(ticket, options, null, custom !== null, recipeTitle());
+        ? await api.startJob(draft.info.path, options, target)
+        : await api.startCustomJob(draft.info.path, options, custom, target);
+    addJob(ticket, options, target, null, custom !== null, recipeTitle());
     if (state.inbox.length > 0) {
       toast(`${draft.info.fileName} is in the queue`, {
         action: { label: "View", run: () => navigate("queue") },
@@ -836,6 +982,10 @@ export async function convertDraft() {
  * (minus the trim, which belongs to one file). Files the settings don't fit,
  * such as a song when making MP4s, go back to the editor afterwards.
  *
+ * They all go to the chosen folder, named by the chosen name pattern. Only
+ * the current file can replace a file (if asked); the others get a number
+ * when their name is taken.
+ *
  * A command edited by hand runs for every file, with each file's paths.
  */
 export async function convertAll() {
@@ -848,19 +998,25 @@ export async function convertAll() {
   };
   const paths = [...state.inbox];
   const custom = draft.command;
+  const output = { ...draft.output };
+  const others = targetOf({ ...output, collision: "keepBoth" });
   const recipe = recipeTitle();
   let template: string | null = null;
   try {
+    const target = await settleTarget(output, (t) => api.outputPreview(draft.info, options, t));
+    if (!target) return;
     if (custom === null) {
-      addJob(await api.startJob(draft.info.path, options), options, null, false, recipe);
-    } else {
       addJob(
-        await api.startCustomJob(draft.info.path, options, custom),
+        await api.startJob(draft.info.path, options, target),
         options,
+        target,
         null,
-        true,
+        false,
         recipe,
       );
+    } else {
+      const ticket = await api.startCustomJob(draft.info.path, options, custom, target);
+      addJob(ticket, options, target, null, true, recipe);
       template = await api.commandTemplate(draft.info.path, custom);
     }
   } catch (error) {
@@ -882,8 +1038,15 @@ export async function convertAll() {
       // The command only fits files that keep its format.
       if (!fitted || (template !== null && fitted.format !== options.format)) leftovers.push(path);
       else if (template !== null)
-        addJob(await api.startCustomJob(path, fitted, template), fitted, null, true, recipe);
-      else addJob(await api.startJob(path, fitted), fitted, null, false, recipe);
+        addJob(
+          await api.startCustomJob(path, fitted, template, others),
+          fitted,
+          others,
+          null,
+          true,
+          recipe,
+        );
+      else addJob(await api.startJob(path, fitted, others), fitted, others, null, false, recipe);
     } catch (error) {
       toast(`${baseName(path)}: ${errorText(error)}`, { tone: "error" });
     }
@@ -905,6 +1068,7 @@ export async function convertAll() {
 function addJob(
   ticket: api.JobTicket,
   options: ConvertOptions,
+  target: OutputTarget,
   sequence: SequenceOptions | null = null,
   custom = false,
   recipe: string | null = null,
@@ -920,6 +1084,7 @@ function addJob(
     replaces: ticket.replaces ?? null,
     options,
     sequence,
+    target,
     command: ticket.command,
     custom,
     recipe,
@@ -1018,15 +1183,18 @@ function remember(item: HistoryItem) {
 }
 
 /**
- * Save the frame at `at` seconds of the open video as a PNG next to it, with
- * the editor's turn, mirror and size. Runs right away rather than queueing.
+ * Save the frame at `at` seconds of the open video as a PNG in the folder the
+ * file will be saved in (by default next to it), with the editor's turn,
+ * mirror and size. Runs right away rather than queueing; a taken name gets a
+ * number.
  */
 export async function saveFrame(at: number) {
   const draft = state.draft;
   if (!draft) return;
   const { info } = draft;
+  const target = targetOf({ folder: draft.output.folder, name: null, collision: "keepBoth" });
   try {
-    const saved = await api.saveFrame(info.path, { ...draft.options }, at);
+    const saved = await api.saveFrame(info.path, { ...draft.options }, at, target);
     remember({
       id: `${Date.now()}-${saved.output}`,
       name: baseName(saved.output),
@@ -1069,7 +1237,7 @@ export async function tweakJob(id: JobId) {
     if (!pictures) return;
     batch(() => {
       setState({
-        sequence: { pictures, options: { ...job.options }, sequence },
+        sequence: { pictures, options: { ...job.options }, sequence, output: reopened(job) },
         draft: null,
         opening: null,
       });
@@ -1083,12 +1251,18 @@ export async function tweakJob(id: JobId) {
         info: job.input,
         options: { ...job.options },
         command: job.custom ? job.command : null,
+        output: reopened(job),
       },
       sequence: null,
       opening: null,
     });
     navigate("edit");
   });
+}
+
+/** A job's output choice for the editor; it asks again before replacing a file. */
+function reopened(job: JobEntry): SaveAs {
+  return { folder: job.target.folder, name: job.target.name, collision: null };
 }
 
 export async function retryJob(id: JobId) {
@@ -1105,16 +1279,17 @@ export async function retryJob(id: JobId) {
         pictures.map((p) => p.path),
         options,
         sequence,
+        job.target,
       );
     } else if (job.custom) {
       // Run as it ran; the output moves to the next free name if need be.
-      ticket = await api.startCustomJob(job.input.path, options, job.command);
+      ticket = await api.startCustomJob(job.input.path, options, job.command, job.target);
     } else {
-      ticket = await api.startJob(job.input.path, options);
+      ticket = await api.startJob(job.input.path, options, job.target);
     }
     batch(() => {
       removeJob(id);
-      addJob(ticket, options, sequence, job.custom, job.recipe);
+      addJob(ticket, options, job.target, sequence, job.custom, job.recipe);
     });
   } catch (error) {
     toast(errorText(error), { tone: "error" });
@@ -1284,6 +1459,7 @@ export async function convertAgain(id: string, recipeId: RecipeId | null = null)
             },
           },
           sequence,
+          output: freshOutput({}),
         },
       });
       return;
@@ -1308,7 +1484,7 @@ export async function convertAgain(id: string, recipeId: RecipeId | null = null)
     let custom: string | null = null;
     if (recipe) {
       options = initialOptions(info, isAvailable, recipe, state.settings);
-      custom = await recipeCommand(recipe, info, options);
+      custom = await recipeCommand(recipe, info, options, targetOf(freshOutput(options)));
       if (!recipe.accepts.includes(info.kind)) {
         toast(
           `“${recipe.title}” doesn't fit ${info.fileName}, so it opens with your usual settings`,
@@ -1321,7 +1497,7 @@ export async function convertAgain(id: string, recipeId: RecipeId | null = null)
       custom = command;
     }
     setState({
-      draft: { info, options, command: custom },
+      draft: { info, options, command: custom, output: freshOutput(options) },
       opening: null,
       recipe: recipe?.id ?? null,
     });
@@ -1470,13 +1646,25 @@ async function destinationOf(choice: OutputChoice): Promise<Destination | null> 
 export async function setDraftDestination(choice: OutputChoice) {
   if (choice === "replaceInput" && !state.settings.replaceConfirmed) return;
   const destination = await destinationOf(choice);
-  if (destination) updateOptions({ destination });
+  if (!destination) return;
+  batch(() => {
+    updateOptions({ destination });
+    // The choice wins over a folder picked with "Change…"; a replacement
+    // keeps the original's name too.
+    setState("lastFolder", null);
+    updateOutput(choice === "replaceInput" ? { ...USUAL_OUTPUT } : { folder: null });
+  });
 }
 
 /** Where the animation being made goes. It can't replace its pictures. */
 export async function setSequenceDestination(choice: Exclude<OutputChoice, "replaceInput">) {
   const destination = await destinationOf(choice);
-  if (destination) updateSequenceOptions({ destination });
+  if (!destination) return;
+  batch(() => {
+    updateSequenceOptions({ destination });
+    setState("lastFolder", null);
+    updateOutput({ folder: null });
+  });
 }
 
 function setRecipes(recipes: Recipe[]) {
@@ -1558,6 +1746,7 @@ export function resetStore() {
     settings: loadSettings(),
     recipes: loadRecipes(),
     batch: null,
+    lastFolder: null,
     quickAction: null,
     toasts: [],
   });

@@ -9,7 +9,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { open } from "@tauri-apps/plugin-dialog";
+import { message, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 
@@ -230,6 +230,44 @@ export type SequenceOptions = {
   fit: Fit;
 };
 
+/** What to do when the chosen name is already taken. */
+export type Collision =
+  /** Keep the file that is there and number the new one: `clip 2.mp4`, … */
+  | "keepBoth"
+  /** Replace it once the new file is finished (never the original, nor a queued job's output). */
+  | "overwrite";
+
+/** Where a result is saved and under which name. All `null` saves next to the input as usual. */
+export type OutputTarget = {
+  /** Folder to save in; `null` is the input's folder. */
+  folder: string | null;
+  /**
+   * File name without the extension, which follows the format. May hold
+   * placeholders ({@link NAME_PLACEHOLDERS}), which makes it a pattern for batches.
+   */
+  name: string | null;
+  collision: Collision;
+};
+
+/** Where a result would be saved, before it is. */
+export type OutputPreview = {
+  path: string;
+  /** The chosen name is taken by a file that `"overwrite"` would replace; otherwise `path` has a number. */
+  exists: boolean;
+};
+
+/** Saves next to the input under the usual free name. */
+export const NEXT_TO_ORIGINAL: OutputTarget = { folder: null, name: null, collision: "keepBoth" };
+
+/** Placeholders a name pattern can use (see `catconvert_core::PLACEHOLDERS`). */
+export const NAME_PLACEHOLDERS = [
+  { token: "{name}", meaning: "the original's name" },
+  { token: "{format}", meaning: "the new extension, e.g. mp4" },
+  { token: "{width}", meaning: "the new width in pixels" },
+  { token: "{height}", meaning: "the new height in pixels" },
+  { token: "{date}", meaning: "today's date" },
+] as const;
+
 export type JobId = number;
 
 export type JobStage = "queued" | "running" | "done" | "failed" | "cancelled";
@@ -321,29 +359,56 @@ type Commands = {
   };
   playback_source: { args: { path: string; decode: boolean }; result: string };
   loudness: { args: { path: string }; result: number | null };
-  preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
+  preview_command: {
+    args: { info: MediaInfo; options: ConvertOptions; target: OutputTarget };
+    result: string;
+  };
+  output_preview: {
+    args: { info: MediaInfo; options: ConvertOptions; target: OutputTarget };
+    result: OutputPreview;
+  };
+  sequence_output_preview: {
+    args: { pictures: MediaInfo[]; options: ConvertOptions; target: OutputTarget };
+    result: OutputPreview;
+  };
   quality_summary: { args: { info: MediaInfo; options: ConvertOptions }; result: QualitySummary };
   check_command: {
-    args: { info: MediaInfo; options: ConvertOptions; command: string };
+    args: { info: MediaInfo; options: ConvertOptions; command: string; target: OutputTarget };
     result: string;
   };
   fill_command: {
-    args: { info: MediaInfo; options: ConvertOptions; template: string };
+    args: { info: MediaInfo; options: ConvertOptions; template: string; target: OutputTarget };
     result: string;
   };
   command_template: { args: { path: string; command: string }; result: string };
   start_custom_job: {
-    args: { path: string; options: ConvertOptions; command: string };
+    args: { path: string; options: ConvertOptions; command: string; target: OutputTarget };
     result: JobTicket;
   };
-  save_frame: { args: { path: string; options: ConvertOptions; at: number }; result: SavedFrame };
+  save_frame: {
+    args: { path: string; options: ConvertOptions; at: number; target: OutputTarget };
+    result: SavedFrame;
+  };
   preview_sequence_command: {
-    args: { pictures: MediaInfo[]; options: ConvertOptions; sequence: SequenceOptions };
+    args: {
+      pictures: MediaInfo[];
+      options: ConvertOptions;
+      sequence: SequenceOptions;
+      target: OutputTarget;
+    };
     result: string;
   };
-  start_job: { args: { path: string; options: ConvertOptions }; result: JobTicket };
+  start_job: {
+    args: { path: string; options: ConvertOptions; target: OutputTarget };
+    result: JobTicket;
+  };
   start_sequence: {
-    args: { paths: string[]; options: ConvertOptions; sequence: SequenceOptions };
+    args: {
+      paths: string[];
+      options: ConvertOptions;
+      sequence: SequenceOptions;
+      target: OutputTarget;
+    };
     result: JobTicket;
   };
   cancel_job: { args: { id: JobId }; result: boolean };
@@ -435,11 +500,17 @@ export async function previewFrame(
 }
 
 /**
- * Save the frame at `at` seconds as a PNG next to the video, with the turn,
- * mirror and size of `options`. Runs right away, not in the queue.
+ * Save the frame at `at` seconds as a PNG where `target` says (by default next
+ * to the video), with the turn, mirror and size of `options`. Runs right away,
+ * not in the queue.
  */
-export function saveFrame(path: string, options: ConvertOptions, at: number): Promise<SavedFrame> {
-  return command("save_frame", { path, options, at });
+export function saveFrame(
+  path: string,
+  options: ConvertOptions,
+  at: number,
+  target: OutputTarget = NEXT_TO_ORIGINAL,
+): Promise<SavedFrame> {
+  return command("save_frame", { path, options, at, target });
 }
 
 /** The audio waveform as a PNG object URL. */
@@ -468,8 +539,33 @@ export function loudness(path: string): Promise<number | null> {
 }
 
 /** The command(s) a conversion would run. */
-export function previewCommand(info: MediaInfo, options: ConvertOptions): Promise<string> {
-  return command("preview_command", { info, options });
+export function previewCommand(
+  info: MediaInfo,
+  options: ConvertOptions,
+  target: OutputTarget = NEXT_TO_ORIGINAL,
+): Promise<string> {
+  return command("preview_command", { info, options, target });
+}
+
+/**
+ * Where converting `info` with `options` would save to right now. Rejects
+ * with what is wrong with the chosen name or folder.
+ */
+export function outputPreview(
+  info: MediaInfo,
+  options: ConvertOptions,
+  target: OutputTarget,
+): Promise<OutputPreview> {
+  return command("output_preview", { info, options, target });
+}
+
+/** Like {@link outputPreview}, for an animation made from `pictures`. */
+export function sequenceOutputPreview(
+  pictures: MediaInfo[],
+  options: ConvertOptions,
+  target: OutputTarget,
+): Promise<OutputPreview> {
+  return command("sequence_output_preview", { pictures, options, target });
 }
 
 /** The audio bitrate and video CRF (or exact bitrate) a conversion would use. */
@@ -478,8 +574,12 @@ export function qualitySummary(info: MediaInfo, options: ConvertOptions): Promis
 }
 
 /** Queue a conversion; progress arrives via {@link onJobProgress}. */
-export function startJob(path: string, options: ConvertOptions): Promise<JobTicket> {
-  return command("start_job", { path, options });
+export function startJob(
+  path: string,
+  options: ConvertOptions,
+  target: OutputTarget = NEXT_TO_ORIGINAL,
+): Promise<JobTicket> {
+  return command("start_job", { path, options, target });
 }
 
 /**
@@ -491,8 +591,9 @@ export function checkCommand(
   info: MediaInfo,
   options: ConvertOptions,
   text: string,
+  target: OutputTarget = NEXT_TO_ORIGINAL,
 ): Promise<string> {
-  return command("check_command", { info, options, command: text });
+  return command("check_command", { info, options, command: text, target });
 }
 
 /** A recipe's saved command (see {@link commandTemplate}) with this file's paths filled in. */
@@ -500,8 +601,9 @@ export function fillCommand(
   info: MediaInfo,
   options: ConvertOptions,
   template: string,
+  target: OutputTarget = NEXT_TO_ORIGINAL,
 ): Promise<string> {
-  return command("fill_command", { info, options, template });
+  return command("fill_command", { info, options, template, target });
 }
 
 /** An edited command with the paths of the file at `path` swapped for placeholders. */
@@ -518,8 +620,9 @@ export function startCustomJob(
   path: string,
   options: ConvertOptions,
   text: string,
+  target: OutputTarget = NEXT_TO_ORIGINAL,
 ): Promise<JobTicket> {
-  return command("start_custom_job", { path, options, command: text });
+  return command("start_custom_job", { path, options, command: text, target });
 }
 
 /** The command(s) making one animation from `pictures` would run. */
@@ -527,8 +630,9 @@ export function previewSequenceCommand(
   pictures: MediaInfo[],
   options: ConvertOptions,
   sequence: SequenceOptions,
+  target: OutputTarget = NEXT_TO_ORIGINAL,
 ): Promise<string> {
-  return command("preview_sequence_command", { pictures, options, sequence });
+  return command("preview_sequence_command", { pictures, options, sequence, target });
 }
 
 /** Queue one animation made from the pictures at `paths`, in this order. */
@@ -536,8 +640,9 @@ export function startSequence(
   paths: string[],
   options: ConvertOptions,
   sequence: SequenceOptions,
+  target: OutputTarget = NEXT_TO_ORIGINAL,
 ): Promise<JobTicket> {
-  return command("start_sequence", { paths, options, sequence });
+  return command("start_sequence", { paths, options, sequence, target });
 }
 
 export function cancelJob(id: JobId): Promise<boolean> {
@@ -579,6 +684,38 @@ export async function pickFiles(): Promise<string[]> {
   });
   if (picked === null) return [];
   return Array.isArray(picked) ? picked : [picked];
+}
+
+/**
+ * Native save dialog for a file of `format`, starting at `suggested` (a full
+ * path). Resolves to the chosen path, or `null` if cancelled. The system asks
+ * before a chosen file would be replaced.
+ */
+export async function chooseSavePath(
+  suggested: string,
+  format: OutputFormat,
+  label: string,
+): Promise<string | null> {
+  return save({
+    title: "Save as",
+    defaultPath: suggested,
+    filters: [{ name: label, extensions: [format] }],
+  });
+}
+
+/** The answer to {@link askReplace}. */
+export type ReplaceChoice = "replace" | "keepBoth" | "cancel";
+
+/** Ask whether to replace `name`, which already exists in `folder`, keep both, or not save. */
+export async function askReplace(name: string, folder: string): Promise<ReplaceChoice> {
+  const buttons = { yes: "Replace", no: "Keep both", cancel: "Cancel" };
+  const answer = await message(
+    `“${name}” already exists in ${folder}. Replace it, or keep both and number the new file?`,
+    { title: "File already exists", kind: "warning", buttons },
+  );
+  if (answer === buttons.yes || answer === "Yes") return "replace";
+  if (answer === buttons.no || answer === "No") return "keepBoth";
+  return "cancel";
 }
 
 /** Native folder picker. Resolves to the chosen folder, or `null` if cancelled. */

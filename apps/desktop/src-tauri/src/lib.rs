@@ -17,10 +17,12 @@
 //!
 //! Results go where the conversion's [`catconvert_core::Destination`] says:
 //! next to the original, into the output folder chosen in Settings, or in
-//! the original's place. The webview never writes files itself (there is no
-//! fs plugin), so the output folder needs no file-system scope: the core
-//! writes there, [`prepare_output_folder`] creates and checks it, and
-//! playback and "Show in folder" work per file as above.
+//! the original's place. The editor can refine that with an [`OutputTarget`]:
+//! another folder, a file name or a name pattern. The webview never writes
+//! files itself (there is no fs plugin), so neither folder needs a
+//! file-system scope: the core writes there, [`prepare_output_folder`]
+//! creates and checks the Settings folder, and playback and "Show in folder"
+//! work per file as above.
 //!
 //! Files can also come in from outside the window ("Open with", the Finder
 //! Quick Action, "Send to"); see [`incoming`] and [`quick_action`].
@@ -32,8 +34,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use catconvert_core::{
-    ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat,
-    QualitySummary, Queue, SavedFrame, SequenceOptions, VideoCodec,
+    ConvertOptions, Destination, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, Naming,
+    OutputFormat, OutputPreview, OutputTarget, QualitySummary, Queue, SavedFrame, SequenceOptions,
+    VideoCodec,
 };
 
 /// Folder in Downloads suggested when "Save to a folder" is first chosen.
@@ -247,16 +250,19 @@ async fn preview_frame(
     Ok(Response::new(bytes))
 }
 
-/// Save the frame at `at` seconds as a PNG next to the video, right away.
+/// Save the frame at `at` seconds as a PNG, by default next to the video,
+/// right away.
 #[tauri::command]
 async fn save_frame(
     state: State<'_, AppState>,
     path: String,
     options: ConvertOptions,
     at: f64,
+    target: Option<OutputTarget>,
 ) -> Result<SavedFrame, String> {
     let queue = state.queue()?;
-    blocking(move || queue.save_frame(&path, &options, at)).await
+    let target = target.unwrap_or_default();
+    blocking(move || queue.save_frame(&path, &options, at, &target)).await
 }
 
 /// The audio waveform as PNG bytes.
@@ -313,8 +319,9 @@ fn preview_command(
     state: State<'_, AppState>,
     info: MediaInfo,
     options: ConvertOptions,
+    target: Option<OutputTarget>,
 ) -> Result<String, String> {
-    preview_plan(&state, &info, &options)
+    preview_plan(&state, &info, &options, &target.unwrap_or_default())
         .map(|plan| plan.command_line())
         .map_err(|err| err.to_string())
 }
@@ -340,19 +347,71 @@ fn preview_plan(
     state: &AppState,
     info: &MediaInfo,
     options: &ConvertOptions,
+    target: &OutputTarget,
 ) -> Result<catconvert_core::Plan, Error> {
     match state.queue() {
-        Ok(queue) => queue.preview(info, options),
+        Ok(queue) => queue.preview(info, options, target),
         Err(_) => {
-            let target = catconvert_core::output_target(
-                &info.path,
-                options.format,
-                &options.destination,
-                |_| false,
-            )?;
-            catconvert_core::plan(info, options, &target.written, JxlSupport::default())
+            let naming = Naming::conversion(info, options);
+            let (to, _) =
+                catconvert_core::resolve_output(&naming, &options.destination, target, |_| false)?;
+            catconvert_core::plan(info, options, &to.written, JxlSupport::default())
         }
     }
+}
+
+/// Where a result named by `naming` would be saved with `target`, skipping
+/// names queued jobs will write.
+fn output_of(
+    state: &AppState,
+    naming: &Naming,
+    destination: &Destination,
+    target: &OutputTarget,
+) -> Result<OutputPreview, String> {
+    match state.queue() {
+        Ok(queue) => queue.output_preview(naming, destination, target),
+        Err(_) => catconvert_core::resolve_output(naming, destination, target, |_| false).map(
+            |(to, exists)| OutputPreview {
+                path: to.output,
+                exists,
+            },
+        ),
+    }
+    .map_err(|err| err.to_string())
+}
+
+/// Where converting `info` with `options` would save to, and whether the
+/// chosen name is taken by a file it could replace. Errors say what is wrong
+/// with the chosen name or folder.
+#[tauri::command]
+fn output_preview(
+    state: State<'_, AppState>,
+    info: MediaInfo,
+    options: ConvertOptions,
+    target: OutputTarget,
+) -> Result<OutputPreview, String> {
+    output_of(
+        &state,
+        &Naming::conversion(&info, &options),
+        &options.destination,
+        &target,
+    )
+}
+
+/// Like [`output_preview`], for the animation made from `pictures`.
+#[tauri::command]
+fn sequence_output_preview(
+    state: State<'_, AppState>,
+    pictures: Vec<MediaInfo>,
+    options: ConvertOptions,
+    target: OutputTarget,
+) -> Result<OutputPreview, String> {
+    output_of(
+        &state,
+        &catconvert_core::sequence_naming(&pictures, &options),
+        &options.destination,
+        &target,
+    )
 }
 
 /// Check a command edited in the editor without running it. Returns the
@@ -364,9 +423,10 @@ fn check_command(
     info: MediaInfo,
     options: ConvertOptions,
     command: String,
+    target: Option<OutputTarget>,
 ) -> Result<String, String> {
     let support = state.ffmpeg().map(|f| f.support()).unwrap_or_default();
-    preview_plan(&state, &info, &options)
+    preview_plan(&state, &info, &options, &target.unwrap_or_default())
         .and_then(|plan| catconvert_core::custom_plan(&info, &plan, &command, support))
         .map(|plan| plan.command_line())
         .map_err(|err| err.to_string())
@@ -379,8 +439,9 @@ fn fill_command(
     info: MediaInfo,
     options: ConvertOptions,
     template: String,
+    target: Option<OutputTarget>,
 ) -> Result<String, String> {
-    preview_plan(&state, &info, &options)
+    preview_plan(&state, &info, &options, &target.unwrap_or_default())
         .and_then(|plan| catconvert_core::fill_command(&template, &info.path, &plan.output))
         .map_err(|err| err.to_string())
 }
@@ -400,9 +461,11 @@ async fn start_custom_job(
     path: String,
     options: ConvertOptions,
     command: String,
+    target: Option<OutputTarget>,
 ) -> Result<JobTicket, String> {
     let queue = state.queue()?;
-    blocking(move || queue.submit_custom(&path, &options, &command)).await
+    let target = target.unwrap_or_default();
+    blocking(move || queue.submit_custom(&path, &options, &target, &command)).await
 }
 
 /// The command(s) making one animation from `pictures` would run.
@@ -412,12 +475,18 @@ fn preview_sequence_command(
     pictures: Vec<MediaInfo>,
     options: ConvertOptions,
     sequence: SequenceOptions,
+    target: Option<OutputTarget>,
 ) -> Result<String, String> {
     let support = state.ffmpeg().map(|f| f.support()).unwrap_or_default();
-    catconvert_core::sequence_target(&pictures, options.format, &options.destination, |_| false)
-        .and_then(|target| {
-            catconvert_core::plan_sequence(&pictures, &options, &sequence, &target.written, support)
-        })
+    let naming = catconvert_core::sequence_naming(&pictures, &options);
+    let output = output_of(
+        &state,
+        &naming,
+        &options.destination,
+        &target.unwrap_or_default(),
+    )?
+    .path;
+    catconvert_core::plan_sequence(&pictures, &options, &sequence, &output, support)
         .map(|plan| plan.command_line())
         .map_err(|err| err.to_string())
 }
@@ -429,9 +498,11 @@ async fn start_sequence(
     paths: Vec<String>,
     options: ConvertOptions,
     sequence: SequenceOptions,
+    target: Option<OutputTarget>,
 ) -> Result<JobTicket, String> {
     let queue = state.queue()?;
-    blocking(move || queue.submit_sequence(&paths, &options, &sequence)).await
+    let target = target.unwrap_or_default();
+    blocking(move || queue.submit_sequence(&paths, &options, &sequence, &target)).await
 }
 
 /// Queue a conversion; progress arrives as `job-progress` events.
@@ -440,9 +511,11 @@ async fn start_job(
     state: State<'_, AppState>,
     path: String,
     options: ConvertOptions,
+    target: Option<OutputTarget>,
 ) -> Result<JobTicket, String> {
     let queue = state.queue()?;
-    blocking(move || queue.submit(&path, &options)).await
+    let target = target.unwrap_or_default();
+    blocking(move || queue.submit(&path, &options, &target)).await
 }
 
 /// Cancel a queued or running job. Returns `false` if it already finished.
@@ -582,6 +655,8 @@ pub fn run() {
             loudness,
             preview_command,
             quality_summary,
+            output_preview,
+            sequence_output_preview,
             check_command,
             fill_command,
             command_template,

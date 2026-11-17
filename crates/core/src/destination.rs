@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::convert::{OutputFormat, file_stem, frame_stem, free_path_in, output_path};
+use crate::output::{Naming, OutputTarget};
 use crate::sequence::{sequence_name, sequence_output_path};
 use crate::{Error, MediaInfo, Result};
 
@@ -163,6 +164,60 @@ pub fn output_target(
             }
         }
     })
+}
+
+/// Where a result named by `naming` goes for `destination`, refined by
+/// `chosen`, and whether the chosen name is taken by a file that
+/// [`crate::Collision::Overwrite`] would replace.
+///
+/// `chosen` picks the exact folder (instead of the destination's, without
+/// kind subfolders) and the name or name pattern for one conversion; see
+/// [`Naming::preview`]. [`Destination::ReplaceInput`] keeps the original's
+/// name and place, so it takes no chosen folder or name, and only one input.
+/// Pass [`Destination::NextToInput`] for results that never replace their
+/// input, such as saved frames.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] for a destination folder that can't be one, a
+/// chosen folder that isn't there, a name that isn't allowed, and a
+/// replacement with a chosen folder or name or with several inputs.
+pub fn resolve_output(
+    naming: &Naming,
+    destination: &Destination,
+    chosen: &OutputTarget,
+    taken: impl Fn(&Path) -> bool,
+) -> Result<(Target, bool)> {
+    destination.check()?;
+    let first = naming
+        .inputs
+        .first()
+        .map_or_else(PathBuf::new, Clone::clone);
+    let dir = match destination {
+        Destination::ReplaceInput => {
+            if naming.inputs.len() != 1 {
+                return Err(Error::unsupported(
+                    "an animation can't replace the pictures it's made from; save it next to \
+                     them or in the output folder",
+                ));
+            }
+            if !chosen.is_default() {
+                return Err(Error::unsupported(
+                    "a file that replaces the original keeps its name and folder; save it \
+                     next to the original or in a folder to choose them",
+                ));
+            }
+            return output_target(&first, naming.format, destination, taken).map(|t| (t, false));
+        }
+        Destination::Folder { .. } => destination.folder_for(&first, naming.format),
+        Destination::NextToInput => naming.dir.clone(),
+    };
+    let preview = Naming {
+        dir,
+        ..naming.clone()
+    }
+    .preview(chosen, taken)?;
+    Ok((Target::at(preview.path), preview.exists))
 }
 
 /// Where an animation made from `inputs` goes for `destination`.
@@ -420,6 +475,81 @@ mod tests {
 
     fn picture(path: &str) -> MediaInfo {
         crate::media::tests::sample(path, crate::MediaKind::Image)
+    }
+
+    #[test]
+    fn chosen_names_and_folders_refine_the_destination() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("clip.mov");
+        let out = dir.path().join("out");
+        let picked = tempfile::tempdir().expect("temp dir");
+        let naming = Naming::new(&input, OutputFormat::Mp4);
+        let named = OutputTarget {
+            name: Some("{name}-{format}".into()),
+            ..OutputTarget::default()
+        };
+        let sorted = Destination::Folder {
+            path: out.clone(),
+            by_kind: true,
+        };
+        let path = |destination: &Destination, chosen: &OutputTarget| {
+            resolve_output(&naming, destination, chosen, |_| false)
+                .expect("resolve")
+                .0
+                .output
+        };
+
+        // Nothing chosen: as the destination alone says.
+        assert_eq!(
+            path(&Destination::NextToInput, &OutputTarget::default()),
+            dir.path().join("clip.mp4")
+        );
+        assert_eq!(
+            path(&sorted, &OutputTarget::default()),
+            out.join("Videos").join("clip.mp4")
+        );
+        // A chosen name goes in the destination's folder, kind and all.
+        assert_eq!(
+            path(&Destination::NextToInput, &named),
+            dir.path().join("clip-mp4.mp4")
+        );
+        assert_eq!(
+            path(&sorted, &named),
+            out.join("Videos").join("clip-mp4.mp4")
+        );
+        // A picked folder is used exactly, without kind subfolders.
+        let elsewhere = OutputTarget {
+            folder: Some(picked.path().to_path_buf()),
+            ..named.clone()
+        };
+        assert_eq!(
+            path(&sorted, &elsewhere),
+            picked.path().join("clip-mp4.mp4")
+        );
+
+        // Replacing keeps the original's name and place, for one file only.
+        let (replace, _) = resolve_output(
+            &naming,
+            &Destination::ReplaceInput,
+            &OutputTarget::default(),
+            |_| false,
+        )
+        .expect("replace");
+        assert_eq!(replace.replaces.as_deref(), Some(input.as_path()));
+        let err = resolve_output(&naming, &Destination::ReplaceInput, &named, |_| false)
+            .expect_err("a name with replace");
+        assert!(err.to_string().contains("keeps its name"), "{err}");
+        let pictures = [picture("/pics/a 1.png"), picture("/pics/a 2.png")];
+        let animation =
+            crate::sequence::sequence_naming(&pictures, &crate::ConvertOptions::default());
+        let err = resolve_output(
+            &animation,
+            &Destination::ReplaceInput,
+            &OutputTarget::default(),
+            |_| false,
+        )
+        .expect_err("an animation with replace");
+        assert!(err.to_string().contains("animation"), "{err}");
     }
 
     #[test]

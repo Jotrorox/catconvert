@@ -597,22 +597,36 @@ fn fill(calls: &mut [Call], input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether `path` is one of the names [`crate::output_path`] picks for
-/// `input` with the extension of `output`: `clip.mp4`, `clip 2.mp4`, …
+/// Whether `path` is one of the free names picked for `output`, in its
+/// folder and with its extension: `clip.mp4`, `clip 2.mp4`, … named after
+/// `input` or after the name chosen for `output`.
 fn is_output_name(path: &Path, input: &Path, output: &Path) -> bool {
     if path.parent() != output.parent() || path.extension() != output.extension() {
         return false;
     }
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+    let (Some(stem), Some(chosen)) = (
+        path.file_stem().and_then(|s| s.to_str()),
+        output.file_stem().and_then(|s| s.to_str()),
+    ) else {
         return false;
     };
-    let base = file_stem(input);
-    stem == base
-        || stem
-            .strip_prefix(&base)
-            .and_then(|rest| rest.strip_prefix(' '))
-            .and_then(|n| n.parse::<u32>().ok())
-            .is_some_and(|n| n >= 2)
+    let numbered = |base: &str| {
+        stem == base
+            || stem
+                .strip_prefix(base)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .and_then(|n| n.parse::<u32>().ok())
+                .is_some_and(|n| n >= 2)
+    };
+    numbered(&file_stem(input)) || numbered(unnumbered(chosen))
+}
+
+/// `clip` from `clip 3`; other names as they are.
+fn unnumbered(stem: &str) -> &str {
+    match stem.rsplit_once(' ') {
+        Some((base, n)) if !base.is_empty() && n.parse::<u32>().is_ok_and(|n| n >= 2) => base,
+        _ => stem,
+    }
 }
 
 /// Point a command written for another free name of the output at `output`,
@@ -1135,6 +1149,26 @@ mod tests {
             message.contains("isn't where this conversion saves"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn follows_a_chosen_name_to_its_current_free_name() {
+        let input = video("/clips/cat.mov");
+        let options = ConvertOptions {
+            format: OutputFormat::Mp4,
+            ..ConvertOptions::default()
+        };
+        // Edited while holiday.mp4 in another folder was free.
+        let shown = generated(&input, &options, "/out/holiday.mp4");
+        let now = generated(&input, &options, "/out/holiday 2.mp4");
+        let custom = custom_plan(&input, &now, &shown.command_line(), all_tools()).expect("custom");
+        assert_eq!(custom, now);
+        // And back from a numbered name.
+        let custom = custom_plan(&input, &shown, &now.command_line(), all_tools()).expect("custom");
+        assert_eq!(custom, shown);
+        assert_eq!(unnumbered("holiday 2"), "holiday");
+        assert_eq!(unnumbered("holiday 1"), "holiday 1");
+        assert_eq!(unnumbered("route 66 x"), "route 66 x");
     }
 
     #[test]

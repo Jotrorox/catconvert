@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::convert::{self, ConvertOptions, OutputFormat, Plan};
 use crate::custom;
 use crate::destination::{self, Destination, Replaced, Target};
-use crate::ffmpeg::{Ffmpeg, RunOutcome};
+use crate::ffmpeg::{Ffmpeg, RunOutcome, RunProgress};
+use crate::output::{Collision, Naming, OutputPreview, OutputTarget};
 use crate::sequence::{self, SequenceOptions};
 use crate::{Error, MediaInfo, Result};
 
@@ -119,6 +120,8 @@ struct Job {
     plan: Plan,
     /// Where `plan` writes and where the result goes.
     target: Target,
+    /// Replace a file already at the output (see [`run_plan`]).
+    overwrite: bool,
     cancel: Arc<AtomicBool>,
 }
 
@@ -180,18 +183,26 @@ impl Queue {
 
     /// Probe `input`, plan the conversion and queue it.
     ///
-    /// The output goes where `options.destination` says, under a name that
-    /// is not taken (see [`destination::output_target`]); its folder is
-    /// created if need be. A `Queued` event is emitted before this returns.
+    /// The output goes where `options.destination` says, refined by `target`
+    /// (another folder, a name or name pattern), under a name that is not
+    /// taken unless `target` says to replace it (see
+    /// [`destination::resolve_output`]); its folder is created if need be.
+    /// Names queued jobs will write are never reused. A `Queued` event is
+    /// emitted before this returns.
     ///
     /// # Errors
     ///
     /// Probe errors, [`Error::Unsupported`] if the options do not fit the input,
-    /// the tools to write the format are missing or the file is already
-    /// queued to be replaced, and [`Error::Io`] if the output folder can't be
-    /// created.
-    pub fn submit(&self, input: impl AsRef<Path>, options: &ConvertOptions) -> Result<JobTicket> {
-        self.submit_planned(input, options, |_, plan| Ok(plan))
+    /// the tools to write the format are missing, the target is invalid or
+    /// the file is already queued to be replaced, and [`Error::Io`] if the
+    /// output folder can't be created.
+    pub fn submit(
+        &self,
+        input: impl AsRef<Path>,
+        options: &ConvertOptions,
+        target: &OutputTarget,
+    ) -> Result<JobTicket> {
+        self.submit_planned(input, options, target, |_, plan| Ok(plan))
     }
 
     /// The plan [`Queue::submit`] would queue for `info` right now, without
@@ -200,14 +211,41 @@ impl Queue {
     /// # Errors
     ///
     /// [`Error::Unsupported`] if the options don't fit the input (see
-    /// [`convert::plan`]).
-    pub fn preview(&self, info: &MediaInfo, options: &ConvertOptions) -> Result<Plan> {
+    /// [`convert::plan`]) or the target is invalid.
+    pub fn preview(
+        &self,
+        info: &MediaInfo,
+        options: &ConvertOptions,
+        target: &OutputTarget,
+    ) -> Result<Plan> {
         let reserved = lock(&self.shared.reserved);
-        let target =
-            destination::output_target(&info.path, options.format, &options.destination, |p| {
-                reserved.contains(p)
-            })?;
-        convert::plan(info, options, &target.written, self.shared.ffmpeg.support())
+        let naming = Naming::conversion(info, options);
+        let (to, _) = destination::resolve_output(&naming, &options.destination, target, |p| {
+            reserved.contains(p)
+        })?;
+        convert::plan(info, options, &to.written, self.shared.ffmpeg.support())
+    }
+
+    /// Where a result named by `naming` would go for `destination` and
+    /// `target` right now, and whether it would replace a file there. Names
+    /// queued jobs will write count as taken.
+    ///
+    /// # Errors
+    ///
+    /// As [`destination::resolve_output`].
+    pub fn output_preview(
+        &self,
+        naming: &Naming,
+        destination: &Destination,
+        target: &OutputTarget,
+    ) -> Result<OutputPreview> {
+        let reserved = lock(&self.shared.reserved);
+        let (to, exists) =
+            destination::resolve_output(naming, destination, target, |p| reserved.contains(p))?;
+        Ok(OutputPreview {
+            path: to.output,
+            exists,
+        })
     }
 
     /// Like [`Queue::submit`], but run `command` as edited by the user
@@ -225,10 +263,11 @@ impl Queue {
         &self,
         input: impl AsRef<Path>,
         options: &ConvertOptions,
+        target: &OutputTarget,
         command: &str,
     ) -> Result<JobTicket> {
         let support = self.shared.ffmpeg.support();
-        self.submit_planned(input, options, |info, plan| {
+        self.submit_planned(input, options, target, |info, plan| {
             custom::custom_plan(info, &plan, command, support)
         })
     }
@@ -239,6 +278,7 @@ impl Queue {
         &self,
         input: impl AsRef<Path>,
         options: &ConvertOptions,
+        chosen: &OutputTarget,
         customize: impl FnOnce(&MediaInfo, Plan) -> Result<Plan>,
     ) -> Result<JobTicket> {
         let ffmpeg = &self.shared.ffmpeg;
@@ -262,12 +302,11 @@ impl Queue {
                     "this file is already queued to be replaced",
                 ));
             }
-            let target = destination::output_target(
-                &info.path,
-                options.format,
-                &options.destination,
-                |p| reserved.contains(p),
-            )?;
+            let naming = Naming::conversion(&info, options);
+            let (target, _) =
+                destination::resolve_output(&naming, &options.destination, chosen, |p| {
+                    reserved.contains(p)
+                })?;
             let plan = customize(
                 &info,
                 convert::plan(&info, options, &target.written, ffmpeg.support())?,
@@ -276,7 +315,7 @@ impl Queue {
             reserved.extend(target.paths());
             (plan, target)
         };
-        self.enqueue(plan, target, vec![info])
+        self.enqueue(plan, target, overwrites(chosen), vec![info])
     }
 
     /// Probe `pictures`, plan one animation from them in this order (see
@@ -284,19 +323,21 @@ impl Queue {
     ///
     /// The output goes next to the first picture (see
     /// [`sequence::sequence_output_path`]) or into the folder of
-    /// `options.destination`. A `Queued` event is emitted before this returns.
+    /// `options.destination`, unless `target` picks another folder or name.
+    /// A `Queued` event is emitted before this returns.
     ///
     /// # Errors
     ///
     /// Probe errors of any picture, [`Error::Unsupported`] if the request
-    /// doesn't make an animation, the tools to write it are missing or the
-    /// destination is [`Destination::ReplaceInput`], and [`Error::Io`] if the
-    /// output folder can't be created.
+    /// doesn't make an animation, the tools to write it are missing, the
+    /// target is invalid or the destination is [`Destination::ReplaceInput`],
+    /// and [`Error::Io`] if the output folder can't be created.
     pub fn submit_sequence(
         &self,
         pictures: &[impl AsRef<Path>],
         options: &ConvertOptions,
         sequence: &SequenceOptions,
+        chosen: &OutputTarget,
     ) -> Result<JobTicket> {
         let ffmpeg = &self.shared.ffmpeg;
         if let Some(message) = ffmpeg
@@ -315,8 +356,9 @@ impl Queue {
 
         let (plan, target) = {
             let mut reserved = lock(&self.shared.reserved);
-            let target =
-                destination::sequence_target(&infos, options.format, &options.destination, |p| {
+            let naming = sequence::sequence_naming(&infos, options);
+            let (target, _) =
+                destination::resolve_output(&naming, &options.destination, chosen, |p| {
                     reserved.contains(p)
                 })?;
             let plan = sequence::plan_sequence(
@@ -330,12 +372,18 @@ impl Queue {
             reserved.extend(target.paths());
             (plan, target)
         };
-        self.enqueue(plan, target, infos)
+        self.enqueue(plan, target, overwrites(chosen), infos)
     }
 
     /// Register a planned job whose output is already reserved and hand it to
     /// the worker.
-    fn enqueue(&self, plan: Plan, target: Target, inputs: Vec<MediaInfo>) -> Result<JobTicket> {
+    fn enqueue(
+        &self,
+        plan: Plan,
+        target: Target,
+        overwrite: bool,
+        inputs: Vec<MediaInfo>,
+    ) -> Result<JobTicket> {
         let (id, cancel) = (JobId::next(), Arc::new(AtomicBool::new(false)));
         lock(&self.shared.active).insert(id, Arc::clone(&cancel));
 
@@ -351,6 +399,7 @@ impl Queue {
             id,
             plan,
             target: target.clone(),
+            overwrite,
             cancel,
         };
         if self.tx.send(job).is_err() {
@@ -365,20 +414,23 @@ impl Queue {
     }
 
     /// Save the frame of `input` at `at_secs` as a PNG next to it, or in the
-    /// folder of `options.destination` (see [`convert::frame_plan`] and
-    /// [`destination::frame_target`]), right away rather than in turn: one
-    /// frame takes a moment. Blocks until the file is written. The name is
-    /// kept clear of outputs that queued jobs will write.
+    /// folder of `options.destination`, or where `target` says (see
+    /// [`convert::frame_plan`] and [`destination::resolve_output`]), right
+    /// away rather than in turn: one frame takes a moment. A frame never
+    /// replaces its video. Blocks until the file is written. The name is kept
+    /// clear of outputs that queued jobs will write.
     ///
     /// # Errors
     ///
-    /// Probe errors, [`Error::Unsupported`] if `input` is not a video or this
-    /// ffmpeg can't write PNG, and [`Error::Ffmpeg`] if the grab fails.
+    /// Probe errors, [`Error::Unsupported`] if `input` is not a video, this
+    /// ffmpeg can't write PNG or the target is invalid, and [`Error::Ffmpeg`]
+    /// if the grab fails.
     pub fn save_frame(
         &self,
         input: impl AsRef<Path>,
         options: &ConvertOptions,
         at_secs: f64,
+        target: &OutputTarget,
     ) -> Result<SavedFrame> {
         let ffmpeg = &self.shared.ffmpeg;
         if let Some(message) = ffmpeg.missing(OutputFormat::Png) {
@@ -390,16 +442,27 @@ impl Queue {
         }
         let plan = {
             let mut reserved = lock(&self.shared.reserved);
-            let output =
-                destination::frame_target(&info.path, at_secs, &options.destination, |p| {
-                    reserved.contains(p)
-                })?;
+            let destination = match &options.destination {
+                folder @ Destination::Folder { .. } => folder.clone(),
+                _ => Destination::NextToInput,
+            };
+            let naming = Naming::frame(&info, options, at_secs);
+            let (to, _) = destination::resolve_output(&naming, &destination, target, |p| {
+                reserved.contains(p)
+            })?;
+            let output = to.output;
             let plan = convert::frame_plan(&info, options, at_secs, &output, ffmpeg.support())?;
             destination::ensure_folder(&output)?;
             reserved.insert(output);
             plan
         };
-        let result = ffmpeg.run(&plan, &AtomicBool::new(false), |_| {});
+        let result = run_plan(
+            ffmpeg,
+            &plan,
+            overwrites(target),
+            &AtomicBool::new(false),
+            |_| {},
+        );
         lock(&self.shared.reserved).remove(&plan.output);
         match result? {
             RunOutcome::Done { output_bytes } => Ok(SavedFrame {
@@ -425,6 +488,7 @@ impl Shared {
             id,
             plan,
             target,
+            overwrite,
             cancel,
         } = job;
         let emit = &self.emit;
@@ -439,7 +503,7 @@ impl Shared {
         let mut last = 0.0_f32;
         // The output folder may have been removed since the job was queued.
         let result = destination::ensure_folder(&plan.output).and_then(|()| {
-            self.ffmpeg.run(&plan, &cancel, |sample| {
+            run_plan(&self.ffmpeg, &plan, overwrite, &cancel, |sample| {
                 last = sample.fraction.unwrap_or(last).max(last);
                 emit(JobProgress {
                     speed: sample.speed,
@@ -498,6 +562,53 @@ impl Shared {
             reserved.remove(&path);
         }
     }
+}
+
+/// Whether a job for `target` may replace a file at its output. The output
+/// was only picked at a taken name if so (see [`destination::resolve_output`]).
+fn overwrites(target: &OutputTarget) -> bool {
+    target.collision == Collision::Overwrite
+}
+
+/// Run `plan`. With `replace`, a file already at the output is moved aside
+/// first, deleted once the new one is finished and put back otherwise, so a
+/// failed or cancelled job loses nothing. Without, a file that turned up at
+/// the output after it was picked stops the job and is left alone.
+fn run_plan(
+    ffmpeg: &Ffmpeg,
+    plan: &Plan,
+    replace: bool,
+    cancel: &AtomicBool,
+    on_progress: impl FnMut(RunProgress),
+) -> Result<RunOutcome> {
+    let output = &plan.output;
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| Error::Io { path, source }
+    };
+    let aside = if output.exists() {
+        if !replace {
+            return Err(Error::unsupported(format!(
+                "{} turned up after this was queued, so it was left alone",
+                output.display()
+            )));
+        }
+        let ext = output.extension().map(|e| e.to_string_lossy().into_owned());
+        let aside = convert::scratch_path(output, "replaced", ext.as_deref().unwrap_or("old"));
+        std::fs::rename(output, &aside).map_err(io(output))?;
+        Some(aside)
+    } else {
+        None
+    };
+    let result = ffmpeg.run(plan, cancel, on_progress);
+    if let Some(aside) = aside {
+        if matches!(result, Ok(RunOutcome::Done { .. })) {
+            let _ = std::fs::remove_file(&aside);
+        } else {
+            std::fs::rename(&aside, output).map_err(io(output))?;
+        }
+    }
+    result
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -581,7 +692,9 @@ mod tests {
             rotate: 90,
             ..ConvertOptions::default()
         };
-        let ticket = queue.submit(&input, &options).expect("submit");
+        let ticket = queue
+            .submit(&input, &options, &OutputTarget::default())
+            .expect("submit");
         assert_eq!(
             ticket.output.extension().and_then(|e| e.to_str()),
             Some(format.extension())
@@ -607,7 +720,9 @@ mod tests {
         assert_eq!(out.height, Some(160));
 
         // A second identical job must not collide with the first output.
-        let again = queue.submit(&input, &options).expect("submit again");
+        let again = queue
+            .submit(&input, &options, &OutputTarget::default())
+            .expect("submit again");
         assert_ne!(again.output, ticket.output);
         queue.cancel(again.id);
         let last = loop {
@@ -633,7 +748,9 @@ mod tests {
                 direction: crate::Direction::Boomerang,
                 ..ConvertOptions::default()
             };
-            let ticket = queue.submit(&input, &boomerang).expect("submit");
+            let ticket = queue
+                .submit(&input, &boomerang, &OutputTarget::default())
+                .expect("submit");
             let done = finish_of(&rx, ticket.id);
             assert_eq!(done.stage, JobStage::Done, "{done:?}");
             let out = ffmpeg.probe(&ticket.output).expect("probe gif");
@@ -652,7 +769,9 @@ mod tests {
 
         // Saving a frame runs right away, with the turn and size but not the trim.
         if ffmpeg.supports(OutputFormat::Png) {
-            let saved = queue.save_frame(&input, &options, 1.2).expect("save frame");
+            let saved = queue
+                .save_frame(&input, &options, 1.2, &OutputTarget::default())
+                .expect("save frame");
             assert_eq!(
                 saved.output.file_name().and_then(|n| n.to_str()),
                 Some("test clip-frame-0m01s.png")
@@ -661,9 +780,147 @@ mod tests {
             let still = ffmpeg.probe(&saved.output).expect("probe frame");
             assert_eq!(still.kind, crate::MediaKind::Image);
             assert_eq!((still.width, still.height), (Some(120), Some(160)));
-            let again = queue.save_frame(&input, &options, 1.4).expect("save again");
+            let again = queue
+                .save_frame(&input, &options, 1.4, &OutputTarget::default())
+                .expect("save again");
             assert!(again.output.ends_with("test clip-frame-0m01s 2.png"));
         }
+    }
+
+    /// A short generated clip at `path`.
+    fn make_clip(ffmpeg: &Ffmpeg, path: &Path) {
+        let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=160x120:d=1:r=10",
+            ])
+            .args(["-c:v", "mjpeg"])
+            .arg(path)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+    }
+
+    /// Real ffmpeg runs into a chosen folder under chosen names. Skipped
+    /// (passes) when ffmpeg is not installed.
+    #[test]
+    fn saves_where_the_target_says_end_to_end() {
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping output target test");
+            return;
+        };
+        if !ffmpeg.supports(OutputFormat::Png) {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("clip.mov");
+        make_clip(&ffmpeg, &input);
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let png = ConvertOptions {
+            format: OutputFormat::Png,
+            ..ConvertOptions::default()
+        };
+        let target = |name: &str, collision| OutputTarget {
+            folder: Some(out.path().to_path_buf()),
+            name: Some(name.into()),
+            collision,
+        };
+
+        // A pattern in another folder.
+        let ticket = queue
+            .submit(
+                &input,
+                &png,
+                &target("{name}_{width}x{height}", Collision::KeepBoth),
+            )
+            .expect("submit");
+        assert_eq!(ticket.output, out.path().join("clip_160x120.png"));
+        assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
+
+        // A taken name: kept and numbered, or replaced once finished.
+        let taken = out.path().join("still.png");
+        std::fs::write(&taken, b"old").expect("write");
+        let kept = queue
+            .submit(&input, &png, &target("still", Collision::KeepBoth))
+            .expect("submit");
+        assert_eq!(kept.output, out.path().join("still 2.png"));
+        assert_eq!(finish_of(&rx, kept.id).stage, JobStage::Done);
+        assert_eq!(std::fs::read(&taken).expect("read"), b"old");
+        let replaced = queue
+            .submit(&input, &png, &target("still.png", Collision::Overwrite))
+            .expect("submit");
+        assert_eq!(replaced.output, taken);
+        assert_eq!(finish_of(&rx, replaced.id).stage, JobStage::Done);
+        assert_ne!(std::fs::read(&taken).expect("read"), b"old");
+        assert!(!out.path().join(".still.png.replaced.png").exists());
+
+        // The preview agrees, and a bad name is refused before queueing.
+        let naming = Naming::conversion(&ffmpeg.probe(&input).expect("probe"), &png);
+        let preview = queue
+            .output_preview(
+                &naming,
+                &Destination::NextToInput,
+                &target("still", Collision::KeepBoth),
+            )
+            .expect("preview");
+        assert!(preview.exists);
+        assert_eq!(preview.path, out.path().join("still 3.png"));
+        assert!(
+            queue
+                .submit(&input, &png, &target("a:b", Collision::KeepBoth))
+                .is_err()
+        );
+
+        // Frames follow the folder too.
+        let frame = queue
+            .save_frame(&input, &png, 0.5, &target("", Collision::KeepBoth))
+            .expect("save frame");
+        assert_eq!(frame.output, out.path().join("clip-frame-0m00s.png"));
+    }
+
+    /// A replaced file comes back when the new one fails, and a file that
+    /// turned up at a picked name is left alone. Skipped (passes) when
+    /// ffmpeg is not installed.
+    #[test]
+    fn replacing_loses_nothing_when_a_job_fails() {
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping replace test");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let output = dir.path().join("out.png");
+        std::fs::write(&output, b"old").expect("write");
+        let failing = Plan {
+            steps: vec![crate::Step {
+                tool: crate::Tool::Ffmpeg,
+                args: ["-i", "/nowhere/missing.mov"]
+                    .into_iter()
+                    .map(Into::into)
+                    .chain([output.clone().into_os_string()])
+                    .collect(),
+                duration_secs: None,
+                weight: 1.0,
+            }],
+            output: output.clone(),
+            scratch: Vec::new(),
+            writes: Vec::new(),
+        };
+        let cancel = AtomicBool::new(false);
+        assert!(run_plan(&ffmpeg, &failing, true, &cancel, |_| {}).is_err());
+        assert_eq!(std::fs::read(&output).expect("read"), b"old");
+        assert!(!dir.path().join(".out.png.replaced.png").exists());
+
+        let err = run_plan(&ffmpeg, &failing, false, &cancel, |_| {}).expect_err("refused");
+        assert!(err.to_string().contains("left alone"), "{err}");
+        assert_eq!(std::fs::read(&output).expect("read"), b"old");
     }
 
     /// A copy of the JPEG `src` with an EXIF orientation tag, as phones write
@@ -718,7 +975,7 @@ mod tests {
         });
         let run = |pictures: &[&Path], options: ConvertOptions, sequence: SequenceOptions| {
             let ticket = queue
-                .submit_sequence(pictures, &options, &sequence)
+                .submit_sequence(pictures, &options, &sequence, &OutputTarget::default())
                 .expect("submit");
             assert_eq!(ticket.inputs.len(), pictures.len());
             let done = finish_of(&rx, ticket.id);
@@ -807,7 +1064,12 @@ mod tests {
         let gone = dir.path().join("gone.jpg");
         assert!(
             queue
-                .submit_sequence(&[&a, &gone], &gif, &SequenceOptions::default())
+                .submit_sequence(
+                    &[&a, &gone],
+                    &gif,
+                    &SequenceOptions::default(),
+                    &OutputTarget::default()
+                )
                 .is_err()
         );
 
@@ -876,7 +1138,9 @@ mod tests {
             max_size: Some(120),
             ..ConvertOptions::default()
         };
-        let ticket = queue.submit(&input, &av1).expect("submit");
+        let ticket = queue
+            .submit(&input, &av1, &OutputTarget::default())
+            .expect("submit");
         let done = finish_of(&rx, ticket.id);
         assert_eq!(done.stage, JobStage::Done, "{done:?}");
         let out = ffmpeg.probe(&ticket.output).expect("probe AV1");
@@ -893,7 +1157,9 @@ mod tests {
             ..ConvertOptions::default()
         };
         if ffmpeg.supports(OutputFormat::Webm) {
-            let again = queue.submit(&ticket.output, &webm).expect("submit again");
+            let again = queue
+                .submit(&ticket.output, &webm, &OutputTarget::default())
+                .expect("submit again");
             let done = finish_of(&rx, again.id);
             assert_eq!(done.stage, JobStage::Done, "{done:?}");
             let out = ffmpeg.probe(&again.output).expect("probe VP9");
@@ -905,7 +1171,11 @@ mod tests {
             format: OutputFormat::Mov,
             ..av1
         };
-        assert!(queue.submit(&input, &mov).is_err());
+        assert!(
+            queue
+                .submit(&input, &mov, &OutputTarget::default())
+                .is_err()
+        );
     }
 
     /// An exact bitrate: H.264 in two passes lands near the target, the
@@ -946,7 +1216,9 @@ mod tests {
             video_bitrate: Some(400),
             ..ConvertOptions::default()
         };
-        let ticket = queue.submit(&input, &options).expect("submit");
+        let ticket = queue
+            .submit(&input, &options, &OutputTarget::default())
+            .expect("submit");
         assert!(ticket.command.contains("-pass 2"), "{}", ticket.command);
         let done = finish_of(&rx, ticket.id);
         assert_eq!(done.stage, JobStage::Done, "{done:?}");
@@ -1037,7 +1309,9 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_owned()
         };
 
-        let ticket = queue.submit(&hdr, &options).expect("submit");
+        let ticket = queue
+            .submit(&hdr, &options, &OutputTarget::default())
+            .expect("submit");
         let done = finish_of(&rx, ticket.id);
         assert_eq!(done.stage, JobStage::Done, "{done:?}");
         let out = ffmpeg.probe(&ticket.output).expect("probe H.265");
@@ -1046,7 +1320,9 @@ mod tests {
         assert!(out.has_audio());
         assert_eq!(streams(&ticket.output), "Main 10,hvc1,yuv420p10le");
 
-        let ticket = queue.submit(&sdr, &options).expect("submit SDR");
+        let ticket = queue
+            .submit(&sdr, &options, &OutputTarget::default())
+            .expect("submit SDR");
         let done = finish_of(&rx, ticket.id);
         assert_eq!(done.stage, JobStage::Done, "{done:?}");
         assert!(!ffmpeg.probe(&ticket.output).expect("probe").hdr);
@@ -1059,7 +1335,9 @@ mod tests {
                 hardware: true,
                 ..options.clone()
             };
-            let ticket = queue.submit(&hdr, &fast).expect("submit hardware");
+            let ticket = queue
+                .submit(&hdr, &fast, &OutputTarget::default())
+                .expect("submit hardware");
             assert!(
                 ticket.command.contains("hevc_videotoolbox"),
                 "{}",
@@ -1078,7 +1356,9 @@ mod tests {
             video_bitrate: Some(400),
             ..options
         };
-        let ticket = queue.submit(&sdr, &exact).expect("submit two-pass");
+        let ticket = queue
+            .submit(&sdr, &exact, &OutputTarget::default())
+            .expect("submit two-pass");
         let done = finish_of(&rx, ticket.id);
         assert_eq!(done.stage, JobStage::Done, "{done:?}");
         let mut left: Vec<_> = std::fs::read_dir(dir.path())
@@ -1102,7 +1382,7 @@ mod tests {
             format: OutputFormat::Webm,
             ..exact
         };
-        assert!(queue.submit(&sdr, &webm).is_err());
+        assert!(queue.submit(&sdr, &webm, &OutputTarget::default()).is_err());
     }
 
     /// Wait for the final event of `id`.
@@ -1163,7 +1443,7 @@ mod tests {
         let edited = shown.replace("-crf 24", "-crf 18");
 
         let ticket = queue
-            .submit_custom(&input, &options, &edited)
+            .submit_custom(&input, &options, &OutputTarget::default(), &edited)
             .expect("submit");
         assert_eq!(ticket.output, output);
         assert!(ticket.command.contains("-crf 18"), "{}", ticket.command);
@@ -1191,7 +1471,7 @@ mod tests {
             (format!("{edited}; rm -rf ~"), "only works in a shell"),
         ] {
             let err = queue
-                .submit_custom(&input, &options, &command)
+                .submit_custom(&input, &options, &OutputTarget::default(), &command)
                 .expect_err("refused");
             assert!(err.to_string().contains(expected), "{command}: {err}");
         }
@@ -1236,7 +1516,9 @@ mod tests {
             let _ = tx.send(event);
         });
         let run = |options: ConvertOptions| {
-            let ticket = queue.submit(&photo, &options).expect("submit");
+            let ticket = queue
+                .submit(&photo, &options, &OutputTarget::default())
+                .expect("submit");
             assert_eq!(
                 finish_of(&rx, ticket.id).stage,
                 JobStage::Done,
@@ -1348,7 +1630,9 @@ mod tests {
         };
 
         // JPEG → JXL losslessly, then back to the identical JPEG.
-        let ticket = queue.submit(&jpeg, &lossless).expect("submit");
+        let ticket = queue
+            .submit(&jpeg, &lossless, &OutputTarget::default())
+            .expect("submit");
         assert!(ticket.command.starts_with("cjxl "), "{}", ticket.command);
         assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
         let jxl = ffmpeg.probe(&ticket.output).expect("probe jxl");
@@ -1364,6 +1648,7 @@ mod tests {
                     format: OutputFormat::Jpg,
                     ..ConvertOptions::default()
                 },
+                &OutputTarget::default(),
             )
             .expect("submit");
         assert!(
@@ -1384,7 +1669,9 @@ mod tests {
             rotate: 90,
             ..ConvertOptions::default()
         };
-        let ticket = queue.submit(&jpeg, &turned).expect("submit");
+        let ticket = queue
+            .submit(&jpeg, &turned, &OutputTarget::default())
+            .expect("submit");
         assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
         let out = ffmpeg.probe(&ticket.output).expect("probe");
         assert_eq!((out.width, out.height), (Some(240), Some(320)));
@@ -1397,7 +1684,9 @@ mod tests {
             }),
             ..turned
         };
-        let ticket = queue.submit(&jpeg, &square).expect("submit");
+        let ticket = queue
+            .submit(&jpeg, &square, &OutputTarget::default())
+            .expect("submit");
         assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
         let out = ffmpeg.probe(&ticket.output).expect("probe");
         assert_eq!((out.width, out.height), (Some(240), Some(240)));
@@ -1409,7 +1698,9 @@ mod tests {
             max_size: Some(120),
             ..ConvertOptions::default()
         };
-        let ticket = queue.submit(&clip, &animated).expect("submit");
+        let ticket = queue
+            .submit(&clip, &animated, &OutputTarget::default())
+            .expect("submit");
         let done = finish_of(&rx, ticket.id);
         assert_eq!(done.stage, JobStage::Done, "{done:?}");
         let anim = ffmpeg.probe(&ticket.output).expect("probe animation");
@@ -1425,7 +1716,9 @@ mod tests {
             trim_end: Some(1.0),
             ..ConvertOptions::default()
         };
-        let ticket2 = queue.submit(&ticket.output, &gif).expect("submit");
+        let ticket2 = queue
+            .submit(&ticket.output, &gif, &OutputTarget::default())
+            .expect("submit");
         assert_eq!(finish_of(&rx, ticket2.id).stage, JobStage::Done);
         let back = ffmpeg.probe(&ticket2.output).expect("probe gif");
         assert_eq!(back.kind, crate::MediaKind::Video);
@@ -1494,7 +1787,9 @@ mod tests {
                 max_size,
                 ..ConvertOptions::default()
             };
-            let ticket = queue.submit(&heic, &options).expect("submit");
+            let ticket = queue
+                .submit(&heic, &options, &OutputTarget::default())
+                .expect("submit");
             assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
             let out = ffmpeg.probe(&ticket.output).expect("probe png");
             assert_eq!((out.width, out.height), (Some(size.0), Some(size.1)));
@@ -1544,8 +1839,12 @@ mod tests {
             path: out.clone(),
             by_kind: true,
         });
-        let first = queue.submit(&photo, &folder).expect("submit");
-        let second = queue.submit(&photo, &folder).expect("submit again");
+        let first = queue
+            .submit(&photo, &folder, &OutputTarget::default())
+            .expect("submit");
+        let second = queue
+            .submit(&photo, &folder, &OutputTarget::default())
+            .expect("submit again");
         assert_eq!(first.output, out.join("Pictures/photo.png"));
         assert_eq!(second.output, out.join("Pictures/photo 2.png"));
         assert_eq!(first.replaces, None);
@@ -1558,7 +1857,9 @@ mod tests {
 
         // Replacing with a new extension: photo.jpg becomes photo.png.
         let replace = png(Destination::ReplaceInput);
-        let ticket = queue.submit(&photo, &replace).expect("submit");
+        let ticket = queue
+            .submit(&photo, &replace, &OutputTarget::default())
+            .expect("submit");
         assert_eq!(ticket.output, dir.path().join("photo.png"));
         assert_eq!(ticket.replaces.as_ref(), Some(&photo));
         assert!(
@@ -1584,12 +1885,12 @@ mod tests {
         let before = std::fs::read(&clip).expect("read");
         let info = ffmpeg.probe(&clip).expect("probe");
         let shown = queue
-            .preview(&info, &replace)
+            .preview(&info, &replace, &OutputTarget::default())
             .expect("preview")
             .command_line();
         let broken = shown.replace("-c:v png", "-vf nosuchfilter -c:v png");
         let ticket = queue
-            .submit_custom(&clip, &replace, &broken)
+            .submit_custom(&clip, &replace, &OutputTarget::default(), &broken)
             .expect("submit");
         let failed = finish_of(&rx, ticket.id);
         assert_eq!(failed.stage, JobStage::Failed, "{failed:?}");
@@ -1616,10 +1917,16 @@ mod tests {
             format: OutputFormat::Gif,
             ..ConvertOptions::default()
         };
-        let ahead = queue.submit(&video, &slow).expect("submit");
-        let ticket = queue.submit(&clip, &replace).expect("submit");
+        let ahead = queue
+            .submit(&video, &slow, &OutputTarget::default())
+            .expect("submit");
+        let ticket = queue
+            .submit(&clip, &replace, &OutputTarget::default())
+            .expect("submit");
         assert!(
-            queue.submit(&clip, &replace).is_err(),
+            queue
+                .submit(&clip, &replace, &OutputTarget::default())
+                .is_err(),
             "one replacement per file at a time"
         );
         queue.cancel(ticket.id);
@@ -1636,7 +1943,12 @@ mod tests {
         };
         assert!(
             queue
-                .submit_sequence(&[&clip, &other], &gif, &SequenceOptions::default())
+                .submit_sequence(
+                    &[&clip, &other],
+                    &gif,
+                    &SequenceOptions::default(),
+                    &OutputTarget::default(),
+                )
                 .is_err()
         );
 
