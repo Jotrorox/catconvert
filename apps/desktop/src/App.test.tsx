@@ -13,6 +13,7 @@ vi.mock("./lib/api", () => ({
   previewFrame: vi.fn(async () => "blob:frame"),
   waveform: vi.fn(async () => "blob:wave"),
   previewCommand: vi.fn(async () => "ffmpeg -i clip.mov clip.mp4"),
+  saveFrame: vi.fn(),
   startJob: vi.fn(),
   cancelJob: vi.fn(async () => true),
   pickFiles: vi.fn(async () => []),
@@ -67,6 +68,7 @@ const VIDEO: MediaInfo = {
   videoCodec: "h264",
   audioCodec: "aac",
   reconstructsJpeg: false,
+  hdr: false,
 };
 
 const PHOTO: MediaInfo = {
@@ -160,6 +162,49 @@ describe("CatConvert", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show licenses" }));
     expect(await screen.findByText("ffmpeg 9.0.2 (GPL-2.0-or-later)")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Hide licenses" })).toBeInTheDocument();
+  });
+
+  it("steps through frames and saves the one on screen right away", async () => {
+    vi.mocked(api.saveFrame).mockResolvedValue({
+      output: "/clips/clip-frame-0m01s.png",
+      outputBytes: 2_100_000,
+    });
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "Rotate 90°" }));
+
+    // The preview opens at 1 s; at 30 fps that's frame 30. Net one frame on.
+    fireEvent.click(screen.getByRole("button", { name: "Next frame" }));
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    fireEvent.keyDown(window, { key: "," });
+    fireEvent.click(screen.getByRole("button", { name: "Save this frame" }));
+
+    expect(await screen.findByText("Saved frame")).toBeInTheDocument();
+    const [path, options, at] = vi.mocked(api.saveFrame).mock.calls[0] ?? [];
+    expect(path).toBe(VIDEO.path);
+    expect(options).toMatchObject({ rotate: 90, format: "mp4" });
+    expect(at).toBeCloseTo(31 / 30, 2);
+    expect(Math.ceil((at ?? 0) * 30)).toBe(31);
+    expect(api.startJob).not.toHaveBeenCalled();
+    expect(state.history[0]).toMatchObject({ name: "clip-frame-0m01s.png", format: "png" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Show in folder" }));
+    expect(api.revealInFolder).toHaveBeenCalledWith("/clips/clip-frame-0m01s.png");
+
+    // S saves too, except while typing in a field.
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Start" }), { key: "s" });
+    expect(api.saveFrame).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(window, { key: "s" });
+    await waitFor(() => expect(api.saveFrame).toHaveBeenCalledTimes(2));
+  });
+
+  it("says why a frame couldn't be saved", async () => {
+    vi.mocked(api.saveFrame).mockRejectedValue("no frame at that time");
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "Save this frame" }));
+    expect(
+      await screen.findByText("Couldn't save the frame: No frame at that time"),
+    ).toBeInTheDocument();
+    expect(state.history).toEqual([]);
   });
 
   it("edits a video and queues it with the chosen settings", async () => {

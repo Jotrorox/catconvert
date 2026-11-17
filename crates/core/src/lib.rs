@@ -23,10 +23,11 @@ mod jxl;
 mod media;
 
 pub use convert::{
-    ConvertOptions, JxlOptions, JxlSupport, OutputFormat, Plan, Step, Tool, output_path, plan,
+    ConvertOptions, JxlOptions, JxlSupport, OutputFormat, Plan, Step, Support, Tool,
+    frame_output_path, frame_plan, output_path, plan,
 };
 pub use error::{Error, Result};
 pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, RunProgress};
-pub use job::{JobId, JobProgress, JobStage, JobTicket, Queue};
+pub use job::{JobId, JobProgress, JobStage, JobTicket, Queue, SavedFrame};
 pub use jxl::{JxlTools, LIBJXL_ENV, has_jpeg_reconstruction, is_jxl_file};
 pub use media::{MediaInfo, MediaKind, probe};

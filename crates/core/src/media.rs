@@ -68,6 +68,10 @@ pub struct MediaInfo {
     /// original JPEG can be restored bit for bit.
     #[serde(default)]
     pub reconstructs_jpeg: bool,
+    /// The video uses an HDR transfer (PQ or HLG; iPhones record HLG by
+    /// default). Pictures and GIFs made from it are tone-mapped to SDR.
+    #[serde(default)]
+    pub hdr: bool,
 }
 
 impl MediaInfo {
@@ -123,6 +127,7 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         video_codec: None,
         audio_codec: None,
         reconstructs_jpeg: false,
+        hdr: false,
     })
 }
 
@@ -150,6 +155,7 @@ pub(crate) mod tests {
             video_codec: None,
             audio_codec: None,
             reconstructs_jpeg: false,
+            hdr: false,
         }
     }
 

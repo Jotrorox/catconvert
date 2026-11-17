@@ -509,7 +509,7 @@ export function applyProgress(event: JobProgress) {
   );
 
   if (event.stage === "done") {
-    const item: HistoryItem = {
+    remember({
       id: `${job.submittedAt}-${job.id}`,
       name: baseName(job.output),
       output: job.output,
@@ -518,17 +518,48 @@ export function applyProgress(event: JobProgress) {
       inputBytes: job.input.sizeBytes,
       outputBytes: event.outputBytes ?? 0,
       finishedAt: Date.now(),
-    };
-    setState("history", (items) => {
-      const next = [item, ...items].slice(0, HISTORY_LIMIT);
-      saveHistory(next);
-      return next;
     });
   } else if (event.stage === "failed" && state.screen !== "queue") {
     toast(`${job.name} didn't convert`, {
       tone: "error",
       action: { label: "See why", run: () => navigate("queue") },
     });
+  }
+}
+
+function remember(item: HistoryItem) {
+  setState("history", (items) => {
+    const next = [item, ...items].slice(0, HISTORY_LIMIT);
+    saveHistory(next);
+    return next;
+  });
+}
+
+/**
+ * Save the frame at `at` seconds of the open video as a PNG next to it, with
+ * the editor's turn, mirror and size. Runs right away rather than queueing.
+ */
+export async function saveFrame(at: number) {
+  const draft = state.draft;
+  if (!draft) return;
+  const { info } = draft;
+  try {
+    const saved = await api.saveFrame(info.path, { ...draft.options }, at);
+    remember({
+      id: `${Date.now()}-${saved.output}`,
+      name: baseName(saved.output),
+      output: saved.output,
+      format: "png",
+      kind: info.kind,
+      inputBytes: info.sizeBytes,
+      outputBytes: saved.outputBytes,
+      finishedAt: Date.now(),
+    });
+    toast("Saved frame", {
+      action: { label: "Show in folder", run: () => void reveal(saved.output) },
+    });
+  } catch (error) {
+    toast(`Couldn't save the frame: ${errorText(error)}`, { tone: "error" });
   }
 }
 

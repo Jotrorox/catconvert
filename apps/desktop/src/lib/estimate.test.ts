@@ -16,6 +16,7 @@ const clip: MediaInfo = {
   videoCodec: "h264",
   audioCodec: "aac",
   reconstructsJpeg: false,
+  hdr: false,
 };
 
 const photo: MediaInfo = {

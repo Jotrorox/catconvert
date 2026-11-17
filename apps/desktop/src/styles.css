@@ -1310,6 +1310,89 @@ code {
   -webkit-backdrop-filter: blur(6px);
 }
 
+/* Frame stepping and saving, bottom left of a video preview. */
+.frame-bar {
+  position: absolute;
+  bottom: 16px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.frame-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 34px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 999px;
+  background: rgb(59 34 38 / 0.72);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 700;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.frame-time {
+  min-width: 6ch;
+  padding: 0 7px;
+  text-align: center;
+}
+
+.frame-step {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  transition: background 160ms ease;
+}
+
+.frame-step:hover {
+  background: rgb(255 255 255 / 0.2);
+}
+
+.frame-save {
+  gap: 6px;
+  padding: 0 13px 0 11px;
+  transition:
+    transform 260ms var(--spring),
+    background 160ms ease;
+}
+
+.frame-save:not(:disabled):hover {
+  transform: translateY(-2px);
+  background: rgb(59 34 38 / 0.86);
+}
+
+.frame-save:not(:disabled):active {
+  transform: scale(0.94);
+}
+
+.frame-save[aria-busy="true"] {
+  cursor: progress;
+}
+
+/* Narrow previews keep the camera and drop the words. */
+@container (max-width: 440px) {
+  .frame-save {
+    justify-content: center;
+    width: 34px;
+    padding: 0;
+  }
+
+  .frame-save-label {
+    display: none;
+  }
+}
+
 .preview-badge.right {
   top: 12px;
   right: 12px;

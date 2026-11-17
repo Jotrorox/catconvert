@@ -36,6 +36,8 @@ export type MediaInfo = {
   audioCodec: string | null;
   /** JPEG XL only: a losslessly recompressed JPEG whose original can be restored. */
   reconstructsJpeg: boolean;
+  /** HDR video (PQ or HLG, as iPhones record); pictures made from it are tone-mapped. */
+  hdr: boolean;
 };
 
 export type OutputFormat =
@@ -108,6 +110,12 @@ export type JobProgress = {
   error: string | null;
 };
 
+/** A frame written by {@link saveFrame}. */
+export type SavedFrame = {
+  output: string;
+  outputBytes: number;
+};
+
 export type JobTicket = {
   id: JobId;
   output: string;
@@ -145,12 +153,16 @@ type Commands = {
   ffmpeg_status: { args: Record<string, never>; result: FfmpegStatus };
   relocate_ffmpeg: { args: Record<string, never>; result: FfmpegStatus };
   probe_file: { args: { path: string }; result: MediaInfo };
-  preview_frame: { args: { path: string; at: number; height: number }; result: ArrayBuffer };
+  preview_frame: {
+    args: { path: string; at: number; height: number; hdr: boolean };
+    result: ArrayBuffer;
+  };
   waveform: {
     args: { path: string; width: number; height: number; color: string };
     result: ArrayBuffer;
   };
   preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
+  save_frame: { args: { path: string; options: ConvertOptions; at: number }; result: SavedFrame };
   start_job: { args: { path: string; options: ConvertOptions }; result: JobTicket };
   cancel_job: { args: { id: JobId }; result: boolean };
   relaunch: { args: Record<string, never>; result: null };
@@ -213,9 +225,25 @@ export function probeFile(path: string): Promise<MediaInfo> {
   return command("probe_file", { path });
 }
 
-/** One JPEG frame as an object URL. Revoke it with `URL.revokeObjectURL` when done. */
-export async function previewFrame(path: string, at: number, height: number): Promise<string> {
-  return blobUrl(await command("preview_frame", { path, at, height }), "image/jpeg");
+/**
+ * One JPEG frame as an object URL, tone-mapped when `hdr` is set. Revoke it
+ * with `URL.revokeObjectURL` when done.
+ */
+export async function previewFrame(
+  path: string,
+  at: number,
+  height: number,
+  hdr = false,
+): Promise<string> {
+  return blobUrl(await command("preview_frame", { path, at, height, hdr }), "image/jpeg");
+}
+
+/**
+ * Save the frame at `at` seconds as a PNG next to the video, with the turn,
+ * mirror and size of `options`. Runs right away, not in the queue.
+ */
+export function saveFrame(path: string, options: ConvertOptions, at: number): Promise<SavedFrame> {
+  return command("save_frame", { path, options, at });
 }
 
 /** The audio waveform as a PNG object URL. */

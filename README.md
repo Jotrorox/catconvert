@@ -12,8 +12,10 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 > them, as in development, CatConvert uses an installed ffmpeg (found on `PATH`,
 > in Homebrew's folders, or via `CATCONVERT_FFMPEG`, which always wins).
 > You can drop files, trim, resize, rotate, mirror, change frame rate, quality and
-> format, drop the sound, and watch a serial queue with live progress. Results are
-> saved next to the original and never overwrite anything.
+> format, drop the sound, and watch a serial queue with live progress. Step through
+> a video frame by frame and save any frame as a PNG (←/→ and S). Results are
+> saved next to the original and never overwrite anything. HDR video, which
+> iPhones record by default, is tone-mapped when it becomes a picture or GIF.
 >
 > JPEG XL is fully supported, still and animated, with libjxl's tools (bundled in
 > releases; otherwise `brew install jpeg-xl`, found like ffmpeg or via
