@@ -5,8 +5,8 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use catconvert_core::{
-    ConvertOptions, Crop, Direction, Ffmpeg, Fit, JxlOptions, Metadata, OutputFormat, Plan,
-    RunOutcome, SequenceOptions, SoundOptions, VideoCodec,
+    AudioRate, ConvertOptions, Crop, Direction, Ffmpeg, Fit, JxlOptions, Metadata, OutputFormat,
+    Plan, QualitySummary, RunOutcome, SequenceOptions, SoundOptions, VIDEO_KBPS, VideoCodec,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -67,6 +67,11 @@ enum Command {
         /// AV1 makes smaller files and keeps HDR, but is slower. MOV is H.264 only.
         #[arg(long, value_enum)]
         codec: Option<Codec>,
+        /// MP4, MOV, MKV and WebM: aim for this average video bitrate instead
+        /// of a quality level, in kbit/s or with a unit (e.g. 800k, 4M). H.264
+        /// and VP9 are encoded in two passes.
+        #[arg(long, value_name = "RATE", value_parser = parse_bitrate)]
+        bitrate: Option<u32>,
         /// Drop the audio track.
         #[arg(long)]
         mute: bool,
@@ -292,7 +297,66 @@ fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<()
     let output = catconvert_core::output_path(&info.path, options.format, |_| false);
     let plan = catconvert_core::plan(&info, options, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
+    if let Some(line) = describe_quality(catconvert_core::quality_summary(&info, options)) {
+        eprintln!("{line}");
+    }
     run(&ffmpeg, &plan, dry_run)
+}
+
+/// The quality setting in numbers, e.g. `video H.264 CRF 24, audio 128 kbps`.
+fn describe_quality(summary: QualitySummary) -> Option<String> {
+    let video = summary.video.map(|rate| match (rate.kbps, rate.crf) {
+        (Some(kbps), _) if rate.passes > 1 => {
+            format!(
+                "video {} {kbps} kbps, {} passes",
+                rate.codec.label(),
+                rate.passes
+            )
+        }
+        (Some(kbps), _) => format!("video {} {kbps} kbps average", rate.codec.label()),
+        (None, crf) => format!(
+            "video {} CRF {}",
+            rate.codec.label(),
+            crf.unwrap_or_default()
+        ),
+    });
+    let audio = summary.audio.map(|rate| match rate {
+        AudioRate::Bitrate { kbps } => format!("audio {kbps} kbps"),
+        AudioRate::Vbr { level, kbps } => format!("audio VBR V{level} (about {kbps} kbps)"),
+        AudioRate::Lossless => "audio lossless".to_owned(),
+        AudioRate::Pcm { kbps: Some(kbps) } => format!("audio PCM {kbps} kbps"),
+        AudioRate::Pcm { kbps: None } => "audio PCM".to_owned(),
+    });
+    let parts: Vec<_> = video.into_iter().chain(audio).collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// A bitrate in kbit/s from `800`, `800k`, `4M` or `4.5M`.
+fn parse_bitrate(text: &str) -> Result<u32, String> {
+    let lower = text.trim().to_ascii_lowercase();
+    let lower = lower.trim_end_matches("bps").trim_end_matches("bit/s");
+    let (number, scale) = match lower.strip_suffix('m') {
+        Some(number) => (number, 1000.0),
+        None => (lower.strip_suffix('k').unwrap_or(lower), 1.0),
+    };
+    let kbps = number
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|n| (n * scale).round())
+        .filter(|kbps| kbps.is_finite() && *kbps >= 0.0 && *kbps <= f64::from(u32::MAX))
+        .ok_or_else(|| format!("expected a bitrate like 800k or 4M, got `{text}`"))?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let kbps = kbps as u32;
+    if VIDEO_KBPS.contains(&kbps) {
+        Ok(kbps)
+    } else {
+        Err(format!(
+            "the bitrate must be between {}k and {}M",
+            VIDEO_KBPS.start(),
+            VIDEO_KBPS.end() / 1000
+        ))
+    }
 }
 
 fn animate(
@@ -386,6 +450,7 @@ fn main() -> ExitCode {
             crop,
             quality,
             codec,
+            bitrate,
             mute,
             normalize,
             fade_in,
@@ -414,6 +479,7 @@ fn main() -> ExitCode {
                 quality,
                 keep_audio: !mute,
                 video_codec: codec.map(Into::into),
+                video_bitrate: bitrate,
                 jxl: JxlOptions {
                     lossless,
                     effort,
@@ -640,6 +706,77 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_bitrates() {
+        assert_eq!(parse_bitrate("800"), Ok(800));
+        assert_eq!(parse_bitrate("800k"), Ok(800));
+        assert_eq!(parse_bitrate("4M"), Ok(4000));
+        assert_eq!(parse_bitrate("4.5m"), Ok(4500));
+        assert_eq!(parse_bitrate("2500kbps"), Ok(2500));
+        for bad in ["", "fast", "50k", "-4M", "300M"] {
+            assert!(parse_bitrate(bad).is_err(), "{bad}");
+        }
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "convert",
+            "a",
+            "--to",
+            "mp4",
+            "--bitrate",
+            "4M",
+        ])
+        .expect("parse");
+        let Command::Convert { bitrate, .. } = cli.command else {
+            panic!("expected convert");
+        };
+        assert_eq!(bitrate, Some(4000));
+    }
+
+    #[test]
+    fn describes_quality_in_numbers() {
+        use catconvert_core::VideoRate;
+
+        let crf = VideoRate {
+            codec: VideoCodec::H264,
+            crf: Some(24),
+            kbps: None,
+            passes: 1,
+        };
+        let summary = QualitySummary {
+            audio: Some(AudioRate::Bitrate { kbps: 128 }),
+            video: Some(crf),
+        };
+        assert_eq!(
+            describe_quality(summary).as_deref(),
+            Some("video H.264 CRF 24, audio 128 kbps")
+        );
+        let exact = QualitySummary {
+            audio: None,
+            video: Some(VideoRate {
+                crf: None,
+                kbps: Some(4000),
+                passes: 2,
+                ..crf
+            }),
+        };
+        assert_eq!(
+            describe_quality(exact).as_deref(),
+            Some("video H.264 4000 kbps, 2 passes")
+        );
+        let mp3 = QualitySummary {
+            audio: Some(AudioRate::Vbr {
+                level: 2,
+                kbps: 190,
+            }),
+            video: None,
+        };
+        assert_eq!(
+            describe_quality(mp3).as_deref(),
+            Some("audio VBR V2 (about 190 kbps)")
+        );
+        assert_eq!(describe_quality(QualitySummary::default()), None);
     }
 
     #[test]
