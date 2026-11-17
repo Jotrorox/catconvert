@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="" width="96" height="96">
+
 # CatConvert
 
 An offline photo, video and audio file converter. Nothing leaves your device.
