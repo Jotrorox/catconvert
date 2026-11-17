@@ -17,6 +17,8 @@ import { describeEstimate } from "../lib/estimate";
 import { baseName, formatBytes, formatClock, formatSpan, parseClock } from "../lib/format";
 import {
   autoLimits,
+  FADE_CHOICES,
+  fadeSpans,
   formatKind,
   fpsChoices,
   groupsFor,
@@ -24,6 +26,7 @@ import {
   isLossless,
   JXL_EFFORTS,
   label,
+  outputHasSound,
   QUALITY_STEPS,
   qualityStep,
   repacksJpeg,
@@ -206,6 +209,12 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   const lossless = () => isLossless(options()) || restoring();
   const setJxl = (patch: Partial<ConvertOptions["jxl"]>) =>
     updateOptions({ jxl: { ...options().jxl, ...patch } });
+  const hasSound = () => outputHasSound(info(), options());
+  /** Length of what gets written, when known. */
+  const keptLength = () => (timed() ? trimEnd() - trimStart() : null);
+  const fades = () => fadeSpans(options().sound, keptLength());
+  const setSound = (patch: Partial<ConvertOptions["sound"]>) =>
+    updateOptions({ sound: { ...options().sound, ...patch } });
   const unavailableReason = (format: ConvertOptions["format"]) =>
     format === "jxl"
       ? "Install libjxl (brew install jpeg-xl) or an ffmpeg with libjxl to write JXL"
@@ -216,7 +225,16 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   const summary = createMemo(() => {
     const o = options();
     const items: {
-      icon: "scissors" | "image" | "rotate" | "flip" | "music" | "clock" | "sparkle";
+      icon:
+        | "scissors"
+        | "image"
+        | "rotate"
+        | "flip"
+        | "music"
+        | "clock"
+        | "sparkle"
+        | "sliders"
+        | "fade";
       text: string;
     }[] = [];
     if (timed() && trimmed()) {
@@ -231,6 +249,12 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       if (outKind() === "video" && fps !== null) items.push({ icon: "clock", text: `${fps} fps` });
     }
     if (canKeepAudio() && !o.keepAudio) items.push({ icon: "music", text: "No sound" });
+    if (hasSound()) {
+      if (o.sound.normalize) items.push({ icon: "sliders", text: "Even loudness" });
+      const { fadeIn, fadeOut } = fades();
+      if (fadeIn > 0) items.push({ icon: "fade", text: `Fades in ${formatSpan(fadeIn)}` });
+      if (fadeOut > 0) items.push({ icon: "fade", text: `Fades out ${formatSpan(fadeOut)}` });
+    }
     if (isJxl() && info().kind === "video") items.push({ icon: "sparkle", text: "Animated" });
     if (isJxl() && o.jxl.lossless) items.push({ icon: "sparkle", text: "Lossless" });
     return items;
@@ -392,6 +416,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 start={trimStart()}
                 end={trimEnd()}
                 playhead={info().kind === "video" ? scrub() : null}
+                fades={hasSound() ? fades() : undefined}
                 onChange={setTrim}
                 onScrub={setScrub}
               >
@@ -600,6 +625,71 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 onClick={() => updateOptions({ keepAudio: !options().keepAudio })}
               />
             </div>
+          </Show>
+
+          <Show when={hasSound()}>
+            <section class="sound-settings" aria-labelledby="sound-heading">
+              <h2 class="label-strong sound-heading" id="sound-heading">
+                <Icon name="music" size={16} /> Sound
+              </h2>
+              <div class="toggle-row">
+                <div>
+                  <span class="toggle-title" id="sound-normalize">
+                    Even out loudness
+                  </span>
+                  <span class="item-meta">A steady, comfortable volume, like streaming apps</span>
+                </div>
+                <button
+                  type="button"
+                  class="switch"
+                  role="switch"
+                  aria-checked={options().sound.normalize}
+                  aria-labelledby="sound-normalize"
+                  onClick={() => setSound({ normalize: !options().sound.normalize })}
+                />
+              </div>
+              <div class="two-col">
+                <fieldset class="field">
+                  <legend class="field-label">Fade in</legend>
+                  <div class="format-chips">
+                    <For each={FADE_CHOICES}>
+                      {(secs) => (
+                        <button
+                          type="button"
+                          class="format-chip"
+                          aria-pressed={options().sound.fadeIn === secs}
+                          onClick={() => setSound({ fadeIn: secs })}
+                        >
+                          {secs === 0 ? "Off" : `${secs} s`}
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </fieldset>
+                <Show when={keptLength() !== null}>
+                  <fieldset class="field">
+                    <legend class="field-label">Fade out</legend>
+                    <div class="format-chips">
+                      <For each={FADE_CHOICES}>
+                        {(secs) => (
+                          <button
+                            type="button"
+                            class="format-chip"
+                            aria-pressed={options().sound.fadeOut === secs}
+                            onClick={() => setSound({ fadeOut: secs })}
+                          >
+                            {secs === 0 ? "Off" : `${secs} s`}
+                          </button>
+                        )}
+                      </For>
+                    </div>
+                  </fieldset>
+                </Show>
+              </div>
+              <Show when={outKind() === "video" && (fades().fadeIn > 0 || fades().fadeOut > 0)}>
+                <span class="item-meta">The picture fades from and to black with the sound.</span>
+              </Show>
+            </section>
           </Show>
 
           <div class="toggle-row">

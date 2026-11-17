@@ -148,8 +148,32 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     quality: 60,
     keepAudio: true,
     jxl: { lossless: false, effort: 7, progressive: false },
+    sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
     keepMetadata: true,
   };
+}
+
+/** Fade lengths offered in the Sound section, in seconds (0 is off). */
+export const FADE_CHOICES = [0, 1, 3] as const;
+
+/** Whether the output carries sound, so the Sound settings apply. */
+export function outputHasSound(info: MediaInfo, options: ConvertOptions): boolean {
+  if (info.audioCodec === null) return false;
+  const out = formatKind(options.format, info.kind);
+  if (out === "audio") return true;
+  return out === "video" && !isAnimatedImage(options.format, info.kind) && options.keepAudio;
+}
+
+/**
+ * How long the fades run over a kept range of `length` seconds, clipped to it
+ * as the planner does. A fade-out needs a known length.
+ */
+export function fadeSpans(
+  sound: ConvertOptions["sound"],
+  length: number | null,
+): { fadeIn: number; fadeOut: number } {
+  const clip = (secs: number) => Math.max(0, length === null ? secs : Math.min(secs, length));
+  return { fadeIn: clip(sound.fadeIn), fadeOut: length === null ? 0 : clip(sound.fadeOut) };
 }
 
 export const QUALITY_STEPS = ["Tiny file", "Balanced", "Crisp"] as const;
@@ -269,7 +293,13 @@ export function fitOptions(
 ): ConvertOptions | null {
   if (!offers(info.kind, options.format) || !available(options.format)) return null;
   if (formatKind(options.format, info.kind) === "audio" && info.audioCodec === null) return null;
-  const fitted = { ...options, jxl: { ...options.jxl }, trimStart: null, trimEnd: null };
+  const fitted = {
+    ...options,
+    jxl: { ...options.jxl },
+    sound: { ...options.sound },
+    trimStart: null,
+    trimEnd: null,
+  };
   // Drop choices that would upscale or speed up this particular file.
   if (fitted.maxSize !== null && !sizeChoices(info).includes(fitted.maxSize)) {
     fitted.maxSize = null;
@@ -331,6 +361,10 @@ export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
   const video = out === "video" && !isAnimatedImage(options.format, info.kind);
   if (video && !options.keepAudio) parts.push("no sound");
   parts.push(isLossless(options) ? "lossless" : qualityStep(options.quality).toLowerCase());
+  if (outputHasSound(info, options)) {
+    if (options.sound.normalize) parts.push("even loudness");
+    if (options.sound.fadeIn > 0 || options.sound.fadeOut > 0) parts.push("fades");
+  }
   if (!options.keepMetadata) parts.push("no metadata");
   const text = parts.join(" · ");
   return text.charAt(0).toUpperCase() + text.slice(1);
@@ -356,7 +390,7 @@ export function recipeFrom(
     detail: recipeDetail(info, options),
     route: `${accepts.length > 1 ? "ANY" : KIND_WORD[info.kind]} → ${label(options.format)}`,
     tone: KIND_TONE[out],
-    options: { ...kept, jxl: { ...kept.jxl } },
+    options: { ...kept, jxl: { ...kept.jxl }, sound: { ...kept.sound } },
     accepts,
   };
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use catconvert_core::{ConvertOptions, Ffmpeg, JxlOptions, OutputFormat, RunOutcome};
+use catconvert_core::{ConvertOptions, Ffmpeg, JxlOptions, OutputFormat, RunOutcome, SoundOptions};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -60,6 +60,15 @@ enum Command {
         /// Drop the audio track.
         #[arg(long)]
         mute: bool,
+        /// Even out loudness (to -16 LUFS).
+        #[arg(long)]
+        normalize: bool,
+        /// Fade in over this many seconds (video fades from black too).
+        #[arg(long, default_value_t = 0.0)]
+        fade_in: f64,
+        /// Fade out over this many seconds (video fades to black too).
+        #[arg(long, default_value_t = 0.0)]
+        fade_out: f64,
         /// JPEG XL: mathematically lossless (an unedited JPEG is recompressed
         /// losslessly and can be restored bit for bit).
         #[arg(long)]
@@ -191,6 +200,9 @@ fn main() -> ExitCode {
             flip,
             quality,
             mute,
+            normalize,
+            fade_in,
+            fade_out,
             lossless,
             effort,
             progressive,
@@ -211,6 +223,11 @@ fn main() -> ExitCode {
                     lossless,
                     effort,
                     progressive,
+                },
+                sound: SoundOptions {
+                    normalize,
+                    fade_in,
+                    fade_out,
                 },
                 keep_metadata: !strip_metadata,
             };

@@ -157,6 +157,25 @@ impl Default for JxlOptions {
     }
 }
 
+/// Clean-up for the sound. Only applies when the output has sound; video
+/// fades the picture along with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SoundOptions {
+    /// Even out loudness to -16 LUFS with ffmpeg's single-pass `loudnorm`.
+    pub normalize: bool,
+    /// Seconds to fade in from silence (and black) at the start; 0 is off.
+    pub fade_in: f64,
+    /// Seconds to fade out to silence (and black) at the end; 0 is off.
+    pub fade_out: f64,
+}
+
+/// Target loudness of [`SoundOptions::normalize`]: -16 LUFS integrated,
+/// -1.5 dBTP peak ceiling, loudness range 11 LU.
+const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
+/// Sample rate after `loudnorm` when the source rate is unknown.
+const FALLBACK_SAMPLE_RATE: u32 = 48_000;
+
 /// The edits and encoding choices for one conversion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -181,6 +200,8 @@ pub struct ConvertOptions {
     pub keep_audio: bool,
     /// JPEG XL settings, ignored for other formats.
     pub jxl: JxlOptions,
+    /// Loudness and fades, ignored when the output has no sound.
+    pub sound: SoundOptions,
     /// Carry over dates, location, titles and other tags where the output
     /// format can hold them. Off strips them.
     pub keep_metadata: bool,
@@ -199,6 +220,7 @@ impl Default for ConvertOptions {
             quality: 60,
             keep_audio: true,
             jxl: JxlOptions::default(),
+            sound: SoundOptions::default(),
             keep_metadata: true,
         }
     }
@@ -366,6 +388,10 @@ pub fn plan(
         return Err(Error::unsupported(
             "rotation must be 0, 90, 180 or 270 degrees",
         ));
+    }
+    let fades = [options.sound.fade_in, options.sound.fade_out];
+    if fades.iter().any(|f| !f.is_finite() || *f < 0.0) {
+        return Err(Error::unsupported("fade lengths must be positive numbers"));
     }
     if output == input.path {
         return Err(Error::unsupported(
@@ -546,6 +572,13 @@ fn ffmpeg_step(
     if timed_input && start > 0.0 && !seek_input {
         args.extend(["-ss".into(), format_secs(start).into()]);
     }
+    // Where the kept range starts on the filters' clock: 0 after an input
+    // seek, the trim start after an output seek.
+    let t0 = if timed_input && !seek_input {
+        start
+    } else {
+        0.0
+    };
     let duration_secs = if timed_input && out_kind != MediaKind::Image {
         let end = end.or(input.duration_secs);
         if let Some(end) = end.filter(|_| options.trim_end.is_some()) {
@@ -586,9 +619,19 @@ fn ffmpeg_step(
             if keep_audio {
                 push(&["-map", "0:a:0"]);
             }
-            let filters = video_filters(input, options, None, true);
+            let mut filters = video_filters(input, options, None, true);
+            if keep_audio {
+                // The sound's fades take the picture along, from and to black.
+                filters.extend(fades("fade", options.sound, t0, duration_secs));
+            }
             if !filters.is_empty() {
                 push(&["-vf", &filters.join(",")]);
+            }
+            if keep_audio {
+                let audio = audio_filters(input, options.sound, t0, duration_secs);
+                if !audio.is_empty() {
+                    push(&["-af", &audio.join(",")]);
+                }
             }
             if format == OutputFormat::Webm {
                 let crf = lerp(q, 48.0, 28.0).to_string();
@@ -655,6 +698,10 @@ fn ffmpeg_step(
             _,
         ) => {
             push(&["-map", "0:a:0", "-vn", "-sn", "-dn"]);
+            let audio = audio_filters(input, options.sound, t0, duration_secs);
+            if !audio.is_empty() {
+                push(&["-af", &audio.join(",")]);
+            }
             match format {
                 OutputFormat::Mp3 => {
                     let vbr = lerp(q, 7.0, 0.0).to_string();
@@ -726,6 +773,57 @@ fn ffmpeg_step(
         duration_secs,
         weight,
     }
+}
+
+/// Loudness, fade and resampling filters for the sound. `t0` is where the
+/// kept range starts on the filters' clock and `length` how long it is.
+fn audio_filters(
+    input: &MediaInfo,
+    sound: SoundOptions,
+    t0: f64,
+    length: Option<f64>,
+) -> Vec<String> {
+    let mut filters = Vec::new();
+    // Normalize first: fading afterwards keeps loudnorm from lifting the fades.
+    if sound.normalize {
+        filters.push(LOUDNORM.to_owned());
+    }
+    filters.extend(fades("afade", sound, t0, length));
+    if sound.normalize {
+        // loudnorm resamples to 192 kHz and passes that on. Asking for the
+        // source rate in the graph rather than with -ar lets ffmpeg settle on
+        // the nearest rate the encoder takes (Opus only does 48 kHz).
+        let rate = input.sample_rate.unwrap_or(FALLBACK_SAMPLE_RATE);
+        filters.push(format!("aresample={rate}"));
+    }
+    filters
+}
+
+/// Fade-in and fade-out with ffmpeg's `fade` (picture) or `afade` (sound)
+/// filter. A fade-out needs the output's `length`, and neither fade runs
+/// longer than the clip.
+fn fades(filter: &str, sound: SoundOptions, t0: f64, length: Option<f64>) -> Vec<String> {
+    let mut filters = Vec::new();
+    let fade_in = length.map_or(sound.fade_in, |l| sound.fade_in.min(l));
+    if fade_in > 0.0 {
+        let st = if t0 > 0.0 {
+            format!(":st={}", format_secs(t0))
+        } else {
+            String::new()
+        };
+        filters.push(format!("{filter}=t=in{st}:d={}", format_secs(fade_in)));
+    }
+    if let Some(length) = length {
+        let fade_out = sound.fade_out.min(length);
+        if fade_out > 0.0 {
+            filters.push(format!(
+                "{filter}=t=out:st={}:d={}",
+                format_secs(t0 + length - fade_out),
+                format_secs(fade_out)
+            ));
+        }
+    }
+    filters
 }
 
 /// Distance and effort for ffmpeg's libjxl encoders.
@@ -1015,6 +1113,7 @@ mod tests {
             fps: Some(30.0),
             video_codec: Some("h264".into()),
             audio_codec: Some("aac".into()),
+            sample_rate: Some(44_100),
             reconstructs_jpeg: false,
         }
     }
@@ -1298,6 +1397,117 @@ mod tests {
         assert_eq!(options.trim_start, Some(1.5));
         assert_eq!(options.quality, 60);
         assert!(options.keep_audio);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sound clean-up
+    // -----------------------------------------------------------------------
+
+    fn sound(normalize: bool, fade_in: f64, fade_out: f64) -> SoundOptions {
+        SoundOptions {
+            normalize,
+            fade_in,
+            fade_out,
+        }
+    }
+
+    #[test]
+    fn trimmed_song_is_normalized_and_faded() {
+        let options = ConvertOptions {
+            format: OutputFormat::Mp3,
+            trim_start: Some(2.0),
+            trim_end: Some(12.0),
+            quality: 100,
+            sound: sound(true, 1.0, 3.0),
+            ..ConvertOptions::default()
+        };
+        assert_eq!(
+            command(&video("talk.mov"), &options, "/clips/talk.mp3"),
+            "ffmpeg -ss 2 -i /clips/talk.mov -t 10 -map 0:a:0 -vn -sn -dn \
+             -af loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=1,afade=t=out:st=7:d=3,aresample=44100 \
+             -c:a libmp3lame -q:a 0 /clips/talk.mp3"
+        );
+    }
+
+    #[test]
+    fn video_fades_picture_and_sound_together() {
+        let options = ConvertOptions {
+            sound: sound(false, 1.0, 1.0),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("garden.mov"), &options, "/clips/garden.mp4");
+        assert!(
+            cmd.contains(
+                "-vf fade=t=in:d=1,fade=t=out:st=41:d=1 -af afade=t=in:d=1,afade=t=out:st=41:d=1 "
+            ),
+            "{cmd}"
+        );
+
+        // Without sound the section is hidden, so nothing fades.
+        let muted = ConvertOptions {
+            keep_audio: false,
+            ..options
+        };
+        let cmd = command(&video("garden.mov"), &muted, "/clips/garden.mp4");
+        assert!(!cmd.contains("fade"), "{cmd}");
+        let gif = ConvertOptions {
+            format: OutputFormat::Gif,
+            ..options
+        };
+        let cmd = command(&video("garden.mov"), &gif, "/clips/garden.gif");
+        assert!(!cmd.contains("fade="), "{cmd}");
+    }
+
+    #[test]
+    fn fades_fit_the_clip_and_need_a_known_length() {
+        let options = ConvertOptions {
+            format: OutputFormat::Ogg,
+            trim_end: Some(2.0),
+            sound: sound(false, 3.0, 3.0),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("short.mov"), &options, "/clips/short.ogg");
+        assert!(
+            cmd.contains("-af afade=t=in:d=2,afade=t=out:st=0:d=2 "),
+            "{cmd}"
+        );
+
+        // Unknown length: fade in only, and the default 48 kHz after loudnorm.
+        let input = MediaInfo {
+            duration_secs: None,
+            sample_rate: None,
+            ..video("stream.mkv")
+        };
+        let options = ConvertOptions {
+            format: OutputFormat::Flac,
+            sound: sound(true, 1.0, 3.0),
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&input, &options, "/clips/stream.flac");
+        assert!(
+            cmd.contains("-af loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=1,aresample=48000 "),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_fades_and_reads_old_recipes() {
+        let options = ConvertOptions {
+            format: OutputFormat::Mp3,
+            sound: sound(false, -1.0, 0.0),
+            ..ConvertOptions::default()
+        };
+        let err = plan_err(&video("a.mov"), &options, JxlSupport::default());
+        assert!(err.contains("fade"), "{err}");
+
+        let old: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp3", "keepAudio": true}))
+                .expect("parse");
+        assert_eq!(old.sound, SoundOptions::default());
+        let partial: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp3", "sound": {"fadeIn": 1}}))
+                .expect("parse");
+        assert_eq!(partial.sound, sound(false, 1.0, 0.0));
     }
 
     // -----------------------------------------------------------------------

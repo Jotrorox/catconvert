@@ -1492,6 +1492,26 @@ code {
   border-radius: 0 12px 12px 0;
 }
 
+.trim-fades {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.fade-shade {
+  fill: rgb(255 246 243 / 0.62);
+}
+
+.fade-line {
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+}
+
 .trim-range {
   position: absolute;
   top: -3px;
@@ -1800,6 +1820,33 @@ button.format-chip:not(:disabled):active {
 
 .jxl-settings .item-meta {
   display: block;
+}
+
+/* Sound */
+
+.sound-settings {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+  border-radius: 16px;
+  background: var(--yellow-bg);
+}
+
+.sound-settings .format-chips {
+  --tone-bg: var(--surface);
+  --tone-ink: var(--yellow-ink);
+}
+
+.sound-settings .item-meta {
+  display: block;
+}
+
+.sound-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--yellow-ink);
 }
 
 /* Toggle */

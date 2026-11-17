@@ -93,6 +93,7 @@ const ICONS = {
       <path d="M4.5 19.5V15H9" />
     </>
   ),
+  fade: () => <path d="M3 18.5 9 6h6l6 12.5" />,
   "arrow-right": () => <path d="M4.5 12h15M13.5 6l6 6-6 6" />,
   skip: () => <path d="m6 6 7 6-7 6ZM17.5 6v12" />,
   alert: () => (

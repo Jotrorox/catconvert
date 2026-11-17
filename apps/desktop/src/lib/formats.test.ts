@@ -4,10 +4,13 @@ import {
   DEFAULTS,
   defaultFormat,
   defaultOptions,
+  fadeSpans,
   fitOptions,
   fpsChoices,
   initialOptions,
+  outputHasSound,
   RECIPES,
+  recipeDetail,
   recipeFrom,
   sizeChoices,
 } from "./formats";
@@ -24,12 +27,44 @@ const clip: MediaInfo = {
   fps: 24,
   videoCodec: "h264",
   audioCodec: "aac",
+  sampleRate: 48000,
   reconstructsJpeg: false,
 };
 
 const all = () => true;
 
 describe("formats", () => {
+  it("knows when the output carries sound", () => {
+    expect(outputHasSound(clip, defaultOptions("mp4"))).toBe(true);
+    expect(outputHasSound(clip, defaultOptions("mp3"))).toBe(true);
+    expect(outputHasSound(clip, { ...defaultOptions("mp4"), keepAudio: false })).toBe(false);
+    expect(outputHasSound(clip, defaultOptions("gif"))).toBe(false);
+    expect(outputHasSound(clip, defaultOptions("jxl"))).toBe(false);
+    expect(outputHasSound({ ...clip, audioCodec: null }, defaultOptions("mp4"))).toBe(false);
+  });
+
+  it("clips fades to the kept length like the planner", () => {
+    const sound = { normalize: false, fadeIn: 3, fadeOut: 3 };
+    expect(fadeSpans(sound, 10)).toEqual({ fadeIn: 3, fadeOut: 3 });
+    expect(fadeSpans(sound, 2)).toEqual({ fadeIn: 2, fadeOut: 2 });
+    // A fade-out needs to know where the end is.
+    expect(fadeSpans(sound, null)).toEqual({ fadeIn: 3, fadeOut: 0 });
+  });
+
+  it("describes and keeps sound clean-up in recipes", () => {
+    const options = {
+      ...defaultOptions("mp3"),
+      sound: { normalize: true, fadeIn: 1, fadeOut: 0 },
+    };
+    expect(recipeDetail(clip, options)).toBe("Balanced · even loudness · fades");
+    // Muted video ignores the sound settings.
+    const muted = { ...defaultOptions("mp4"), keepAudio: false, sound: options.sound };
+    expect(recipeDetail(clip, muted)).toBe("No sound · balanced");
+    const recipe = recipeFrom("r", "Podcast", clip, options);
+    expect(recipe.options.sound).toEqual(options.sound);
+    expect(recipe.options.sound).not.toBe(options.sound);
+  });
+
   it("only offers downscales and slower frame rates", () => {
     expect(sizeChoices(clip)).toEqual([240]);
     expect(fpsChoices(clip)).toEqual([15, 10]);

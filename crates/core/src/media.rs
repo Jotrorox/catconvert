@@ -64,6 +64,9 @@ pub struct MediaInfo {
     /// Codec name of the primary audio stream, e.g. `"aac"`.
     #[serde(default)]
     pub audio_codec: Option<String>,
+    /// Sample rate of the primary audio stream in Hz, e.g. `48000`.
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
     /// JPEG XL only: the file is a losslessly recompressed JPEG, so the
     /// original JPEG can be restored bit for bit.
     #[serde(default)]
@@ -122,6 +125,7 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         fps: None,
         video_codec: None,
         audio_codec: None,
+        sample_rate: None,
         reconstructs_jpeg: false,
     })
 }
@@ -149,6 +153,7 @@ pub(crate) mod tests {
             fps: None,
             video_codec: None,
             audio_codec: None,
+            sample_rate: None,
             reconstructs_jpeg: false,
         }
     }

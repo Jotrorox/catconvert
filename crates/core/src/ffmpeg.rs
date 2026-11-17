@@ -891,6 +891,14 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
         }
     }
     info.audio_codec = audio.and_then(|a| a["codec_name"].as_str().map(str::to_owned));
+    info.sample_rate = audio
+        .and_then(|a| as_f64(&a["sample_rate"]))
+        .filter(|rate| rate.is_finite() && *rate >= 1.0 && *rate <= f64::from(u32::MAX))
+        .map(|rate| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let rate = rate.round() as u32;
+            rate
+        });
     info.duration_secs = if info.kind == MediaKind::Image {
         None
     } else {
@@ -1011,6 +1019,7 @@ mod tests {
             fps: None,
             video_codec: None,
             audio_codec: None,
+            sample_rate: None,
             reconstructs_jpeg: false,
         }
     }
@@ -1059,7 +1068,7 @@ mod tests {
                     {"codec_type": "video", "codec_name": "hevc", "width": 1920, "height": 1080,
                      "avg_frame_rate": "30000/1001", "side_data_list": [{"rotation": -90}],
                      "disposition": {"attached_pic": 0}},
-                    {"codec_type": "audio", "codec_name": "aac"}
+                    {"codec_type": "audio", "codec_name": "aac", "sample_rate": "48000"}
                 ],
                 "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "42.5"}
             }),
@@ -1070,6 +1079,7 @@ mod tests {
         assert!((info.fps.unwrap() - 29.97).abs() < 0.01);
         assert_eq!(info.video_codec.as_deref(), Some("hevc"));
         assert!(info.has_audio());
+        assert_eq!(info.sample_rate, Some(48_000));
     }
 
     #[test]
