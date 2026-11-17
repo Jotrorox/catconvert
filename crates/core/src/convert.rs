@@ -445,6 +445,7 @@ pub fn plan(
         source.path = decoded.clone();
         source.extension = Some(ext.into());
         source.video_codec = Some(ext.into());
+        source.tile_grid = None;
         scratch.push(decoded);
     }
 
@@ -563,33 +564,22 @@ fn ffmpeg_step(
         (OutputFormat::Jxl, Sink::Frames { animated }) => {
             let filters = animation_filters(input, options);
             if animated {
-                push(&["-map", "0:v:0"]);
-                if !filters.is_empty() {
-                    push(&["-vf", &filters.join(",")]);
-                }
+                push_video(&mut push, input, &[], &filters);
                 // Fast zlib: this file only lives until cjxl has read it.
                 push(&["-c:v", "apng", "-compression_level", "1", "-plays", "0"]);
                 push(&["-an", "-sn", "-dn", "-f", "apng"]);
             } else {
-                push(&["-map", "0:v:0", "-frames:v", "1"]);
-                if !filters.is_empty() {
-                    push(&["-vf", &filters.join(",")]);
-                }
+                push_video(&mut push, input, &["-frames:v", "1"], &filters);
                 push(&["-c:v", "png", "-compression_level", "1"]);
                 push(&["-update", "1", "-an", "-sn", "-dn"]);
             }
         }
         (_, Sink::Frames { .. }) => unreachable!("only JPEG XL goes through intermediate frames"),
         (OutputFormat::Mp4 | OutputFormat::Mov | OutputFormat::Mkv | OutputFormat::Webm, _) => {
-            push(&["-map", "0:v:0"]);
             let keep_audio = options.keep_audio && input.has_audio();
-            if keep_audio {
-                push(&["-map", "0:a:0"]);
-            }
+            let audio: &[&str] = if keep_audio { &["-map", "0:a:0"] } else { &[] };
             let filters = video_filters(input, options, None, true);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
-            }
+            push_video(&mut push, input, audio, &filters);
             if format == OutputFormat::Webm {
                 let crf = lerp(q, 48.0, 28.0).to_string();
                 push(&["-c:v", "libvpx-vp9", "-crf", &crf, "-b:v", "0"]);
@@ -622,26 +612,14 @@ fn ffmpeg_step(
             filters.push(format!(
                 "split[a][b];[a]palettegen=max_colors={colors}:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4"
             ));
-            push(&[
-                "-map",
-                "0:v:0",
-                "-vf",
-                &filters.join(","),
-                "-loop",
-                "0",
-                "-an",
-                "-sn",
-                "-dn",
-            ]);
+            push_video(&mut push, input, &[], &filters);
+            push(&["-loop", "0", "-an", "-sn", "-dn"]);
         }
         (OutputFormat::Jxl, Sink::Output) if animated => {
             // ffmpeg's libjxl_anim emits the codestream frame by frame; the
             // data muxer writes the packets back to back as one file.
             let filters = animation_filters(input, options);
-            push(&["-map", "0:v:0"]);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
-            }
+            push_video(&mut push, input, &[], &filters);
             push(&["-c:v", "libjxl_anim"]);
             push_ffmpeg_jxl(&mut push, options);
             push(&["-an", "-sn", "-dn", "-f", "data"]);
@@ -679,10 +657,7 @@ fn ffmpeg_step(
         ) => {
             let needs_even = format == OutputFormat::Avif;
             let filters = video_filters(input, options, None, needs_even);
-            push(&["-map", "0:v:0", "-frames:v", "1"]);
-            if !filters.is_empty() {
-                push(&["-vf", &filters.join(",")]);
-            }
+            push_video(&mut push, input, &["-frames:v", "1"], &filters);
             match format {
                 OutputFormat::Png => push(&["-c:v", "png"]),
                 OutputFormat::Jpg => {
@@ -725,6 +700,34 @@ fn ffmpeg_step(
         args,
         duration_secs,
         weight,
+    }
+}
+
+/// Pick the picture of `input`, push `extra`, and run `filters` on the picture.
+///
+/// HEIF tile grids come out of a filtergraph ffmpeg builds itself (stitching
+/// the tiles, then applying the rotation), and `-vf` can't be added to that,
+/// so their filters go into a complex filtergraph fed by the grid instead.
+fn push_video(
+    push: &mut impl FnMut(&[&str]),
+    input: &MediaInfo,
+    extra: &[&str],
+    filters: &[String],
+) {
+    let chain = filters.join(",");
+    match input.tile_grid {
+        Some(group) if chain.is_empty() => push(&["-map", &format!("[0:g:{group}]")]),
+        Some(group) => push(&[
+            "-filter_complex",
+            &format!("[0:g:{group}]{chain}[v]"),
+            "-map",
+            "[v]",
+        ]),
+        None => push(&["-map", "0:v:0"]),
+    }
+    push(extra);
+    if input.tile_grid.is_none() && !chain.is_empty() {
+        push(&["-vf", &chain]);
     }
 }
 
@@ -1016,6 +1019,7 @@ mod tests {
             video_codec: Some("h264".into()),
             audio_codec: Some("aac".into()),
             reconstructs_jpeg: false,
+            tile_grid: None,
         }
     }
 
@@ -1459,6 +1463,38 @@ mod tests {
             "ffmpeg -i /clips/cat.heic -map 0:v:0 -frames:v 1 -vf transpose=clock,scale=1080:-2:flags=lanczos \
              -c:v png -compression_level 1 -update 1 -an -sn -dn /clips/.cat.jxl.frames.png && \\\n  \
              cjxl /clips/.cat.jxl.frames.png /clips/cat.jxl -d 0.5 -e 7 --quiet"
+        );
+    }
+
+    #[test]
+    fn tiled_heic_is_read_through_its_grid() {
+        let photo = MediaInfo {
+            tile_grid: Some(0),
+            ..image("IMG_0001.heic", 3024, 4032)
+        };
+        // Edits go into a complex filtergraph fed by the stitched grid.
+        let options = ConvertOptions {
+            format: OutputFormat::Jpg,
+            max_size: Some(1080),
+            quality: 100,
+            ..ConvertOptions::default()
+        };
+        let jpg = plan(&photo, &options, Path::new("/clips/IMG_0001.jpg"), LIBJXL).expect("plan");
+        assert_eq!(
+            jpg.command_line(),
+            "ffmpeg -i /clips/IMG_0001.heic -filter_complex '[0:g:0]scale=1080:-2:flags=lanczos[v]' \
+             -map '[v]' -frames:v 1 -c:v mjpeg -q:v 2 -update 1 -an -sn -dn /clips/IMG_0001.jpg"
+        );
+        // Without edits the grid is mapped directly.
+        let options = ConvertOptions {
+            format: OutputFormat::Png,
+            ..ConvertOptions::default()
+        };
+        let png = plan(&photo, &options, Path::new("/clips/IMG_0001.png"), LIBJXL).expect("plan");
+        let cmd = png.command_line();
+        assert!(
+            cmd.starts_with("ffmpeg -i /clips/IMG_0001.heic -map '[0:g:0]' -frames:v 1 -c:v png "),
+            "{cmd}"
         );
     }
 

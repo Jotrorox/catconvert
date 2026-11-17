@@ -67,6 +67,7 @@ const VIDEO: MediaInfo = {
   videoCodec: "h264",
   audioCodec: "aac",
   reconstructsJpeg: false,
+  tileGrid: null,
 };
 
 const PHOTO: MediaInfo = {
@@ -90,6 +91,7 @@ const PACKED: MediaInfo = {
   extension: "jxl",
   videoCodec: "jpegxl",
   reconstructsJpeg: true,
+  tileGrid: null,
 };
 
 const SONG: MediaInfo = {

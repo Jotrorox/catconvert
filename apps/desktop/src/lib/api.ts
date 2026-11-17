@@ -36,6 +36,8 @@ export type MediaInfo = {
   audioCodec: string | null;
   /** JPEG XL only: a losslessly recompressed JPEG whose original can be restored. */
   reconstructsJpeg: boolean;
+  /** HEIF only: the stream group ffmpeg stitches a tiled photo from. */
+  tileGrid: number | null;
 };
 
 export type OutputFormat =
@@ -269,7 +271,8 @@ export async function pickFiles(): Promise<string[]> {
         extensions: [
           ...["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpg", "mpeg", "gif", "apng"],
           ...["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "aiff", "wma"],
-          ...["jpg", "jpeg", "png", "webp", "avif", "jxl", "heic", "heif", "tif", "tiff", "bmp"],
+          ...["jpg", "jpeg", "png", "webp", "avif", "jxl", "tif", "tiff", "bmp"],
+          ...["heic", "heif", "hif"],
         ],
       },
     ],
