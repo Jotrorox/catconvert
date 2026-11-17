@@ -408,6 +408,21 @@ describe("CatConvert", () => {
     expect(screen.getByRole("button", { name: /Try again/ })).toBeEnabled();
   });
 
+  it("estimates the output size as the quality changes", async () => {
+    render(() => <App />);
+    await screen.findByText("ffmpeg 7.1");
+    openPaths([VIDEO.path]);
+    await screen.findByRole("heading", { name: "clip.mov" });
+
+    const slider = screen.getByRole("slider", { name: "Quality" });
+    expect(slider).toHaveAccessibleDescription(/^About [\d.]+ MB · \d+% smaller$/);
+    const id = slider.getAttribute("aria-describedby") ?? "";
+    const text = () => document.getElementById(id)?.textContent;
+    const atDefault = text();
+    fireEvent.input(slider, { target: { value: "0" } });
+    expect(text()).not.toBe(atDefault);
+  });
+
   it("starts files from the defaults chosen in Settings and remembers them", async () => {
     render(() => <App />);
     await screen.findByText("ffmpeg 7.1");

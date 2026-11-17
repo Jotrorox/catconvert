@@ -1775,6 +1775,13 @@ button.format-chip:not(:disabled):active {
   font-weight: 600;
 }
 
+.estimate {
+  margin: -10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* JPEG XL */
 
 .jxl-settings {
