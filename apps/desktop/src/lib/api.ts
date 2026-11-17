@@ -57,6 +57,9 @@ export type OutputFormat =
 
 export type Rotation = 0 | 90 | 180 | 270;
 
+/** Which way an animation plays; a boomerang plays forward, then back. */
+export type Direction = "forward" | "reverse" | "boomerang";
+
 /** Settings that only matter when writing JPEG XL. */
 export type JxlOptions = {
   /** Mathematically lossless; an unedited JPEG is recompressed and can be restored exactly. */
@@ -92,6 +95,10 @@ export type ConvertOptions = {
   jxl: JxlOptions;
   /** Carry over dates, location and other tags where the format can hold them. */
   keepMetadata: boolean;
+  /** Playback speed of animations (GIF, animated JPEG XL), 0.25–4. Ignored otherwise. */
+  speed: number;
+  /** Playback direction of animations. Ignored otherwise. */
+  direction: Direction;
 };
 
 export type JobId = number;

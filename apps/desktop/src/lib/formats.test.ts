@@ -7,6 +7,8 @@ import {
   fitOptions,
   fpsChoices,
   initialOptions,
+  isUntouched,
+  outputSeconds,
   RECIPES,
   recipeFrom,
   sizeChoices,
@@ -97,6 +99,20 @@ describe("formats", () => {
     expect(fitOptions({ ...clip, audioCodec: null }, defaultOptions("mp3"), all)).toBeNull();
   });
 
+  it("times animations by their speed and direction", () => {
+    const gif = { ...defaultOptions("gif"), trimStart: 2, trimEnd: 8 };
+    expect(outputSeconds(clip, gif)).toBe(6);
+    expect(outputSeconds(clip, { ...gif, speed: 2 })).toBe(3);
+    expect(outputSeconds(clip, { ...gif, speed: 0.5, direction: "boomerang" })).toBe(24);
+    // Ignored for ordinary video.
+    expect(outputSeconds(clip, { ...defaultOptions("mp4"), speed: 4 })).toBe(10);
+    // A reversed animation isn't the original, so no lossless shortcut.
+    const jxl = defaultOptions("jxl");
+    expect(isUntouched(clip, jxl)).toBe(true);
+    expect(isUntouched(clip, { ...jxl, direction: "reverse" })).toBe(false);
+    expect(isUntouched(clip, { ...defaultOptions("mp4"), direction: "reverse" })).toBe(true);
+  });
+
   it("saves editor settings as a recipe without the per-file edits", () => {
     const options = {
       ...defaultOptions("mp4"),
@@ -122,6 +138,17 @@ describe("formats", () => {
       keepAudio: false,
       rotate: 0,
       trimStart: null,
+    });
+
+    const boomerang = recipeFrom("custom-3", "Bounce", clip, {
+      ...defaultOptions("gif"),
+      speed: 2,
+      direction: "boomerang",
+    });
+    expect(boomerang.detail).toBe("2× · boomerang · balanced");
+    expect(initialOptions(clip, all, boomerang)).toMatchObject({
+      speed: 2,
+      direction: "boomerang",
     });
 
     const sound = recipeFrom("custom-2", "Podcast", clip, {
