@@ -13,6 +13,7 @@ vi.mock("./lib/api", () => ({
   previewFrame: vi.fn(async () => "blob:frame"),
   waveform: vi.fn(async () => "blob:wave"),
   previewCommand: vi.fn(async () => "ffmpeg -i clip.mov clip.mp4"),
+  saveFrame: vi.fn(),
   startJob: vi.fn(),
   cancelJob: vi.fn(async () => true),
   pickFiles: vi.fn(async () => []),
@@ -72,6 +73,9 @@ const VIDEO: MediaInfo = {
   audioCodec: "aac",
   sampleRate: 48000,
   reconstructsJpeg: false,
+  hdr: false,
+  hasLocation: false,
+  locationTags: [],
   tileGrid: null,
 };
 
@@ -172,6 +176,49 @@ describe("CatConvert", () => {
     expect(screen.getByRole("button", { name: "Hide licenses" })).toBeInTheDocument();
   });
 
+  it("steps through frames and saves the one on screen right away", async () => {
+    vi.mocked(api.saveFrame).mockResolvedValue({
+      output: "/clips/clip-frame-0m01s.png",
+      outputBytes: 2_100_000,
+    });
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "Rotate 90°" }));
+
+    // The preview opens at 1 s; at 30 fps that's frame 30. Net one frame on.
+    fireEvent.click(screen.getByRole("button", { name: "Next frame" }));
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    fireEvent.keyDown(window, { key: "," });
+    fireEvent.click(screen.getByRole("button", { name: "Save this frame" }));
+
+    expect(await screen.findByText("Saved frame")).toBeInTheDocument();
+    const [path, options, at] = vi.mocked(api.saveFrame).mock.calls[0] ?? [];
+    expect(path).toBe(VIDEO.path);
+    expect(options).toMatchObject({ rotate: 90, format: "mp4" });
+    expect(at).toBeCloseTo(31 / 30, 2);
+    expect(Math.ceil((at ?? 0) * 30)).toBe(31);
+    expect(api.startJob).not.toHaveBeenCalled();
+    expect(state.history[0]).toMatchObject({ name: "clip-frame-0m01s.png", format: "png" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Show in folder" }));
+    expect(api.revealInFolder).toHaveBeenCalledWith("/clips/clip-frame-0m01s.png");
+
+    // S saves too, except while typing in a field.
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Start" }), { key: "s" });
+    expect(api.saveFrame).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(window, { key: "s" });
+    await waitFor(() => expect(api.saveFrame).toHaveBeenCalledTimes(2));
+  });
+
+  it("says why a frame couldn't be saved", async () => {
+    vi.mocked(api.saveFrame).mockRejectedValue("no frame at that time");
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "Save this frame" }));
+    expect(
+      await screen.findByText("Couldn't save the frame: No frame at that time"),
+    ).toBeInTheDocument();
+    expect(state.history).toEqual([]);
+  });
+
   it("cleans up the sound and draws the fades on the trim bar", async () => {
     await openVideo();
     expect(screen.getByRole("heading", { name: "Sound" })).toBeInTheDocument();
@@ -248,7 +295,7 @@ describe("CatConvert", () => {
       keepAudio: false,
       jxl: { lossless: false, effort: 7, progressive: false },
       sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
-      keepMetadata: true,
+      metadata: "noLocation",
       speed: 1,
       direction: "forward",
     });
@@ -566,37 +613,93 @@ describe("CatConvert", () => {
       target: { value: "mkv" },
     });
     fireEvent.input(screen.getByRole("slider", { name: "Quality" }), { target: { value: "85" } });
-    fireEvent.click(screen.getByRole("switch", { name: "Keep metadata" }));
+    expect(screen.getByRole("button", { name: "Keep all but location" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove everything" }));
     expect(JSON.parse(localStorage.getItem("catconvert.settings.v1") ?? "{}")).toEqual({
       formats: { video: "mkv", audio: null, image: null },
       quality: 85,
-      keepMetadata: false,
+      metadata: "none",
     });
 
     openPaths([VIDEO.path]);
     await screen.findByRole("heading", { name: "clip.mov" });
     expect(screen.getByRole("button", { name: "MKV" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("slider", { name: "Quality" })).toHaveValue("85");
-    expect(screen.getByRole("switch", { name: "Keep metadata" })).toHaveAttribute(
-      "aria-checked",
-      "false",
+    expect(screen.getByRole("button", { name: "Remove everything" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
     );
   });
 
-  it("strips metadata on request, which rules out the JPEG repack", async () => {
+  it("reads the metadata switch of earlier versions", async () => {
+    localStorage.setItem(
+      "catconvert.settings.v1",
+      JSON.stringify({ formats: {}, quality: 60, keepMetadata: true }),
+    );
+    const recipe = {
+      id: "custom-1",
+      title: "Old",
+      options: { format: "mp4", keepMetadata: false },
+    };
+    localStorage.setItem("catconvert.recipes.v1", JSON.stringify([recipe]));
+    resetStore();
+    expect(state.settings).toEqual({
+      formats: { video: null, audio: null, image: null },
+      quality: 60,
+      metadata: "keep",
+    });
+    expect(state.recipes[0]?.options).toEqual({ format: "mp4", metadata: "none" });
+    await openVideo();
+    expect(screen.getByRole("button", { name: "Keep everything" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("tells when a photo knows where it was taken and drops it, repack and all", async () => {
+    vi.mocked(api.probeFile).mockResolvedValue({ ...PHOTO, hasLocation: true });
     render(() => <App />);
     await screen.findByText("ffmpeg 7.1");
     openPaths([PHOTO.path]);
     await screen.findByRole("heading", { name: "cat.jpg" });
+    expect(screen.getByText(/This photo knows where it was taken/)).toHaveTextContent(
+      "This photo knows where it was taken. The copy won't.",
+    );
+    const changes = () =>
+      within(screen.getByRole("list", { name: "Changes" }))
+        .getAllByRole("listitem")
+        .map((li) => li.textContent);
+    expect(changes()).toContain("No location");
+
+    // The lossless JPEG XL repack stays available without the location.
     fireEvent.click(screen.getByRole("button", { name: "JXL" }));
-    expect(screen.getByText(/Repacks the JPEG/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("switch", { name: "Keep metadata" }));
-    expect(screen.getByText(/every pixel and sample stays put/)).toBeInTheDocument();
+    expect(screen.getByText(/Repacks the JPEG/)).toHaveTextContent(
+      "Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly, minus its location.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove everything" }));
+    expect(screen.getByText(/Repacks the JPEG/)).toHaveTextContent(/minus its metadata\.$/);
+    fireEvent.click(screen.getByRole("button", { name: "Keep everything" }));
+    expect(screen.getByText(/The copy will too\./)).toBeInTheDocument();
+    expect(screen.queryByText(/minus its/)).not.toBeInTheDocument();
+
+    // ffmpeg writes no EXIF into JPG, so there is nothing to choose.
+    fireEvent.click(screen.getByRole("button", { name: "JPG" }));
+    expect(screen.queryByRole("button", { name: "Keep everything" })).not.toBeInTheDocument();
+    expect(
+      screen.getByText("JPG files come out without dates, place or camera details."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/The copy won't\./)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "JXL" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep all but location" }));
     fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
     await screen.findByRole("heading", { name: "Queue" });
     expect(api.startJob).toHaveBeenCalledWith(
       PHOTO.path,
-      expect.objectContaining({ format: "jxl", keepMetadata: false }),
+      expect.objectContaining({ format: "jxl", metadata: "noLocation" }),
     );
   });
 

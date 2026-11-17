@@ -21,13 +21,15 @@ mod ffmpeg;
 mod job;
 mod jxl;
 mod media;
+mod scrub;
 
 pub use convert::{
-    ConvertOptions, Crop, CropArea, Direction, JxlOptions, JxlSupport, OutputFormat, Plan,
-    SoundOptions, Step, Tool, output_path, plan,
+    ConvertOptions, Crop, CropArea, Direction, JxlOptions, JxlSupport, Metadata, OutputFormat,
+    Plan, SoundOptions, Step, Support, Tool, frame_output_path, frame_plan, output_path, plan,
 };
 pub use error::{Error, Result};
 pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, RunProgress};
-pub use job::{JobId, JobProgress, JobStage, JobTicket, Queue};
+pub use job::{JobId, JobProgress, JobStage, JobTicket, Queue, SavedFrame};
 pub use jxl::{JxlTools, LIBJXL_ENV, has_jpeg_reconstruction, is_jxl_file};
 pub use media::{MediaInfo, MediaKind, probe};
+pub use scrub::scrub_file;

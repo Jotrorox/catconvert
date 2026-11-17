@@ -11,9 +11,10 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::convert::{JxlSupport, OutputFormat, Plan, Step, Tool};
+use crate::convert::{JxlSupport, OutputFormat, Plan, Step, Support, TONE_MAP_FILTER, Tool};
 use crate::jxl::{self, JxlTools};
 use crate::media::{self, MediaInfo, MediaKind};
+use crate::scrub;
 use crate::{Error, Result};
 
 /// Environment variable pointing at an ffmpeg binary, checked before `PATH`.
@@ -38,6 +39,8 @@ pub struct Ffmpeg {
     version: String,
     encoders: Arc<HashSet<String>>,
     decoders: Arc<HashSet<String>>,
+    /// The `scale` filter can tone-map HDR to SDR.
+    tone_map: bool,
     jxl: Arc<JxlTools>,
     /// JPEG XL files djxl decoded for previews, when ffmpeg can't read them.
     decoded: Arc<Mutex<DecodeCache>>,
@@ -142,6 +145,13 @@ impl Ffmpeg {
             &ffmpeg,
         )?;
         let decoders = parse_codecs(&String::from_utf8_lossy(&decoders_out));
+        // Older ffmpegs lack these options and would fail on them; without
+        // them HDR video simply isn't tone-mapped.
+        let tone_map = capture(
+            base_command(&ffmpeg).args(["-hide_banner", "-h", "filter=scale"]),
+            &ffmpeg,
+        )
+        .is_ok_and(|out| scale_can_tone_map(&String::from_utf8_lossy(&out)));
 
         let jxl = JxlTools::locate(
             bundled,
@@ -159,6 +169,7 @@ impl Ffmpeg {
             version,
             encoders: Arc::new(encoders),
             decoders: Arc::new(decoders),
+            tone_map,
             jxl: Arc::new(jxl),
             decoded: Arc::default(),
         })
@@ -180,6 +191,15 @@ impl Ffmpeg {
             ffmpeg_anim_encoder: self.has_encoder("libjxl_anim"),
             ffmpeg_decoder: self.decoders.contains("libjxl"),
             ffmpeg_anim_decoder: self.decoders.contains("libjxl_anim"),
+        }
+    }
+
+    /// What the installed tools can do, for [`crate::plan`].
+    #[must_use]
+    pub fn support(&self) -> Support {
+        Support {
+            jxl: self.jxl_support(),
+            tone_map: self.tone_map,
         }
     }
 
@@ -289,6 +309,10 @@ impl Ffmpeg {
                 jxl::apply_jxlinfo(&mut info, &parsed);
             }
         }
+        // ffprobe doesn't reliably show GPS in EXIF, so photos are read here.
+        if info.kind == MediaKind::Image && scrub::has_location(path) {
+            info.has_location = true;
+        }
         Ok(info)
     }
 
@@ -357,12 +381,14 @@ impl Ffmpeg {
     /// Grab one frame as a JPEG, scaled down to at most `max_height` pixels.
     ///
     /// Works for videos (any time within the clip) and still images (`at_secs`
-    /// is ignored when it is zero).
+    /// is ignored when it is zero). Like a conversion, it takes the first
+    /// frame at or after `at_secs`. Pass [`MediaInfo::hdr`] as `hdr` to
+    /// tone-map the way pictures made from the file will be.
     ///
     /// # Errors
     ///
     /// [`Error::Ffmpeg`] if decoding fails or there is no frame at `at_secs`.
-    pub fn frame(&self, input: &Path, at_secs: f64, max_height: u32) -> Result<Vec<u8>> {
+    pub fn frame(&self, input: &Path, at_secs: f64, max_height: u32, hdr: bool) -> Result<Vec<u8>> {
         let input = &self.readable(input)?;
         let grid = self.tile_grid(input);
         // ffmpeg can't seek in animated JPEG XL; decode up to the frame instead.
@@ -379,13 +405,18 @@ impl Ffmpeg {
         }
         cmd.args(["-frames:v", "1", "-an", "-sn"]);
         let scale = format!("scale=-2:'min(ih,{})'", even(max_height));
+        let filters = if hdr && self.tone_map {
+            format!("{TONE_MAP_FILTER},{scale}")
+        } else {
+            scale
+        };
         // `-vf` can't follow the filtergraph that stitches a tile grid.
         match grid {
             Some(group) => cmd
                 .arg("-filter_complex")
-                .arg(format!("[0:g:{group}]{scale}[v]"))
+                .arg(format!("[0:g:{group}]{filters}[v]"))
                 .args(["-map", "[v]"]),
-            None => cmd.arg("-vf").arg(scale),
+            None => cmd.arg("-vf").arg(filters),
         };
         cmd.args(["-c:v", "mjpeg", "-q:v", "4", "-f", "image2pipe", "pipe:1"]);
         let bytes = capture(&mut cmd, &self.ffmpeg)?;
@@ -471,6 +502,8 @@ impl Ffmpeg {
                         speed: sample.speed.filter(|_| !several),
                     });
                 }),
+                Tool::Scrub if cancel.load(Ordering::Relaxed) => Ok(false),
+                Tool::Scrub => scrub::run_step(&step.args).map(|()| true),
                 tool => self.run_tool(tool, step, cancel),
             };
             if !matches!(outcome, Ok(true)) {
@@ -506,6 +539,7 @@ impl Ffmpeg {
             Tool::Ffmpeg => Some(self.ffmpeg.as_path()),
             Tool::Cjxl => self.jxl.cjxl.as_deref(),
             Tool::Djxl => self.jxl.djxl.as_deref(),
+            Tool::Scrub => return Err(Error::unsupported("metadata cleaning runs in-process")),
         };
         path.ok_or_else(|| {
             Error::unsupported(format!("{} from libjxl is not installed", tool.name()))
@@ -919,6 +953,10 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
         info.width = width;
         info.height = height;
         info.video_codec = v["codec_name"].as_str().map(str::to_owned);
+        info.hdr = matches!(
+            v["color_transfer"].as_str(),
+            Some("smpte2084" | "arib-std-b67")
+        );
         if info.kind == MediaKind::Video {
             info.fps = v["avg_frame_rate"]
                 .as_str()
@@ -940,6 +978,16 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
         };
     }
     info.audio_codec = audio.and_then(|a| a["codec_name"].as_str().map(str::to_owned));
+    info.location_tags = format["tags"]
+        .as_object()
+        .map(|tags| {
+            tags.keys()
+                .filter(|key| is_location_tag(key))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    info.has_location = !info.location_tags.is_empty();
     info.sample_rate = audio
         .and_then(|a| as_f64(&a["sample_rate"]))
         .filter(|rate| rate.is_finite() && *rate >= 1.0 && *rate <= f64::from(u32::MAX))
@@ -953,6 +1001,24 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
     } else {
         duration
     };
+}
+
+/// Whether `ffmpeg -h filter=scale` lists the colour-management options of
+/// ffmpeg 8's swscale, which tone-map HDR when the output transfer is SDR.
+fn scale_can_tone_map(help: &str) -> bool {
+    let has = |option: &str| {
+        help.lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .any(|name| name.trim_start_matches('-') == option)
+    };
+    has("out_transfer") && has("out_primaries") && has("intent")
+}
+
+/// Container tags that say where a recording was made: QuickTime's `©xyz`
+/// (read as `location`, plus `location-eng` and the like), Apple's
+/// `com.apple.quicktime.location.*` keys and Matroska's `LOCATION`.
+fn is_location_tag(key: &str) -> bool {
+    key.to_ascii_lowercase().contains("location")
 }
 
 /// The tile grid ffmpeg would show by default, as its stream group index and
@@ -1086,6 +1152,9 @@ mod tests {
             audio_codec: None,
             sample_rate: None,
             reconstructs_jpeg: false,
+            hdr: false,
+            has_location: false,
+            location_tags: Vec::new(),
             tile_grid: None,
         }
     }
@@ -1145,7 +1214,37 @@ mod tests {
         assert!((info.fps.unwrap() - 29.97).abs() < 0.01);
         assert_eq!(info.video_codec.as_deref(), Some("hevc"));
         assert!(info.has_audio());
+        assert!(!info.has_location);
         assert_eq!(info.sample_rate, Some(48_000));
+        assert!(!info.hdr);
+    }
+
+    #[test]
+    fn probe_json_spots_hdr_transfers() {
+        for (transfer, hdr) in [
+            ("arib-std-b67", true),
+            ("smpte2084", true),
+            ("bt709", false),
+        ] {
+            let mut info = base("clip.mov");
+            apply_probe(
+                &mut info,
+                &json!({
+                    "streams": [{"codec_type": "video", "codec_name": "hevc", "width": 3840,
+                                 "height": 2160, "color_transfer": transfer}],
+                    "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": "5"}
+                }),
+            );
+            assert_eq!(info.hdr, hdr, "{transfer}");
+        }
+    }
+
+    #[test]
+    fn tone_mapping_needs_swscale_colour_options() {
+        let modern = "scale AVOptions:\n   out_primaries     <int>   ..FV....... set output primaries\n   out_transfer      <int>   ..FV....... set output color transfer\nSWScaler AVOptions:\n  -intent            <int>   E..V....... color mapping intent\n";
+        assert!(scale_can_tone_map(modern));
+        let old = "scale AVOptions:\n  w                 <string>     ..FV.......\n  out_color_matrix  <string>     ..FV.......\n";
+        assert!(!scale_can_tone_map(old));
     }
 
     #[test]
@@ -1196,6 +1295,35 @@ mod tests {
         assert_eq!(info.kind, MediaKind::Image);
         assert_eq!(info.tile_grid, None);
         assert_eq!((info.width, info.height), (Some(400), Some(300)));
+    }
+
+    #[test]
+    fn probe_json_finds_location_tags() {
+        let mut info = base("clip.mov");
+        apply_probe(
+            &mut info,
+            &json!({
+                "streams": [{"codec_type": "video", "codec_name": "hevc"}],
+                "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "tags": {
+                    "title": "Cat",
+                    "location": "+52.5200+013.4050/",
+                    "location-eng": "+52.5200+013.4050/",
+                    "com.apple.quicktime.location.ISO6709": "+52.5200+013.4050+034.000/",
+                    "com.apple.quicktime.make": "Apple"
+                }}
+            }),
+        );
+        assert!(info.has_location);
+        let mut tags = info.location_tags.clone();
+        tags.sort();
+        assert_eq!(
+            tags,
+            [
+                "com.apple.quicktime.location.ISO6709",
+                "location",
+                "location-eng"
+            ]
+        );
     }
 
     #[test]

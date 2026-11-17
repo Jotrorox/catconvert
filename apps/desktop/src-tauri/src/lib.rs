@@ -22,6 +22,7 @@ use std::sync::{Arc, RwLock};
 
 use catconvert_core::{
     ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat, Queue,
+    SavedFrame,
 };
 use serde::Serialize;
 use tauri::ipc::Response;
@@ -187,17 +188,32 @@ async fn probe_file(state: State<'_, AppState>, path: String) -> Result<MediaInf
     .await
 }
 
-/// One frame as JPEG bytes (an `ArrayBuffer` on the JS side).
+/// One frame as JPEG bytes (an `ArrayBuffer` on the JS side), tone-mapped
+/// when `hdr` is set.
 #[tauri::command]
 async fn preview_frame(
     state: State<'_, AppState>,
     path: String,
     at: f64,
     height: u32,
+    hdr: bool,
 ) -> Result<Response, String> {
     let ffmpeg = state.queue()?.ffmpeg().clone();
-    let bytes = blocking(move || ffmpeg.frame(path.as_ref(), at, height.clamp(16, 1080))).await?;
+    let bytes =
+        blocking(move || ffmpeg.frame(path.as_ref(), at, height.clamp(16, 1080), hdr)).await?;
     Ok(Response::new(bytes))
+}
+
+/// Save the frame at `at` seconds as a PNG next to the video, right away.
+#[tauri::command]
+async fn save_frame(
+    state: State<'_, AppState>,
+    path: String,
+    options: ConvertOptions,
+    at: f64,
+) -> Result<SavedFrame, String> {
+    let queue = state.queue()?;
+    blocking(move || queue.save_frame(&path, &options, at)).await
 }
 
 /// The audio waveform as PNG bytes.
@@ -221,9 +237,9 @@ fn preview_command(
     info: MediaInfo,
     options: ConvertOptions,
 ) -> Result<String, String> {
-    let jxl = state.ffmpeg().map(|f| f.jxl_support()).unwrap_or_default();
+    let support = state.ffmpeg().map(|f| f.support()).unwrap_or_default();
     let output = catconvert_core::output_path(&info.path, options.format, |_| false);
-    catconvert_core::plan(&info, &options, &output, jxl)
+    catconvert_core::plan(&info, &options, &output, support)
         .map(|plan| plan.command_line())
         .map_err(|err| err.to_string())
 }
@@ -340,6 +356,7 @@ pub fn run() {
             preview_frame,
             waveform,
             preview_command,
+            save_frame,
             start_job,
             cancel_job,
             relaunch,

@@ -38,6 +38,12 @@ export type MediaInfo = {
   sampleRate: number | null;
   /** JPEG XL only: a losslessly recompressed JPEG whose original can be restored. */
   reconstructsJpeg: boolean;
+  /** HDR video (PQ or HLG, as iPhones record); pictures made from it are tone-mapped. */
+  hdr: boolean;
+  /** GPS in a photo's EXIF or XMP, or a location tag in a video or song. */
+  hasLocation: boolean;
+  /** Container tags holding the location, cleared when everything else is kept. */
+  locationTags: string[];
   /** HEIF only: the stream group ffmpeg stitches a tiled photo from. */
   tileGrid: number | null;
 };
@@ -60,6 +66,9 @@ export type OutputFormat =
   | "jxl";
 
 export type Rotation = 0 | 90 | 180 | 270;
+
+/** What to carry over besides the picture and sound. */
+export type MetadataMode = "keep" | "noLocation" | "none";
 
 /** Which way an animation plays; a boomerang plays forward, then back. */
 export type Direction = "forward" | "reverse" | "boomerang";
@@ -123,8 +132,8 @@ export type ConvertOptions = {
   keepAudio: boolean;
   jxl: JxlOptions;
   sound: SoundOptions;
-  /** Carry over dates, location and other tags where the format can hold them. */
-  keepMetadata: boolean;
+  /** Which dates, places and other tags to carry over, where the format can hold them. */
+  metadata: MetadataMode;
   /** Playback speed of animations (GIF, animated JPEG XL), 0.25–4. Ignored otherwise. */
   speed: number;
   /** Playback direction of animations. Ignored otherwise. */
@@ -143,6 +152,12 @@ export type JobProgress = {
   speed: number | null;
   outputBytes: number | null;
   error: string | null;
+};
+
+/** A frame written by {@link saveFrame}. */
+export type SavedFrame = {
+  output: string;
+  outputBytes: number;
 };
 
 export type JobTicket = {
@@ -192,12 +207,16 @@ type Commands = {
   ffmpeg_status: { args: Record<string, never>; result: FfmpegStatus };
   relocate_ffmpeg: { args: Record<string, never>; result: FfmpegStatus };
   probe_file: { args: { path: string }; result: MediaInfo };
-  preview_frame: { args: { path: string; at: number; height: number }; result: ArrayBuffer };
+  preview_frame: {
+    args: { path: string; at: number; height: number; hdr: boolean };
+    result: ArrayBuffer;
+  };
   waveform: {
     args: { path: string; width: number; height: number; color: string };
     result: ArrayBuffer;
   };
   preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
+  save_frame: { args: { path: string; options: ConvertOptions; at: number }; result: SavedFrame };
   start_job: { args: { path: string; options: ConvertOptions }; result: JobTicket };
   cancel_job: { args: { id: JobId }; result: boolean };
   relaunch: { args: Record<string, never>; result: null };
@@ -269,9 +288,25 @@ export function probeFile(path: string): Promise<MediaInfo> {
   return command("probe_file", { path });
 }
 
-/** One JPEG frame as an object URL. Revoke it with `URL.revokeObjectURL` when done. */
-export async function previewFrame(path: string, at: number, height: number): Promise<string> {
-  return blobUrl(await command("preview_frame", { path, at, height }), "image/jpeg");
+/**
+ * One JPEG frame as an object URL, tone-mapped when `hdr` is set. Revoke it
+ * with `URL.revokeObjectURL` when done.
+ */
+export async function previewFrame(
+  path: string,
+  at: number,
+  height: number,
+  hdr = false,
+): Promise<string> {
+  return blobUrl(await command("preview_frame", { path, at, height, hdr }), "image/jpeg");
+}
+
+/**
+ * Save the frame at `at` seconds as a PNG next to the video, with the turn,
+ * mirror and size of `options`. Runs right away, not in the queue.
+ */
+export function saveFrame(path: string, options: ConvertOptions, at: number): Promise<SavedFrame> {
+  return command("save_frame", { path, options, at });
 }
 
 /** The audio waveform as a PNG object URL. */

@@ -39,7 +39,11 @@ import {
   isAnimatedImage,
   isLossless,
   JXL_EFFORTS,
+  keepsLocation,
+  keepsMetadata,
   label,
+  locationLine,
+  METADATA_CHOICES,
   outputHasSound,
   outputSeconds,
   QUALITY_STEPS,
@@ -52,6 +56,7 @@ import {
   sizeLabel,
   speedLabel,
 } from "../lib/formats";
+import { FALLBACK_FPS, stepFrame } from "../lib/frames";
 import { createFilmstrip, createFrame, createWaveform } from "../lib/preview";
 import {
   closeEditor,
@@ -59,6 +64,7 @@ import {
   convertDraft,
   type Draft,
   isAvailable,
+  saveFrame,
   saveRecipe,
   skipDraft,
   state,
@@ -136,12 +142,13 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     info().kind === "video" ? Math.min(1, (duration() ?? 0) * 0.15) : 0,
   );
   const picturePath = () => (hasPicture() ? info().path : null);
-  const frame = createFrame(picturePath, scrub, 540);
+  const frame = createFrame(picturePath, scrub, 540, info().hdr);
   const filmstrip = createFilmstrip(
     () => (info().kind === "video" ? info().path : null),
     duration,
     FILMSTRIP_FRAMES,
     90,
+    info().hdr,
   );
   const wave = createWaveform(() => (info().kind === "audio" ? info().path : null), "#c93b63");
 
@@ -205,6 +212,40 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       });
     }
   };
+
+  // Frames --------------------------------------------------------------------
+
+  const canStep = () => info().kind === "video" && (duration() ?? 0) > 0;
+  const canSaveFrame = () => canStep() && state.ffmpeg?.found === true && isAvailable("png");
+  const stepBy = (delta: number) =>
+    setScrub(stepFrame(scrub(), delta, info().fps ?? FALLBACK_FPS, duration() ?? 0));
+  const [savingFrame, setSavingFrame] = createSignal(false);
+  const saveThisFrame = async () => {
+    if (savingFrame()) return;
+    setSavingFrame(true);
+    try {
+      await saveFrame(scrub());
+    } finally {
+      setSavingFrame(false);
+    }
+  };
+
+  // ← → (or , .) step a frame and S saves it, unless the key is meant for a
+  // field or a trim handle.
+  const onKey = (event: KeyboardEvent) => {
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const busy =
+      target?.isContentEditable || target?.closest("input, textarea, select, [role=slider]");
+    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || busy) return;
+    if (!canStep()) return;
+    if (event.key === "ArrowLeft" || event.key === ",") stepBy(-1);
+    else if (event.key === "ArrowRight" || event.key === ".") stepBy(1);
+    else if (event.key.toLowerCase() === "s" && canSaveFrame()) void saveThisFrame();
+    else return;
+    event.preventDefault();
+  };
+  window.addEventListener("keydown", onKey);
+  onCleanup(() => window.removeEventListener("keydown", onKey));
 
   // Command preview ---------------------------------------------------------
 
@@ -290,6 +331,29 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     format === "jxl"
       ? "Install libjxl (brew install jpeg-xl) or an ffmpeg with libjxl to write JXL"
       : `Your ffmpeg can't write ${label(format)}`;
+  const canKeepMetadata = () => keepsMetadata(options().format, info().kind);
+  /** What the JPEG repack or restore leaves out, if anything. */
+  const leftOut = () =>
+    options().metadata === "none"
+      ? "its metadata"
+      : options().metadata === "noLocation" && info().hasLocation
+        ? "its location"
+        : null;
+  const metadataHint = () => {
+    if (!canKeepMetadata()) {
+      if (animatedImage()) return "Animations come out without any tags.";
+      if (info().kind !== "image") return "Stills taken from a video carry no tags.";
+      return `${label(options().format)} files come out without dates, place or camera details.`;
+    }
+    switch (options().metadata) {
+      case "keep":
+        return "Dates, place and camera details, where the format allows";
+      case "noLocation":
+        return "Dates and camera details stay, GPS coordinates go";
+      default:
+        return "Dates, place, camera details and titles all go";
+    }
+  };
   const estimate = createMemo(() => describeEstimate(info(), options()));
   const ready = () => state.ffmpeg?.found === true && isAvailable(options().format);
 
@@ -307,7 +371,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
         | "sparkle"
         | "sliders"
         | "fade"
-        | "play";
+        | "play"
+        | "pin";
       text: string;
     }[] = [];
     if (timed() && trimmed()) {
@@ -342,6 +407,9 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     }
     if (isJxl() && info().kind === "video") items.push({ icon: "sparkle", text: "Animated" });
     if (isJxl() && o.jxl.lossless) items.push({ icon: "sparkle", text: "Lossless" });
+    if (info().hasLocation && !keepsLocation(info(), o)) {
+      items.push({ icon: "pin", text: "No location" });
+    }
     return items;
   });
 
@@ -513,7 +581,46 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               </fieldset>
             </Show>
             <Show when={info().kind === "video"}>
-              <span class="preview-badge mono">{formatClock(scrub(), true)}</span>
+              <div class="frame-bar">
+                <div class="frame-pill">
+                  <Show when={canStep()}>
+                    <button
+                      type="button"
+                      class="frame-step"
+                      aria-label="Previous frame"
+                      title="Previous frame (←)"
+                      onClick={() => stepBy(-1)}
+                    >
+                      <Icon name="chevron-left" size={16} />
+                    </button>
+                  </Show>
+                  <span class="frame-time mono">{formatClock(scrub(), true)}</span>
+                  <Show when={canStep()}>
+                    <button
+                      type="button"
+                      class="frame-step"
+                      aria-label="Next frame"
+                      title="Next frame (→)"
+                      onClick={() => stepBy(1)}
+                    >
+                      <Icon name="chevron-right" size={16} />
+                    </button>
+                  </Show>
+                </div>
+                <Show when={canSaveFrame()}>
+                  <button
+                    type="button"
+                    class="frame-pill frame-save"
+                    title="Save this frame as a PNG next to the video (S)"
+                    aria-busy={savingFrame()}
+                    disabled={savingFrame()}
+                    onClick={() => void saveThisFrame()}
+                  >
+                    <Icon name="camera" size={16} />
+                    <span class="frame-save-label">Save this frame</span>
+                  </button>
+                </Show>
+              </div>
             </Show>
             <Show when={outKind() === "audio" && info().kind === "video"}>
               <span class="preview-badge right">
@@ -670,9 +777,9 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               <p class="lossless-note">
                 <Icon name="sparkle" size={16} />
                 {restoring()
-                  ? "Restores the original JPEG, bit for bit."
+                  ? `Restores the original JPEG, bit for bit${leftOut() ? ` apart from ${leftOut()}` : ""}.`
                   : repacking()
-                    ? "Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly."
+                    ? `Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly${leftOut() ? `, minus ${leftOut()}` : ""}.`
                     : "Lossless: every pixel and sample stays put."}
               </p>
             }
@@ -897,24 +1004,39 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
             </section>
           </Show>
 
-          <div class="toggle-row">
-            <div>
-              <span class="toggle-title" id="keep-metadata">
-                Keep metadata
-              </span>
-              <span class="item-meta">
-                Dates, place and camera details, where the format allows
-              </span>
-            </div>
-            <button
-              type="button"
-              class="switch"
-              role="switch"
-              aria-checked={options().keepMetadata}
-              aria-labelledby="keep-metadata"
-              onClick={() => updateOptions({ keepMetadata: !options().keepMetadata })}
-            />
-          </div>
+          <fieldset class="field metadata-field">
+            <legend class="field-label">Metadata</legend>
+            <Show when={locationLine(info())}>
+              {(line) => (
+                <p class="location-line">
+                  <span aria-hidden="true">📍</span>
+                  <span>
+                    {line()}.{" "}
+                    <span class="location-fate">
+                      {keepsLocation(info(), options()) ? "The copy will too." : "The copy won't."}
+                    </span>
+                  </span>
+                </p>
+              )}
+            </Show>
+            <Show when={canKeepMetadata()}>
+              <div class="format-chips">
+                <For each={METADATA_CHOICES}>
+                  {(choice) => (
+                    <button
+                      type="button"
+                      class="format-chip"
+                      aria-pressed={options().metadata === choice.mode}
+                      onClick={() => updateOptions({ metadata: choice.mode })}
+                    >
+                      {choice.label}
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
+            <span class="item-meta">{metadataHint()}</span>
+          </fieldset>
 
           <Show when={isJxl()}>
             <div class="jxl-settings">

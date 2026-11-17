@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::convert::{self, ConvertOptions, Plan};
+use crate::convert::{self, ConvertOptions, OutputFormat, Plan};
 use crate::ffmpeg::{Ffmpeg, RunOutcome};
 use crate::{Error, MediaInfo, Result};
 
@@ -89,6 +89,14 @@ pub struct JobTicket {
     pub input: MediaInfo,
     /// The exact command(s) that will run.
     pub command: String,
+}
+
+/// What [`Queue::save_frame`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedFrame {
+    pub output: PathBuf,
+    pub output_bytes: u64,
 }
 
 type Emit = dyn Fn(JobProgress) + Send + Sync;
@@ -173,7 +181,7 @@ impl Queue {
         let (plan, id, cancel) = {
             let mut reserved = lock(&self.shared.reserved);
             let output = convert::output_path(&info.path, options.format, |p| reserved.contains(p));
-            let plan = convert::plan(&info, options, &output, ffmpeg.jxl_support())?;
+            let plan = convert::plan(&info, options, &output, ffmpeg.support())?;
             reserved.insert(output);
             (plan, JobId::next(), Arc::new(AtomicBool::new(false)))
         };
@@ -195,6 +203,44 @@ impl Queue {
             });
         }
         Ok(ticket)
+    }
+
+    /// Save the frame of `input` at `at_secs` as a PNG next to it (see
+    /// [`convert::frame_plan`]), right away rather than in turn: one frame
+    /// takes a moment. Blocks until the file is written. The name is kept
+    /// clear of outputs that queued jobs will write.
+    ///
+    /// # Errors
+    ///
+    /// Probe errors, [`Error::Unsupported`] if `input` is not a video or this
+    /// ffmpeg can't write PNG, and [`Error::Ffmpeg`] if the grab fails.
+    pub fn save_frame(
+        &self,
+        input: impl AsRef<Path>,
+        options: &ConvertOptions,
+        at_secs: f64,
+    ) -> Result<SavedFrame> {
+        let ffmpeg = &self.shared.ffmpeg;
+        if let Some(message) = ffmpeg.missing(OutputFormat::Png) {
+            return Err(Error::Unsupported { message });
+        }
+        let info = ffmpeg.probe(input)?;
+        let plan = {
+            let mut reserved = lock(&self.shared.reserved);
+            let output = convert::frame_output_path(&info.path, at_secs, |p| reserved.contains(p));
+            let plan = convert::frame_plan(&info, options, at_secs, &output, ffmpeg.support())?;
+            reserved.insert(output);
+            plan
+        };
+        let result = ffmpeg.run(&plan, &AtomicBool::new(false), |_| {});
+        lock(&self.shared.reserved).remove(&plan.output);
+        match result? {
+            RunOutcome::Done { output_bytes } => Ok(SavedFrame {
+                output: plan.output,
+                output_bytes,
+            }),
+            RunOutcome::Cancelled => unreachable!("nothing raises the cancel flag"),
+        }
     }
 
     /// Cancel a queued or running job. Returns `false` if it already finished.
@@ -391,13 +437,28 @@ mod tests {
         }
 
         // Preview helpers.
-        let frame = ffmpeg.frame(&input, 1.0, 90).expect("frame");
+        let frame = ffmpeg.frame(&input, 1.0, 90, false).expect("frame");
         assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
         let wave = ffmpeg
             .waveform(&input, 200, 40, "#c93b63")
             .expect("waveform");
         assert_eq!(&wave[1..4], b"PNG");
         assert!(ffmpeg.waveform(&input, 200, 40, "red;rm").is_err());
+
+        // Saving a frame runs right away, with the turn and size but not the trim.
+        if ffmpeg.supports(OutputFormat::Png) {
+            let saved = queue.save_frame(&input, &options, 1.2).expect("save frame");
+            assert_eq!(
+                saved.output.file_name().and_then(|n| n.to_str()),
+                Some("test clip-frame-0m01s.png")
+            );
+            assert!(saved.output_bytes > 0);
+            let still = ffmpeg.probe(&saved.output).expect("probe frame");
+            assert_eq!(still.kind, crate::MediaKind::Image);
+            assert_eq!((still.width, still.height), (Some(120), Some(160)));
+            let again = queue.save_frame(&input, &options, 1.4).expect("save again");
+            assert!(again.output.ends_with("test clip-frame-0m01s 2.png"));
+        }
     }
 
     /// Wait for the final event of `id`.
@@ -412,6 +473,110 @@ mod tests {
 
     /// Real JPEG XL round trips through cjxl/djxl. Skipped (passes) when
     /// ffmpeg or the libjxl tools are not installed.
+    /// A geotagged photo through every path that has to drop its location.
+    /// Skipped (passes) without ffmpeg and libjxl's tools.
+    #[test]
+    fn location_is_dropped_end_to_end() {
+        use crate::scrub::tests::{mentions_make, with_exif};
+        use crate::{Metadata, scrub::has_location};
+
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping location test");
+            return;
+        };
+        let tools = ffmpeg.jxl_tools();
+        if tools.cjxl.is_none() || tools.djxl.is_none() {
+            eprintln!("libjxl tools not found; skipping location test");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let plain = dir.path().join("plain.jpg");
+        let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x240:d=1"])
+            .args(["-frames:v", "1", "-q:v", "3"])
+            .arg(&plain)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+        let photo = dir.path().join("photo.jpg");
+        let original = with_exif(&std::fs::read(&plain).expect("read"), true);
+        std::fs::write(&photo, &original).expect("write");
+        assert!(ffmpeg.probe(&photo).expect("probe").has_location);
+
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let run = |options: ConvertOptions| {
+            let ticket = queue.submit(&photo, &options).expect("submit");
+            assert_eq!(
+                finish_of(&rx, ticket.id).stage,
+                JobStage::Done,
+                "{}",
+                ticket.command
+            );
+            ticket
+        };
+
+        // Lossless JPEG XL stays a repack, and restores to the photo minus its GPS.
+        let jxl = run(ConvertOptions {
+            format: OutputFormat::Jxl,
+            jxl: crate::JxlOptions {
+                lossless: true,
+                ..crate::JxlOptions::default()
+            },
+            ..ConvertOptions::default()
+        });
+        assert!(
+            jxl.command.starts_with("catconvert scrub "),
+            "{}",
+            jxl.command
+        );
+        let packed = ffmpeg.probe(&jxl.output).expect("probe jxl");
+        assert!(packed.reconstructs_jpeg);
+        assert!(!packed.has_location);
+        let restored = dir.path().join("restored.jpg");
+        let djxl = std::process::Command::new(tools.djxl.as_ref().expect("djxl"))
+            .arg(&jxl.output)
+            .arg(&restored)
+            .args(["--reconstruct_jpeg", "--quiet"])
+            .status()
+            .expect("run djxl");
+        assert!(djxl.success());
+        let expected = dir.path().join("expected.jpg");
+        crate::scrub_file(&photo, &expected, Metadata::NoLocation).expect("scrub");
+        let restored = std::fs::read(&restored).expect("read");
+        assert_eq!(restored, std::fs::read(&expected).expect("read"));
+        assert_eq!(restored.len(), original.len());
+        assert!(mentions_make(&restored));
+
+        // ffmpeg writes the EXIF into PNGs; it is cleaned afterwards.
+        let png = |metadata| {
+            let ticket = run(ConvertOptions {
+                format: OutputFormat::Png,
+                metadata,
+                ..ConvertOptions::default()
+            });
+            (
+                has_location(&ticket.output),
+                mentions_make(&std::fs::read(&ticket.output).expect("read")),
+            )
+        };
+        assert_eq!(png(Metadata::Keep), (true, true));
+        assert_eq!(png(Metadata::NoLocation), (false, true));
+        assert_eq!(png(Metadata::None), (false, false));
+        assert!(
+            std::fs::read_dir(dir.path()).expect("list").all(|entry| {
+                !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')
+            }),
+            "scratch files are cleaned up"
+        );
+    }
+
     #[test]
     fn jpeg_xl_end_to_end() {
         let Ok(ffmpeg) = Ffmpeg::locate() else {
@@ -537,7 +702,7 @@ mod tests {
         let back = ffmpeg.probe(&ticket2.output).expect("probe gif");
         assert_eq!(back.kind, crate::MediaKind::Video);
         assert!((back.duration_secs.expect("duration") - 1.0).abs() < 0.15);
-        let frame = ffmpeg.frame(&ticket.output, 0.8, 90).expect("frame");
+        let frame = ffmpeg.frame(&ticket.output, 0.8, 90, false).expect("frame");
         assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
 
         // No scratch files left behind.
@@ -588,7 +753,7 @@ mod tests {
         }
         assert_eq!((info.width, info.height), (Some(1200), Some(900)));
 
-        let frame = ffmpeg.frame(&heic, 0.0, 90).expect("frame");
+        let frame = ffmpeg.frame(&heic, 0.0, 90, false).expect("frame");
         assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
 
         let (tx, rx) = mpsc::channel();

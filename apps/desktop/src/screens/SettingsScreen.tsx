@@ -3,7 +3,14 @@ import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
 import { type OutputFormat, thirdPartyLicenses } from "../lib/api";
 import { formatBytes } from "../lib/format";
-import { FORMAT_GROUPS, type FormatGroup, label, QUALITY_STEPS, qualityStep } from "../lib/formats";
+import {
+  FORMAT_GROUPS,
+  type FormatGroup,
+  label,
+  METADATA_CHOICES,
+  QUALITY_STEPS,
+  qualityStep,
+} from "../lib/formats";
 import { os } from "../lib/platform";
 import {
   activeCount,
@@ -93,22 +100,27 @@ const StartingSettings: Component = () => {
           </For>
         </div>
       </div>
-      <div class="toggle-row">
-        <div>
-          <span class="toggle-title" id="default-keep-metadata">
-            Keep metadata
-          </span>
-          <span class="item-meta">Dates, place and camera details, where the format allows</span>
+      <fieldset class="field metadata-field">
+        <legend class="field-label">Metadata</legend>
+        <div class="format-chips">
+          <For each={METADATA_CHOICES}>
+            {(choice) => (
+              <button
+                type="button"
+                class="format-chip"
+                aria-pressed={settings().metadata === choice.mode}
+                onClick={() => updateSettings({ metadata: choice.mode })}
+              >
+                {choice.label}
+              </button>
+            )}
+          </For>
         </div>
-        <button
-          type="button"
-          class="switch"
-          role="switch"
-          aria-checked={settings().keepMetadata}
-          aria-labelledby="default-keep-metadata"
-          onClick={() => updateSettings({ keepMetadata: !settings().keepMetadata })}
-        />
-      </div>
+        <span class="item-meta">
+          Dates, place and camera details, where the format allows. JPG, WebP and AVIF never carry
+          them.
+        </span>
+      </fieldset>
     </section>
   );
 };
