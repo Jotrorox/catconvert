@@ -126,8 +126,11 @@ struct FfmpegStatus {
     path: Option<PathBuf>,
     error: Option<String>,
     formats: Vec<FormatSupport>,
-    /// Video codecs ffmpeg can write, for MP4, MKV and WebM's codec choice.
+    /// Video codecs ffmpeg can write, for the codec choice of MP4, MOV, MKV
+    /// and WebM.
     video_codecs: Vec<VideoCodec>,
+    /// H.265 can be encoded in hardware (VideoToolbox on Apple silicon).
+    hevc_hardware: bool,
     /// ffmpeg decodes AV1 video and AVIF pictures (it has dav1d or libaom).
     reads_av1: bool,
     /// Version of libjxl's tools, if `cjxl` was found.
@@ -154,14 +157,22 @@ fn status_of(state: &AppState) -> FfmpegStatus {
         path: ffmpeg.as_ref().map(|f| f.ffmpeg_path().to_path_buf()),
         error: state.queue().err(),
         formats,
-        video_codecs: [VideoCodec::H264, VideoCodec::Vp9, VideoCodec::Av1]
-            .into_iter()
-            .filter(|&codec| {
-                ffmpeg
-                    .as_ref()
-                    .is_some_and(|f| f.missing_codec(codec).is_none())
-            })
-            .collect(),
+        video_codecs: [
+            VideoCodec::H264,
+            VideoCodec::H265,
+            VideoCodec::Vp9,
+            VideoCodec::Av1,
+        ]
+        .into_iter()
+        .filter(|&codec| {
+            ffmpeg
+                .as_ref()
+                .is_some_and(|f| f.missing_codec(codec).is_none())
+        })
+        .collect(),
+        hevc_hardware: ffmpeg
+            .as_ref()
+            .is_some_and(Ffmpeg::encodes_hevc_in_hardware),
         reads_av1: ffmpeg.as_ref().is_some_and(Ffmpeg::reads_av1),
         libjxl: ffmpeg.as_ref().and_then(|f| f.jxl_tools().version.clone()),
         jxl: ffmpeg.as_ref().map(Ffmpeg::jxl_support).unwrap_or_default(),
@@ -309,8 +320,16 @@ fn preview_command(
 /// The audio bitrate and video CRF (or exact bitrate) a conversion would
 /// use, for the line under the quality slider.
 #[tauri::command]
-fn quality_summary(info: MediaInfo, options: ConvertOptions) -> QualitySummary {
-    catconvert_core::quality_summary(&info, &options)
+fn quality_summary(
+    state: State<'_, AppState>,
+    info: MediaInfo,
+    options: ConvertOptions,
+) -> QualitySummary {
+    let support = state
+        .ffmpeg()
+        .map(|ffmpeg| ffmpeg.support())
+        .unwrap_or_default();
+    catconvert_core::quality_summary(&info, &options, support)
 }
 
 /// The plan a conversion of `info` with `options` would run, for previews.

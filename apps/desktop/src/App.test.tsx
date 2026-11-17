@@ -21,11 +21,20 @@ vi.mock("./lib/api", () => ({
     if (options.format === "gif") return { audio: null, video: null };
     const q = options.quality;
     const kbps = q < 34 ? 96 : q < 67 ? 128 : 192;
+    const hardware = { hardware: false, hardwareQuality: null };
     return {
       audio: info.audioCodec ? { mode: "bitrate", kbps } : null,
-      video: options.videoBitrate
-        ? { codec: "h264", crf: null, kbps: options.videoBitrate, passes: 2 }
-        : { codec: "h264", crf: Math.round(34 - (16 * q) / 100), kbps: null, passes: 1 },
+      video: options.hardware
+        ? { codec: "h265", crf: null, kbps: null, passes: 1, hardware: true, hardwareQuality: 64 }
+        : options.videoBitrate
+          ? { codec: "h264", crf: null, kbps: options.videoBitrate, passes: 2, ...hardware }
+          : {
+              codec: "h264",
+              crf: Math.round(34 - (16 * q) / 100),
+              kbps: null,
+              passes: 1,
+              ...hardware,
+            },
     };
   }),
   previewSequenceCommand: vi.fn(async () => "ffmpeg -f concat -i list.txt cat.gif"),
@@ -88,7 +97,8 @@ function status(found = true): FfmpegStatus {
       available: found && format !== "webp",
       animated: found && ["mp4", "webm", "mov", "mkv", "gif", "jxl"].includes(format),
     })),
-    videoCodecs: found ? ["h264", "vp9", "av1"] : [],
+    videoCodecs: found ? ["h264", "h265", "vp9", "av1"] : [],
+    hevcHardware: false,
     readsAv1: found,
     libjxl: found ? "0.13.0" : null,
     jxl: {
@@ -372,6 +382,7 @@ describe("CatConvert", () => {
         keepAudio: false,
         videoCodec: null,
         videoBitrate: null,
+        hardware: false,
         jxl: { lossless: false, effort: 7, progressive: false },
         sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
         metadata: "noLocation",
@@ -421,7 +432,8 @@ describe("CatConvert", () => {
     expect(codecs().getByRole("button", { name: "AV1" })).toHaveAttribute("aria-pressed", "true");
     expect(codecs().getByRole("button", { name: "VP9" })).toHaveAttribute("aria-pressed", "false");
     fireEvent.click(screen.getByRole("button", { name: "MOV" }));
-    expect(screen.queryByRole("group", { name: "Video codec" })).not.toBeInTheDocument();
+    expect(codecs().queryByRole("button", { name: "AV1" })).not.toBeInTheDocument();
+    expect(codecs().getByRole("button", { name: "H.264" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.click(screen.getByRole("button", { name: "MKV" }));
     expect(codecs().getByRole("button", { name: "H.264" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.click(codecs().getByRole("button", { name: "AV1" }));
@@ -433,6 +445,56 @@ describe("CatConvert", () => {
       expect.objectContaining({ format: "mkv", videoCodec: "av1" }),
       USUAL,
     );
+  });
+
+  it("encodes H.265 into MP4, MOV and MKV, in hardware where it can", async () => {
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({ ...status(), hevcHardware: true });
+    await openVideo();
+    const codecs = () => within(screen.getByRole("group", { name: "Video codec" }));
+    // No hardware switch until H.265 is picked.
+    expect(screen.queryByRole("switch", { name: "Fast (hardware)" })).not.toBeInTheDocument();
+    fireEvent.click(codecs().getByRole("button", { name: "H.265" }));
+    expect(codecs().getByRole("button", { name: "H.265" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText(/Plays on Apple devices/)).toBeInTheDocument();
+    const changes = () => within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes().getByText("H.265")).toBeInTheDocument();
+
+    // MOV keeps it; WebM can't hold it and falls back to VP9.
+    fireEvent.click(screen.getByRole("button", { name: "MOV" }));
+    expect(codecs().getByRole("button", { name: "H.265" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "WEBM" }));
+    expect(codecs().queryByRole("button", { name: "H.265" })).not.toBeInTheDocument();
+    expect(codecs().getByRole("button", { name: "VP9" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "MOV" }));
+    fireEvent.click(codecs().getByRole("button", { name: "H.265" }));
+
+    const hardware = screen.getByRole("switch", { name: "Fast (hardware)" });
+    expect(hardware).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(hardware);
+    expect(hardware).toHaveAttribute("aria-checked", "true");
+    expect(changes().getByText("H.265, hardware")).toBeInTheDocument();
+    expect(await screen.findByText(/\(hardware, quality 64\)$/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ format: "mov", videoCodec: "h265", hardware: true }),
+      USUAL,
+    );
+  });
+
+  it("offers no hardware switch, and no H.265, where ffmpeg can't", async () => {
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({
+      ...status(),
+      videoCodecs: ["h264", "vp9", "av1"],
+    });
+    await openVideo();
+    const codecs = within(screen.getByRole("group", { name: "Video codec" }));
+    const h265 = codecs.getByRole("button", { name: "H.265" });
+    expect(h265).toBeDisabled();
+    expect(h265).toHaveAttribute("title", "Your ffmpeg can't write H.265 video");
+    expect(screen.queryByRole("switch", { name: "Fast (hardware)" })).not.toBeInTheDocument();
   });
 
   it("shows the quality in bitrates, updating as the slider moves", async () => {

@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::convert::{
     ANIMATED_JXL_MAX_SIZE, ANIMATED_WEBP_MAX_SIZE, FRAME_MEMORY_BUDGET, GIF_MAX_SIZE, VideoRate,
-    cjxl_step, free_path, lerp, push_animated_webp, push_ffmpeg_jxl, push_video_encoder,
-    scratch_path, turn_filters,
+    cjxl_step, free_path, lerp, push_animated_webp, push_ffmpeg_jxl, push_mp4_flags,
+    push_video_encoder, scratch_path, turn_filters,
 };
 use crate::ffmpeg::format_secs;
 use crate::jxl::is_jxl;
@@ -346,14 +346,14 @@ pub fn plan_sequence(
         _ => {
             let codec = options.codec().unwrap_or(VideoCodec::H264);
             // A slideshow is mostly still: constant quality suits it, and
-            // an exact bitrate would mostly go to the first frame.
-            push_video_encoder(&mut push, VideoRate::constant(codec, q), None);
+            // an exact bitrate would mostly go to the first frame. It is
+            // short work for x265, so it never needs the hardware encoder,
+            // and pictures are SDR.
+            push_video_encoder(&mut push, VideoRate::constant(codec, q), false, None);
             if codec == VideoCodec::H264 {
                 push(&["-tune", "stillimage"]);
             }
-            if matches!(format, OutputFormat::Mp4 | OutputFormat::Mov) {
-                push(&["-movflags", "+faststart"]);
-            }
+            push_mp4_flags(&mut push, format, codec);
         }
     }
     // Tags of the first picture (place, camera) don't describe the animation.
@@ -861,6 +861,41 @@ mod tests {
         assert!(
             cmd.contains(
                 "-c:v libsvtav1 -preset 8 -crf 32 -pix_fmt yuv420p10le -movflags +faststart"
+            ),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("stillimage"), "{cmd}");
+    }
+
+    #[test]
+    fn h265_slideshow_is_tagged_hvc1_without_x264_tuning() {
+        let inputs = [
+            picture("a.jpg", "mjpeg", 1920, 1080),
+            picture("b.jpg", "mjpeg", 1920, 1080),
+        ];
+        let options = ConvertOptions {
+            format: OutputFormat::Mov,
+            video_codec: Some(VideoCodec::H265),
+            // Slideshows are always encoded in software.
+            hardware: true,
+            ..ConvertOptions::default()
+        };
+        let support = Support {
+            hevc_hardware: true,
+            ..Support::default()
+        };
+        let cmd = plan_sequence(
+            &inputs,
+            &options,
+            &SequenceOptions::default(),
+            Path::new("/pics/a.mov"),
+            support,
+        )
+        .expect("plan")
+        .command_line();
+        assert!(
+            cmd.contains(
+                "-c:v libx265 -preset fast -crf 28 -pix_fmt yuv420p -tag:v hvc1 -movflags +faststart"
             ),
             "{cmd}"
         );

@@ -19,6 +19,12 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
   shows, play forward, reversed or as a boomerang, and fit other shapes with
   black bars or by cropping. GIFs and animated JXL get the same speed, reverse
   and boomerang controls.
+- **H.265 / HEVC video:** write MP4, MOV and MKV files with H.265, 30–50%
+  smaller than H.264 at the same look, with hardware playback on Apple devices,
+  recent PCs, TVs and phones. Files are tagged `hvc1` so QuickTime, Safari and
+  the Finder play them, and iPhone HDR footage stays HDR (10-bit Main 10). On
+  Apple silicon Macs, "Fast (hardware)" encodes with VideoToolbox instead of
+  x265: several times faster, somewhat bigger files.
 - **AV1 video:** write MP4, MKV and WebM files with AV1 instead of H.264 or
   VP9: smaller at the same look, 10-bit, and HDR stays HDR. AV1 videos and AVIF
   photos open like any other file (the bundled ffmpeg decodes them with dav1d).
@@ -212,6 +218,10 @@ Alternatively, native shells can use `catconvert-ffi` through UniFFI.
 ## License
 
 CatConvert is [BSD-3-Clause](LICENSE). The desktop app bundles ffmpeg (built
-with x264) and ffprobe, which are GPL-2.0-or-later, and libjxl's tools; they run
-as separate programs. Their licenses are listed in the app (Settings →
+with x264 and x265) and ffprobe, which are GPL-2.0-or-later, and libjxl's tools;
+they run as separate programs. Their licenses are listed in the app (Settings →
 Open-source licenses), and each release includes their source code.
+
+H.264 and H.265 (HEVC) are covered by patents licensed through patent pools.
+CatConvert ships the open-source x264 and x265 encoders but no patent license;
+whether you need one depends on where and how you use the videos.

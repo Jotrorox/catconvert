@@ -53,7 +53,7 @@ Release builds ship `ffmpeg`, `ffprobe` and libjxl's `cjxl`, `djxl` and
   library, an encoder the app needs is missing, or the tools outgrow their size
   budget.
 
-Licensing: ffmpeg with x264 is GPL-2.0-or-later. CatConvert stays BSD-3-Clause
+Licensing: ffmpeg with x264 and x265 is GPL-2.0-or-later. CatConvert stays BSD-3-Clause
 because it only runs these tools as separate processes. Don't link ffmpeg's
 libraries into the app. Every release must carry the matching source archive,
 which the release workflow attaches automatically.

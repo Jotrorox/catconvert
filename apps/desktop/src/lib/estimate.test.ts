@@ -114,6 +114,24 @@ describe("estimateBytes", () => {
     expect(size(clip, "mov", av1)).toBe(size(clip, "mov"));
   });
 
+  it("expects H.265 to be smaller than H.264, less so in hardware", () => {
+    const h265 = { videoCodec: "h265" as const };
+    for (const format of ["mp4", "mov", "mkv"] as const) {
+      expect(size(clip, format, h265), format).toBeLessThan(size(clip, format) * 0.75);
+      expect(size(clip, format, h265), format).toBeGreaterThan(size(clip, format) * 0.4);
+      const hardware = size(clip, format, { ...h265, hardware: true });
+      expect(hardware, format).toBeGreaterThan(size(clip, format, h265));
+      expect(hardware, format).toBeLessThan(size(clip, format) * 1.1);
+    }
+    expect(size(clip, "mov", { ...h265, quality: 0 })).toBeLessThan(size(clip, "mov", h265));
+    expect(size(clip, "mov", h265)).toBeLessThan(size(clip, "mov", { ...h265, quality: 100 }));
+    const fast = { ...h265, hardware: true };
+    expect(size(clip, "mp4", { ...fast, quality: 0 })).toBeLessThan(size(clip, "mp4", fast));
+    expect(size(clip, "mp4", fast)).toBeLessThan(size(clip, "mp4", { ...fast, quality: 100 }));
+    // WebM can't hold H.265.
+    expect(size(clip, "webm", h265)).toBe(size(clip, "webm"));
+  });
+
   it("follows trims, dropped sound, frame rate and size", () => {
     const full = size(clip, "mp4");
     expect(size(clip, "mp4", { trimStart: 0, trimEnd: 21 })).toBeCloseTo(full / 2);
@@ -216,7 +234,14 @@ describe("estimateVideoBitrate", () => {
 });
 
 describe("describeQuality", () => {
-  const h264 = { codec: "h264", crf: 24, kbps: null, passes: 1 } as const;
+  const h264 = {
+    codec: "h264",
+    crf: 24,
+    kbps: null,
+    passes: 1,
+    hardware: false,
+    hardwareQuality: null,
+  } as const;
 
   it("puts the core's numbers and the estimate in one line", () => {
     expect(describeQuality({ audio: { mode: "bitrate", kbps: 128 }, video: h264 }, 3_840_000)).toBe(
@@ -231,10 +256,20 @@ describe("describeQuality", () => {
     ).toBe("Video 4 Mbps (2-pass)");
     expect(
       describeQuality(
-        { audio: null, video: { codec: "av1", crf: null, kbps: 2500, passes: 1 } },
+        { audio: null, video: { ...h264, codec: "av1", crf: null, kbps: 2500, passes: 1 } },
         null,
       ),
     ).toBe("Video 2.5 Mbps (average)");
+    const hardware = {
+      ...h264,
+      codec: "h265",
+      crf: null,
+      hardware: true,
+      hardwareQuality: 64,
+    } as const;
+    expect(describeQuality({ audio: null, video: hardware }, 3_000_000)).toBe(
+      "Video ~3 Mbps (hardware, quality 64)",
+    );
   });
 
   it("names what lossless and uncompressed sound come to", () => {
