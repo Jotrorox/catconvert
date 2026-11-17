@@ -13,6 +13,7 @@ import type {
   VideoCodec,
 } from "./api";
 import { aspectText, cropBox, cropForOtherFile, pictureSize, turnedSize } from "./crop";
+import { formatBitrate } from "./format";
 
 export type Tone = "pink" | "green" | "yellow" | "lavender";
 
@@ -159,6 +160,31 @@ export function codecFor(format: OutputFormat, codec: VideoCodec | null): VideoC
 
 export const CODEC_LABELS: Record<VideoCodec, string> = { h264: "H.264", vp9: "VP9", av1: "AV1" };
 
+/**
+ * The streams of a video or sound file with their bitrates, for the file
+ * info: "H264 12 Mbps · AAC 256 kbps", so the source can be compared with the
+ * quality setting. Codec names stand alone where the file doesn't say, and
+ * the whole file's bitrate is added when no stream's is known.
+ */
+export function describeStreams(info: MediaInfo): string | null {
+  const stream = (codec: string | null, rate: number | null | undefined) =>
+    codec
+      ? [codec.toUpperCase(), rate ? formatBitrate(rate) : null].filter(Boolean).join(" ")
+      : null;
+  const parts =
+    info.kind === "video"
+      ? [stream(info.videoCodec, info.videoBitrate), stream(info.audioCodec, info.audioBitrate)]
+      : info.kind === "audio"
+        ? [stream(info.audioCodec, info.audioBitrate)]
+        : [];
+  const named = parts.filter((part): part is string => part !== null);
+  if (named.length === 0) return null;
+  if (!info.videoBitrate && !info.audioBitrate && info.bitrate) {
+    named.push(`${formatBitrate(info.bitrate)} total`);
+  }
+  return named.join(" · ");
+}
+
 /** One line on what picking `codec` means. */
 export function codecHint(codec: VideoCodec): string {
   switch (codec) {
@@ -259,6 +285,7 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     quality: 60,
     keepAudio: true,
     videoCodec: null,
+    videoBitrate: null,
     jxl: { lossless: false, effort: 7, progressive: false },
     sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
     metadata: "noLocation",
@@ -347,6 +374,10 @@ export function metadataFrom(stored: {
 }
 
 export const QUALITY_STEPS = ["Tiny file", "Balanced", "Crisp"] as const;
+
+/** Lowest and highest exact video bitrate in kbit/s, as `VIDEO_KBPS` in convert.rs. */
+export const MIN_VIDEO_KBPS = 100;
+export const MAX_VIDEO_KBPS = 200_000;
 
 export function qualityStep(quality: number): (typeof QUALITY_STEPS)[number] {
   return QUALITY_STEPS[quality < 34 ? 0 : quality > 66 ? 2 : 1];
@@ -540,7 +571,9 @@ export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
   const codec = codecOf(options);
   if (video && codec && codec !== videoCodecs(options.format)[0]) parts.push(CODEC_LABELS[codec]);
   if (video && !options.keepAudio) parts.push("no sound");
-  parts.push(isLossless(options) ? "lossless" : qualityStep(options.quality).toLowerCase());
+  const exact = video && codec !== null ? (options.videoBitrate ?? null) : null;
+  if (exact !== null) parts.push(formatBitrate(exact * 1000));
+  else parts.push(isLossless(options) ? "lossless" : qualityStep(options.quality).toLowerCase());
   if (outputHasSound(info, options)) {
     if (options.sound.normalize) parts.push("even loudness");
     if (options.sound.fadeIn > 0 || options.sound.fadeOut > 0) parts.push("fades");

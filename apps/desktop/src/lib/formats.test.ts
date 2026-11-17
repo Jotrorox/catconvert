@@ -7,6 +7,7 @@ import {
   DEFAULTS,
   defaultFormat,
   defaultOptions,
+  describeStreams,
   fadeSpans,
   fitOptions,
   formatKind,
@@ -208,6 +209,11 @@ describe("formats", () => {
     expect(codecFor("mp4", "vp9")).toBeNull();
     const av1 = { ...defaultOptions("mp4"), videoCodec: "av1" as const };
     expect(recipeDetail(clip, av1)).toBe("AV1 · balanced");
+    // An exact bitrate stands in for the quality level of video files.
+    const exact = { ...defaultOptions("mp4"), videoBitrate: 4000 };
+    expect(recipeDetail(clip, exact)).toBe("4 Mbps");
+    expect(recipeDetail(clip, { ...exact, format: "mp3" })).toBe("Balanced");
+    expect(fitOptions(clip, exact, all)?.videoBitrate).toBe(4000);
     expect(fitOptions(clip, av1, all)?.videoCodec).toBe("av1");
     expect(fitOptions(clip, { ...av1, format: "mov" }, all)?.videoCodec).toBeNull();
   });
@@ -384,5 +390,23 @@ describe("pictures → animation", () => {
   it("starts with the first installed animation format", () => {
     expect(sequenceFormat(() => true)).toBe("gif");
     expect(sequenceFormat((f) => f === "mp4")).toBe("mp4");
+  });
+});
+
+describe("describeStreams", () => {
+  it("shows each stream's codec with its bitrate", () => {
+    const rated = { ...clip, videoBitrate: 12_000_000, audioBitrate: 256_000 };
+    expect(describeStreams(rated)).toBe("H264 12 Mbps · AAC 256 kbps");
+    expect(describeStreams({ ...rated, audioCodec: null, audioBitrate: null })).toBe(
+      "H264 12 Mbps",
+    );
+    const song = { ...clip, kind: "audio" as const, videoCodec: null, audioBitrate: 320_000 };
+    expect(describeStreams(song)).toBe("AAC 320 kbps");
+  });
+
+  it("falls back to the codecs and the whole file's bitrate", () => {
+    expect(describeStreams(clip)).toBe("H264 · AAC");
+    expect(describeStreams({ ...clip, bitrate: 900_000 })).toBe("H264 · AAC · 900 kbps total");
+    expect(describeStreams({ ...clip, kind: "image", videoCodec: "mjpeg" })).toBeNull();
   });
 });

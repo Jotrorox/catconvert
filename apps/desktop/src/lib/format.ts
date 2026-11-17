@@ -14,6 +14,24 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
+ * A bitrate in bit/s for people: `128 kbps`, `3.8 Mbps`, `12 Mbps`. With
+ * `rough`, kbps are rounded to two significant digits so an estimate doesn't
+ * promise precision (`850 kbps` rather than `847 kbps`).
+ */
+export function formatBitrate(bitsPerSecond: number, rough = false): string {
+  if (!Number.isFinite(bitsPerSecond) || bitsPerSecond <= 0) return "–";
+  const kbps = bitsPerSecond / 1000;
+  if (kbps < 999.5) {
+    const shown = rough && kbps >= 100 ? Math.round(kbps / 10) * 10 : Math.round(kbps);
+    return shown >= 1000 ? "1 Mbps" : `${Math.max(1, shown)} kbps`;
+  }
+  const mbps = kbps / 1000;
+  const shown =
+    mbps >= 9.95 ? Math.round(mbps).toString() : (Math.round(mbps * 10) / 10).toString();
+  return `${shown} Mbps`;
+}
+
+/**
  * Clock time: `0:42`, `12:03`, `1:02:03`. With `precise`, tenths of a second
  * are added (`0:03.2`).
  */

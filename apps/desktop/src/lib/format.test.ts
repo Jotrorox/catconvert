@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, formatClock, formatSpan, parseClock } from "./format";
+import { formatBitrate, formatBytes, formatClock, formatSpan, parseClock } from "./format";
 
 describe("format", () => {
   it("formats clock times", () => {
@@ -23,5 +23,18 @@ describe("format", () => {
     expect(formatSpan(27.84)).toBe("27.8 s");
     expect(formatSpan(245)).toBe("4 min 05 s");
     expect(formatBytes(48_000_000)).toBe("48.0 MB");
+  });
+
+  it("formats bitrates", () => {
+    expect(formatBitrate(128_000)).toBe("128 kbps");
+    expect(formatBitrate(1_411_200)).toBe("1.4 Mbps");
+    expect(formatBitrate(3_840_000)).toBe("3.8 Mbps");
+    expect(formatBitrate(12_400_000)).toBe("12 Mbps");
+    expect(formatBitrate(999_700)).toBe("1 Mbps");
+    expect(formatBitrate(847_000)).toBe("847 kbps");
+    // Estimates don't pretend to be precise.
+    expect(formatBitrate(847_000, true)).toBe("850 kbps");
+    expect(formatBitrate(64_400, true)).toBe("64 kbps");
+    expect(formatBitrate(0)).toBe("–");
   });
 });

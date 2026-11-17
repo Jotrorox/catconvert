@@ -15,9 +15,15 @@ import {
   type ConvertOptions,
   type Fit,
   previewSequenceCommand,
+  type QualitySummary,
+  qualitySummary,
   type SequenceOptions,
 } from "../lib/api";
-import { describeSequenceEstimate } from "../lib/estimate";
+import {
+  describeQuality,
+  describeSequenceEstimate,
+  estimateSequenceVideoBitrate,
+} from "../lib/estimate";
 import { formatBytes, formatSpan } from "../lib/format";
 import {
   codecOf,
@@ -194,6 +200,32 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
   const setJxl = (patch: Partial<ConvertOptions["jxl"]>) =>
     updateSequenceOptions({ jxl: { ...options().jxl, ...patch } });
   const estimate = createMemo(() => describeSequenceEstimate(pictures(), options()));
+  // A slideshow's CRF from the core (pictures have no sound), and what it
+  // comes to on average. Slideshows always use a CRF.
+  const [encoding, setEncoding] = createSignal<QualitySummary | null>(null);
+  let encodingAsked = 0;
+  createEffect(
+    on(
+      () => [first(), JSON.stringify(options())] as const,
+      ([picture]) => {
+        const asked = ++encodingAsked;
+        if (!picture) {
+          setEncoding(null);
+          return;
+        }
+        const snapshot = { ...options(), videoBitrate: null };
+        Promise.resolve()
+          .then(() => qualitySummary(picture, snapshot))
+          .then(
+            (summary) => asked === encodingAsked && setEncoding(summary ?? null),
+            () => asked === encodingAsked && setEncoding(null),
+          );
+      },
+    ),
+  );
+  const qualityNumbers = createMemo(() =>
+    describeQuality(encoding(), estimateSequenceVideoBitrate(pictures(), options(), sequence())),
+  );
   const ready = () => {
     const codec = codecOf(options());
     return (
@@ -521,6 +553,7 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
           >
             <QualityField
               quality={options().quality}
+              numbers={qualityNumbers()}
               describedBy={estimate() ? "sequence-estimate" : undefined}
               onChange={(quality) => updateSequenceOptions({ quality })}
             />

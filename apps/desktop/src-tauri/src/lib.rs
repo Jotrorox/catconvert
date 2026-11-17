@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use catconvert_core::{
-    ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat, Queue,
-    SavedFrame, SequenceOptions, VideoCodec,
+    ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat,
+    QualitySummary, Queue, SavedFrame, SequenceOptions, VideoCodec,
 };
 use serde::Serialize;
 use tauri::ipc::Response;
@@ -262,6 +262,13 @@ fn preview_command(
         .map_err(|err| err.to_string())
 }
 
+/// The audio bitrate and video CRF (or exact bitrate) a conversion would
+/// use, for the line under the quality slider.
+#[tauri::command]
+fn quality_summary(info: MediaInfo, options: ConvertOptions) -> QualitySummary {
+    catconvert_core::quality_summary(&info, &options)
+}
+
 /// The command(s) making one animation from `pictures` would run.
 #[tauri::command]
 fn preview_sequence_command(
@@ -401,6 +408,7 @@ pub fn run() {
             preview_frame,
             waveform,
             preview_command,
+            quality_summary,
             save_frame,
             preview_sequence_command,
             start_job,
