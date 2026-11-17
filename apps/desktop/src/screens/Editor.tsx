@@ -21,6 +21,7 @@ import {
   type Aspect,
   type ConvertOptions,
   checkCommand,
+  loudness,
   type MediaInfo,
   previewCommand,
 } from "../lib/api";
@@ -67,6 +68,13 @@ import {
   speedLabel,
 } from "../lib/formats";
 import { FALLBACK_FPS, stepFrame } from "../lib/frames";
+import {
+  createPlayer,
+  normalizeGain,
+  type PlayRange,
+  playbackType,
+  soundGain,
+} from "../lib/player";
 import { createFilmstrip, createFrame, createWaveform } from "../lib/preview";
 import {
   canRead,
@@ -183,8 +191,72 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   const [scrub, setScrub] = createSignal(
     info().kind === "video" ? Math.min(1, (duration() ?? 0) * 0.15) : 0,
   );
+
+  // Listening ---------------------------------------------------------------
+
+  /** There is sound to play: an audio file, or a video with a sound track. */
+  const canListen = () => timed() && (info().kind === "audio" || info().audioCodec !== null);
+  const [loop, setLoop] = createSignal(false);
+  /** Measured loudness: `undefined` until asked for, `null` if silent or unknown. */
+  const [lufs, setLufs] = createSignal<number | null | undefined>(undefined);
+  /** Normalisation as a volume factor, while the output gets it. */
+  const level = () => (hasSound() && options().sound.normalize ? normalizeGain(lufs() ?? null) : 1);
+  // The option callbacks run only while playing, after everything below exists.
+  const player = createPlayer(() => (canListen() ? info().path : null), {
+    type: () => playbackType(info().extension, info().audioCodec),
+    gain: (t) =>
+      hasSound()
+        ? soundGain(t, { start: trimStart(), end: trimEnd(), ...fades(), level: level() })
+        : 1,
+    limit: () => level() > 1,
+  });
+  const selection = (): PlayRange => ({ start: trimStart(), end: trimEnd(), loop: loop() });
+  const playSelection = () => {
+    if (player.playing() && player.inRange()) player.pause();
+    else player.play(trimStart(), selection);
+  };
+  /** Which of the sound settings playback lets you hear, if any. */
+  const previewNote = () => {
+    if (!hasSound() || !player.shapes()) return null;
+    const heard: string[] = [];
+    if (fades().fadeIn > 0 || fades().fadeOut > 0) heard.push("fades");
+    if (options().sound.normalize) heard.push("even loudness");
+    return heard.length > 0 ? `You hear the ${heard.join(" and ")} as the copy will.` : null;
+  };
+  /** Go to `t`: the frame shown and where playback starts or carries on. */
+  const scrubTo = (t: number) => {
+    setScrub(t);
+    player.seek(t);
+  };
+  player.seek(scrub());
+  // A paused video shows the frame it stopped on.
+  createEffect(
+    on(
+      player.playing,
+      (now, before) => {
+        if (before && !now && info().kind === "video") setScrub(player.time());
+      },
+      { defer: true },
+    ),
+  );
+  // Opening the next file stops this one.
+  createEffect(() => {
+    if (state.opening) player.pause();
+  });
+  // Loudness is measured once, the first time it is heard.
+  createEffect(() => {
+    if (lufs() !== undefined || !player.playing() || !hasSound() || !options().sound.normalize) {
+      return;
+    }
+    setLufs(null);
+    loudness(info().path).then(setLufs, () => {});
+  });
+
   const picturePath = () => (hasPicture() ? info().path : null);
-  const frame = createFrame(picturePath, scrub, 540, info().hdr);
+  // While a video plays, the picture follows a few times a second.
+  const frameTime = () =>
+    player.playing() && !player.loading() ? Math.floor(player.time() * 4) / 4 : scrub();
+  const frame = createFrame(picturePath, frameTime, 540, info().hdr);
   const filmstrip = createFilmstrip(
     () => (info().kind === "video" ? info().path : null),
     duration,
@@ -259,8 +331,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
 
   const canStep = () => info().kind === "video" && (duration() ?? 0) > 0;
   const canSaveFrame = () => canStep() && state.ffmpeg?.found === true && isAvailable("png");
-  const stepBy = (delta: number) =>
-    setScrub(stepFrame(scrub(), delta, info().fps ?? FALLBACK_FPS, duration() ?? 0));
+  const stepBy = (delta: number) => {
+    const from = player.playing() ? player.time() : scrub();
+    player.pause();
+    scrubTo(stepFrame(from, delta, info().fps ?? FALLBACK_FPS, duration() ?? 0));
+  };
   const [savingFrame, setSavingFrame] = createSignal(false);
   const saveThisFrame = async () => {
     if (savingFrame()) return;
@@ -272,13 +347,23 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     }
   };
 
-  // ← → (or , .) step a frame and S saves it, unless the key is meant for a
-  // field or a trim handle.
+  // Space plays or pauses (Shift+Space the selection), ← → (or , .) step a
+  // frame and S saves it, unless the key is meant for a field, button or slider.
   const onKey = (event: KeyboardEvent) => {
     const target = event.target instanceof HTMLElement ? event.target : null;
-    const busy =
-      target?.isContentEditable || target?.closest("input, textarea, select, [role=slider]");
-    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || busy) return;
+    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (target?.isContentEditable) return;
+    if (event.key === " ") {
+      // Space presses a focused button or types in a field. Sliders don't use it.
+      const pressable = "input, textarea, select, button, summary, a, [role=switch]";
+      if (!canListen() || target?.closest(pressable)) return;
+      event.preventDefault();
+      if (event.repeat) return;
+      if (event.shiftKey) playSelection();
+      else player.toggle();
+      return;
+    }
+    if (target?.closest("input, textarea, select, [role=slider]")) return;
     if (!canStep()) return;
     if (event.key === "ArrowLeft" || event.key === ",") stepBy(-1);
     else if (event.key === "ArrowRight" || event.key === ".") stepBy(1);
@@ -375,7 +460,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     }
     if (which === "start") setTrim(Math.min(parsed, trimEnd() - 0.1), trimEnd());
     else setTrim(trimStart(), Math.min(d, Math.max(parsed, trimStart() + 0.1)));
-    setScrub(which === "start" ? trimStart() : trimEnd());
+    scrubTo(which === "start" ? trimStart() : trimEnd());
     input.value = formatClock(which === "start" ? trimStart() : trimEnd(), true);
   };
 
@@ -763,12 +848,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
           </div>
 
           <Show when={timed()}>
-            <section
-              class="card trim"
-              classList={{ locked: custom() }}
-              inert={custom()}
-              aria-disabled={custom() || undefined}
-            >
+            <section class="card trim">
               <div class="row-between">
                 <h2 class="label-strong">
                   <Icon name="scissors" size={16} /> Trim
@@ -784,10 +864,16 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 duration={duration() ?? 0}
                 start={trimStart()}
                 end={trimEnd()}
-                playhead={info().kind === "video" ? scrub() : null}
+                playhead={canListen() ? player.time() : info().kind === "video" ? scrub() : null}
+                playing={player.playing()}
                 fades={hasSound() ? fades() : undefined}
-                onChange={setTrim}
-                onScrub={setScrub}
+                // An edited command carries its own trim; listening and seeking still work.
+                onChange={(start, end) => !custom() && setTrim(start, end)}
+                // Moving a handle while playing leaves the sound where it is.
+                onScrub={(t) => {
+                  if (!player.playing()) scrubTo(t);
+                }}
+                onSeek={scrubTo}
               >
                 <Show
                   when={info().kind === "video"}
@@ -810,7 +896,72 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                   </div>
                 </Show>
               </TrimBar>
-              <div class="trim-fields">
+              <Show when={canListen()}>
+                <fieldset class="player-bar" aria-label="Playback">
+                  <button
+                    type="button"
+                    class="play-btn"
+                    aria-label={player.playing() ? "Pause" : "Play"}
+                    aria-keyshortcuts="Space"
+                    title={player.playing() ? "Pause (Space)" : "Play (Space)"}
+                    aria-busy={player.loading()}
+                    onClick={() => player.toggle()}
+                  >
+                    <Icon name={player.playing() ? "pause" : "play"} size={20} />
+                  </button>
+                  <button
+                    type="button"
+                    class="player-chip"
+                    aria-pressed={player.playing() && player.inRange()}
+                    aria-keyshortcuts="Shift+Space"
+                    title="Play just the part you keep (Shift+Space)"
+                    onClick={playSelection}
+                  >
+                    <Icon
+                      name={player.playing() && player.inRange() ? "pause" : "scissors"}
+                      size={15}
+                    />
+                    Play selection
+                  </button>
+                  <button
+                    type="button"
+                    class="player-chip"
+                    aria-pressed={loop()}
+                    title="Start the selection over when it ends"
+                    onClick={() => setLoop(!loop())}
+                  >
+                    <Icon name="repeat" size={15} />
+                    Loop
+                  </button>
+                  <span class="player-time mono">
+                    {formatClock(player.time(), true)}
+                    <span class="player-of">
+                      {" "}
+                      / {formatClock(player.duration() ?? duration() ?? 0, true)}
+                    </span>
+                  </span>
+                </fieldset>
+                <Show
+                  when={player.error()}
+                  fallback={
+                    <Show when={previewNote()}>
+                      {(note) => <p class="item-meta player-note">{note()}</p>}
+                    </Show>
+                  }
+                >
+                  {(message) => (
+                    <p class="player-error" role="alert">
+                      <Icon name="alert" size={16} /> {message()}
+                    </p>
+                  )}
+                </Show>
+              </Show>
+              <div
+                class="trim-fields"
+                classList={{ locked: custom() }}
+                inert={custom()}
+                aria-disabled={custom() || undefined}
+              >
                 <label class="field">
                   <span class="field-label">Start</span>
                   <input

@@ -25,6 +25,10 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 - **JPEG XL**, still and animated: lossless or lossy, an effort setting and
   progressive files. Unedited JPEGs are repacked losslessly and can be restored
   bit for bit.
+- **Listen first:** play a song or a video's sound in the editor (Space), seek
+  on the waveform, play just the part you keep (Shift+Space) or loop it, and hear
+  the fades and even loudness before converting. Finished songs play from the
+  Queue and History.
 - **Frame by frame:** step through a video and save any frame as a PNG
   (←/→ and S). HDR video, which iPhones record by default, is tone-mapped when it
   becomes a picture or GIF.
