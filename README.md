@@ -7,33 +7,42 @@ CatConvert is a desktop app for macOS, Windows and Linux built with
 front end and a Rust core library. iOS and Android shells come later, through
 Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 
-> **Status: early.** Conversion runs through `ffmpeg`/`ffprobe`. Release builds
-> ship their own (with libjxl's tools), so there is nothing to install. Without
-> them, as in development, CatConvert uses an installed ffmpeg (found on `PATH`,
-> in Homebrew's folders, or via `CATCONVERT_FFMPEG`, which always wins).
-> You can drop files, trim, crop (free or 1:1, 9:16, 16:9), resize, rotate, mirror,
-> change frame rate, quality and format, drop the sound, and watch a serial queue with live progress. Step through
-> a video frame by frame and save any frame as a PNG (←/→ and S). Results are
-> saved next to the original and never overwrite anything. HDR video, which
-> iPhones record by default, is tone-mapped when it becomes a picture or GIF.
->
-> You don't have to open the app first: photos, videos and songs offer
-> CatConvert under "Open With" (plus "Send to" on Windows), and on macOS
-> Settings can add a "Convert with CatConvert" Finder Quick Action. Finished
-> files drag straight out of the Queue and History into other apps.
->
-> Drop several pictures to convert each, or to make one animation of them: a GIF,
-> animated WebP or JPEG XL, or an MP4 slideshow. Reorder them in a filmstrip, pick
-> how long each one shows, play it forward, reversed or as a boomerang, and fit
-> other shapes to the first picture with black bars or by cropping.
->
-> JPEG XL is fully supported, still and animated, with libjxl's tools (bundled in
-> releases; otherwise `brew install jpeg-xl`, found like ffmpeg or via
-> `CATCONVERT_LIBJXL`). You get
-> lossless or lossy encoding, an effort setting and progressive files. Unedited JPEGs
-> are repacked losslessly and can later be restored bit for bit. Videos and GIFs
-> become animated JXL, and JXL files (animated too) open like any other file. An
-> ffmpeg built with libjxl works as a fallback.
+## Features
+
+- **Photo, video and audio** in, any sensible format out: trim, crop (free or
+  1:1, 9:16, 16:9), resize, rotate, mirror, change frame rate, quality and
+  format, or drop the sound. Even out loudness and fade audio in and out.
+- **Pictures to animation:** drop several pictures to make a GIF, animated WebP
+  or JPEG XL, or an MP4 slideshow. Reorder them in a filmstrip, set how long each
+  shows, play forward, reversed or as a boomerang, and fit other shapes with
+  black bars or by cropping. GIFs and animated JXL get the same speed, reverse
+  and boomerang controls.
+- **JPEG XL**, still and animated: lossless or lossy, an effort setting and
+  progressive files. Unedited JPEGs are repacked losslessly and can be restored
+  bit for bit.
+- **Frame by frame:** step through a video and save any frame as a PNG
+  (←/→ and S). HDR video, which iPhones record by default, is tone-mapped when it
+  becomes a picture or GIF.
+- **Privacy:** remove location data and keep the rest of the metadata.
+- **Size estimate** before you convert, and a serial queue with live progress.
+  Results are saved next to the original and never overwrite anything.
+- **Works from other apps:** photos, videos and songs offer CatConvert under
+  "Open With" (plus "Send to" on Windows), macOS can add a "Convert with
+  CatConvert" Finder Quick Action, and finished files drag straight out of the
+  Queue and History.
+- **Batch and recipes:** convert many files at once with saved settings.
+- **Auto-updates** from GitHub Releases, signed with the updater key.
+
+Conversion runs through `ffmpeg`/`ffprobe` and libjxl's tools. Release builds
+ship their own, so there is nothing to install. Development builds use an
+installed ffmpeg (found on `PATH`, in Homebrew's folders, or via
+`CATCONVERT_FFMPEG`, which always wins) and libjxl (`brew install jpeg-xl`, or
+`CATCONVERT_LIBJXL`). An ffmpeg built with libjxl works as a JPEG XL fallback.
+
+## Download
+
+Get the latest `.dmg`, `.msi`/`.exe`, `.AppImage` or `.deb` from
+[Releases](https://github.com/Jotrorox/catconvert/releases/latest).
 
 ## Quick start
 
@@ -72,8 +81,10 @@ catconvert/
 ├── apps/
 │   └── desktop/            # SolidJS + Vite front end (src/)
 │       └── src-tauri/      # Tauri shell: thin commands over catconvert-core
-├── scripts/release.mjs     # version bump + tag (used by `mise run release`)
-└── .github/                # CI, release and Dependabot config
+├── scripts/
+│   ├── release.mjs         # version bump + tag (used by `mise run release`)
+│   └── media-tools/        # static ffmpeg/libjxl build + pinned sources
+└── .github/                # CI, release, media-tools and Dependabot config
 ```
 
 All logic lives in `catconvert-core`. The Tauri commands, the CLI and the FFI
