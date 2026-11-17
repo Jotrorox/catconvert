@@ -51,7 +51,7 @@ jobs:
 
       - name: Install build tools (macOS)
         if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
-        run: brew install nasm ninja pkgconf
+        run: brew install meson nasm ninja pkgconf
 
       - name: Install build tools (Linux)
         if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
@@ -59,7 +59,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends nasm ninja-build pkg-config
+          sudo apt-get install -y --no-install-recommends meson nasm ninja-build pkg-config
           if [ "$TARGET" = x86_64-pc-windows-msvc ]; then
             sudo apt-get install -y --no-install-recommends mingw-w64
           fi
