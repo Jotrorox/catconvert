@@ -11,7 +11,7 @@ type Props = {
   onChange: (codec: VideoCodec | null) => void;
 };
 
-/** H.264/VP9 or AV1, for formats that can hold more than one video codec. */
+/** H.264, H.265, VP9 or AV1, for formats that can hold more than one video codec. */
 export const CodecField: Component<Props> = (props) => {
   const codecs = () => videoCodecs(props.format);
   const current = () => codecOf({ format: props.format, videoCodec: props.codec });

@@ -76,7 +76,7 @@ export type OutputFormat =
   | "jxl";
 
 /** How the picture of an MP4, MOV, MKV or WebM file is compressed. */
-export type VideoCodec = "h264" | "vp9" | "av1";
+export type VideoCodec = "h264" | "h265" | "vp9" | "av1";
 
 export type Rotation = 0 | 90 | 180 | 270;
 
@@ -147,9 +147,16 @@ export type ConvertOptions = {
   videoCodec: VideoCodec | null;
   /**
    * Exact average video bitrate in kbit/s instead of the CRF `quality` picks
-   * (MP4, MOV, MKV, WebM); `null` uses `quality`. H.264 and VP9 take two passes.
+   * (MP4, MOV, MKV, WebM); `null` uses `quality`. H.264, H.265 and VP9 take
+   * two passes in software.
    */
   videoBitrate: number | null;
+  /**
+   * Encode H.265 on the graphics hardware where `FfmpegStatus.hevcHardware`
+   * says it can (VideoToolbox on Apple silicon): much faster, bigger files.
+   * Falls back to x265 elsewhere; ignored for other codecs and slideshows.
+   */
+  hardware: boolean;
   jxl: JxlOptions;
   sound: SoundOptions;
   /** Which dates, places and other tags to carry over, where the format can hold them. */
@@ -174,12 +181,16 @@ export type AudioRate =
 /** How the picture of a video file is encoded. */
 export type VideoRate = {
   codec: VideoCodec;
-  /** Constant rate factor; `null` with an exact bitrate. */
+  /** Constant rate factor; `null` with an exact bitrate or in hardware. */
   crf: number | null;
   /** Exact average bitrate in kbit/s; `null` with a CRF. */
   kbps: number | null;
-  /** 2 for an exact H.264 or VP9 bitrate, otherwise 1. */
+  /** 2 for an exact H.264, H.265 or VP9 bitrate in software, otherwise 1. */
   passes: number;
+  /** Encoded by the graphics hardware (VideoToolbox) rather than x265. */
+  hardware: boolean;
+  /** VideoToolbox's constant quality (higher is better) in hardware without an exact bitrate. */
+  hardwareQuality: number | null;
 };
 
 /** The numbers behind the quality setting, exactly as the planned command uses them. */
@@ -242,6 +253,8 @@ export type FfmpegStatus = {
   formats: { format: OutputFormat; available: boolean; animated: boolean }[];
   /** Video codecs ffmpeg can write. */
   videoCodecs: VideoCodec[];
+  /** H.265 can be encoded in hardware (VideoToolbox on Apple silicon). */
+  hevcHardware: boolean;
   /** ffmpeg decodes AV1 video and AVIF pictures (it has dav1d or libaom). */
   readsAv1: boolean;
   /** Version of libjxl's cjxl/djxl, if installed. */
@@ -365,6 +378,7 @@ export async function ffmpegStatus(): Promise<FfmpegStatus> {
       error: "Open CatConvert as an app to convert files.",
       formats: [],
       videoCodecs: [],
+      hevcHardware: false,
       readsAv1: false,
       libjxl: null,
       jxl: NO_JXL,

@@ -879,6 +879,141 @@ mod tests {
         assert_eq!(left, ["noise.mkv", "noise.mp4"], "pass logs are cleaned up");
     }
 
+    /// The issue's HDR acceptance test: an HDR clip becomes 10-bit H.265
+    /// (Main 10, tagged `hvc1`) that stays HDR, and SDR stays 8-bit Main.
+    /// Skipped (passes) without an ffmpeg that has libx265.
+    #[test]
+    fn h265_keeps_hdr_end_to_end() {
+        use crate::VideoCodec;
+
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping H.265 end-to-end test");
+            return;
+        };
+        if ffmpeg.missing_codec(VideoCodec::H265).is_some() {
+            eprintln!("ffmpeg lacks libx265; skipping H.265 end-to-end test");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let make = |name: &str, hdr: bool| {
+            let path = dir.path().join(name);
+            let mut cmd = std::process::Command::new(ffmpeg.ffmpeg_path());
+            cmd.args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=1:r=25",
+            ])
+            .args(["-f", "lavfi", "-i", "sine=d=1", "-shortest"]);
+            if hdr {
+                cmd.args([
+                    "-vf",
+                    "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                ]);
+            }
+            let status = cmd
+                .args(["-c:v", "ffv1", "-c:a", "pcm_s16le"])
+                .arg(&path)
+                .status()
+                .expect("run ffmpeg");
+            assert!(status.success());
+            path
+        };
+        let hdr = make("hlg.mkv", true);
+        let sdr = make("sdr.mkv", false);
+        assert!(ffmpeg.probe(&hdr).expect("probe").hdr);
+
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let options = ConvertOptions {
+            format: OutputFormat::Mov,
+            video_codec: Some(VideoCodec::H265),
+            ..ConvertOptions::default()
+        };
+        let streams = |path: &Path| {
+            let out = std::process::Command::new(ffmpeg.ffprobe_path())
+                .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+                .args(["stream=codec_tag_string,profile,pix_fmt", "-of", "csv=p=0"])
+                .arg(path)
+                .output()
+                .expect("run ffprobe");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        let ticket = queue.submit(&hdr, &options).expect("submit");
+        let done = finish_of(&rx, ticket.id);
+        assert_eq!(done.stage, JobStage::Done, "{done:?}");
+        let out = ffmpeg.probe(&ticket.output).expect("probe H.265");
+        assert_eq!(out.video_codec.as_deref(), Some("hevc"));
+        assert!(out.hdr, "H.265 keeps the HDR transfer");
+        assert!(out.has_audio());
+        assert_eq!(streams(&ticket.output), "Main 10,hvc1,yuv420p10le");
+
+        let ticket = queue.submit(&sdr, &options).expect("submit SDR");
+        let done = finish_of(&rx, ticket.id);
+        assert_eq!(done.stage, JobStage::Done, "{done:?}");
+        assert!(!ffmpeg.probe(&ticket.output).expect("probe").hdr);
+        assert_eq!(streams(&ticket.output), "Main,hvc1,yuv420p");
+
+        // VideoToolbox, where there is one, keeps HDR too.
+        if ffmpeg.encodes_hevc_in_hardware() {
+            let fast = ConvertOptions {
+                format: OutputFormat::Mkv,
+                hardware: true,
+                ..options.clone()
+            };
+            let ticket = queue.submit(&hdr, &fast).expect("submit hardware");
+            assert!(
+                ticket.command.contains("hevc_videotoolbox"),
+                "{}",
+                ticket.command
+            );
+            let done = finish_of(&rx, ticket.id);
+            assert_eq!(done.stage, JobStage::Done, "{done:?}");
+            assert!(ffmpeg.probe(&ticket.output).expect("probe").hdr);
+            assert!(streams(&ticket.output).starts_with("Main 10,"));
+            std::fs::remove_file(&ticket.output).expect("remove");
+        }
+
+        // Exact bitrate: two passes, and x265's statistics are cleaned up.
+        let exact = ConvertOptions {
+            format: OutputFormat::Mp4,
+            video_bitrate: Some(400),
+            ..options
+        };
+        let ticket = queue.submit(&sdr, &exact).expect("submit two-pass");
+        let done = finish_of(&rx, ticket.id);
+        assert_eq!(done.stage, JobStage::Done, "{done:?}");
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["hlg.mkv", "hlg.mov", "sdr.mkv", "sdr.mov", "sdr.mp4"]
+        );
+
+        // WebM can't hold H.265.
+        let webm = ConvertOptions {
+            format: OutputFormat::Webm,
+            ..exact
+        };
+        assert!(queue.submit(&sdr, &webm).is_err());
+    }
+
     /// Wait for the final event of `id`.
     fn finish_of(rx: &mpsc::Receiver<JobProgress>, id: JobId) -> JobProgress {
         loop {

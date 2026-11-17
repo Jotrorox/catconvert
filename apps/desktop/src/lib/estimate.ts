@@ -111,13 +111,19 @@ const TYPICAL_IMAGE_BPP: Record<string, number> = {
 /**
  * Bits per pixel of a typical 1080p30 frame for the video encoder settings in
  * `push_video_encoder`. Each step of CRF changes the size by a fixed ratio:
- * x264 doubles about every 6, VP9 about every 8 and SVT-AV1 about every 9.
- * VP9 needs roughly 30% fewer bits than x264 for the same look; 10-bit AV1
- * at CRF 32 looks about like x264 at 24 with roughly 40% fewer.
+ * x264 and x265 double about every 6, VP9 about every 8 and SVT-AV1 about
+ * every 9. VP9 needs roughly 30% fewer bits than x264 for the same look;
+ * x265 at CRF 28 and 10-bit AV1 at CRF 32 look about like x264 at 24 with
+ * roughly 40% fewer. VideoToolbox's hardware H.265 gives up most of that
+ * saving for speed, and doubles about every 10 steps of its quality.
  */
 function videoBpp(options: ConvertOptions): number {
   const q = options.quality;
   switch (codecOf(options)) {
+    case "h265":
+      return options.hardware
+        ? 0.075 * 2 ** ((lerp(q, 40, 80) - 64) / 10)
+        : 0.048 * 2 ** ((28 - lerp(q, 38, 22)) / 6);
     case "av1":
       return 0.045 * 2 ** ((32 - lerp(q, 48, 22)) / 9);
     case "vp9":
@@ -341,7 +347,10 @@ function videoText(rate: VideoRate, estimate: number | null): string {
   if (rate.kbps !== null) {
     return `${formatBitrate(rate.kbps * 1000)} (${rate.passes > 1 ? `${rate.passes}-pass` : "average"})`;
   }
-  const crf = `CRF ${rate.crf ?? "?"}`;
+  const crf =
+    rate.hardwareQuality !== null
+      ? `hardware, quality ${rate.hardwareQuality}`
+      : `CRF ${rate.crf ?? "?"}`;
   return estimate === null || !Number.isFinite(estimate)
     ? crf
     : `~${formatBitrate(estimate, true)} (${crf})`;

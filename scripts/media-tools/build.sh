@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Build the media tools the desktop app bundles: ffmpeg (with x264) and a
-# decode-only ffprobe, both GPL-2.0-or-later and both reading AV1 with dav1d,
-# and libjxl's cjxl, djxl and jxlinfo. Everything is built from the pinned sources in sources.lock and
-# linked statically, so the binaries only need what the OS itself provides.
+# Build the media tools the desktop app bundles: ffmpeg (with x264 and x265)
+# and a decode-only ffprobe, both GPL-2.0-or-later and both reading AV1 with
+# dav1d, and libjxl's cjxl, djxl and jxlinfo. Everything is built from the
+# pinned sources in sources.lock and linked statically, so the binaries only
+# need what the OS itself provides.
 #
 # Usage:
 #   build.sh <target> [out-dir]     build for a Rust target triple
@@ -28,7 +29,7 @@
 #   MEDIA_TOOLS_WORK     scratch directory (default: target/media-tools)
 #   MEDIA_TOOLS_SOURCES  where pinned tarballs are cached (default: $MEDIA_TOOLS_WORK/sources)
 #   MEDIA_TOOLS_JOBS     parallel jobs (default: number of CPUs)
-#   MEDIA_TOOLS_MAX_MB   size budget per architecture in MB (default: 100)
+#   MEDIA_TOOLS_MAX_MB   size budget per architecture in MB (default: 120)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,7 +46,8 @@ fi
 WORK="${MEDIA_TOOLS_WORK:-$DEFAULT_WORK}"
 CACHE="${MEDIA_TOOLS_SOURCES:-$WORK/sources}"
 JOBS="${MEDIA_TOOLS_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
-MAX_MB="${MEDIA_TOOLS_MAX_MB:-100}"
+# x265 (8 and 10 bits) took this from 100 MB.
+MAX_MB="${MEDIA_TOOLS_MAX_MB:-120}"
 TOOLS="ffmpeg ffprobe cjxl djxl jxlinfo"
 # Prefix of the bundled file names; keep in sync with BUNDLED_PREFIX in
 # crates/core/src/ffmpeg.rs. It keeps a Linux package from claiming /usr/bin/ffmpeg.
@@ -53,7 +55,9 @@ NAME_PREFIX="catconvert-"
 # Keep in sync with bundle.macOS.minimumSystemVersion in tauri.conf.json.
 MACOS_MIN="11.0"
 # Encoders catconvert-core asks for (crates/core/src/convert.rs).
-REQUIRED_ENCODERS="libx264 libvpx-vp9 libopus libmp3lame libwebp libwebp_anim libsvtav1 libjxl libjxl_anim aac flac pcm_s16le gif apng png mjpeg"
+REQUIRED_ENCODERS="libx264 libx265 libvpx-vp9 libopus libmp3lame libwebp libwebp_anim libsvtav1 libjxl libjxl_anim aac flac pcm_s16le gif apng png mjpeg"
+# And on macOS, H.265 in hardware (ConvertOptions::hardware).
+REQUIRED_ENCODERS_MACOS="hevc_videotoolbox"
 # Decoders and filters it relies on beyond the usual: HEIC photos are HEVC
 # tiles that ffmpeg stitches with xstack and crops and turns upright; AV1
 # video and AVIF pictures need dav1d (ffmpeg's own av1 decoder only drives
@@ -252,6 +256,15 @@ EOF
 cmake_install() {
   local src=$1
   shift
+  cmake_build "$src" "$src/_build" "$@"
+  cmake --install "$src/_build"
+}
+
+# cmake_build <source dir> <build dir> [cmake options...]: configure and build
+# without installing.
+cmake_build() {
+  local src=$1 build=$2
+  shift 2
   # Homebrew's prefix is ignored for libraries below, which hides its programs
   # too, so name the build tools explicitly.
   local programs=(-DCMAKE_MAKE_PROGRAM="$(command -v ninja)"
@@ -259,7 +272,7 @@ cmake_install() {
   if command -v nasm >/dev/null 2>&1; then
     programs+=(-DCMAKE_ASM_NASM_COMPILER="$(command -v nasm)")
   fi
-  cmake -S "$src" -B "$src/_build" -G Ninja \
+  cmake -S "$src" -B "$build" -G Ninja \
     "${programs[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
@@ -272,8 +285,7 @@ cmake_install() {
     -DBUILD_TESTING=OFF \
     ${CMAKE_EXTRA[@]+"${CMAKE_EXTRA[@]}"} \
     "$@"
-  cmake --build "$src/_build" --parallel "$JOBS"
-  cmake --install "$src/_build"
+  cmake --build "$build" --parallel "$JOBS"
 }
 
 # meson_install <source dir> [meson options...]
@@ -459,6 +471,46 @@ build_x264() {
   )
 }
 
+# x265 builds one bit depth at a time. As upstream's build/linux/multilib.sh
+# does, a 10-bit library (Main 10, for HDR) is linked into the 8-bit one,
+# which picks the depth per encode, and the two archives are merged into one
+# libx265.a. 12 bits isn't needed.
+build_x265() {
+  local src common=() private=""
+  unpack x265
+  src=$UNPACKED
+  # No libnuma on Linux, which the binary would then link; x265 looks for
+  # nasm itself, past cmake_build's CMAKE_ASM_NASM_COMPILER.
+  common=(-DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_LIBNUMA=OFF)
+  if command -v nasm >/dev/null 2>&1; then
+    common+=(-DNASM_EXECUTABLE="$(command -v nasm)")
+  fi
+  cmake_build "$src/source" "$src/_build10" "${common[@]}" \
+    -DHIGH_BIT_DEPTH=ON -DEXPORT_C_API=OFF
+  mkdir -p "$src/_build"
+  cp "$src/_build10/libx265.a" "$src/_build/libx265_main10.a"
+  cmake_build "$src/source" "$src/_build" "${common[@]}" \
+    -DEXTRA_LIB=x265_main10.a -DEXTRA_LINK_FLAGS=-L. -DLINKED_10BIT=ON
+  (
+    cd "$src/_build"
+    mv libx265.a libx265_main.a
+    if [ "$OS" = macos ]; then
+      libtool -static -o libx265.a libx265_main.a libx265_main10.a
+    else
+      printf 'CREATE libx265.a\nADDLIB libx265_main.a\nADDLIB libx265_main10.a\nSAVE\nEND\n' |
+        ${AR:-ar} -M
+    fi
+  )
+  cmake --install "$src/_build"
+  # x265.pc lists the C++ runtime as CMake found it (a shared libstdc++ and
+  # libgcc_s on Linux). configure_ffmpeg adds the runtime the way each OS
+  # needs it, so keep only what x265 needs besides.
+  [ "$OS" = linux ] && private="-lm -lpthread -ldl"
+  sed "s|^Libs.private:.*|Libs.private: $private|" "$PREFIX/lib/pkgconfig/x265.pc" \
+    >"$PREFIX/lib/pkgconfig/x265.pc.new"
+  mv "$PREFIX/lib/pkgconfig/x265.pc.new" "$PREFIX/lib/pkgconfig/x265.pc"
+}
+
 build_libvpx() {
   local src target asm=()
   unpack libvpx
@@ -521,8 +573,9 @@ build_dav1d() {
 }
 
 # ffmpeg is built twice from the same source. The full build gives ffmpeg with
-# every encoder the app uses. ffprobe only ever reads files, so the second build
-# leaves out encoders, muxers, filters and the encoder-only libraries (x264,
+# every encoder the app uses (on macOS including VideoToolbox's, for H.265 in
+# hardware). ffprobe only ever reads files, so the second build leaves out
+# encoders, muxers, filters and the encoder-only libraries (x264, x265,
 # SVT-AV1, LAME, libwebp, libvpx), which would otherwise more than double its
 # size for nothing. Both get the decoders: libjxl and dav1d.
 build_ffmpeg() {
@@ -535,6 +588,7 @@ build_ffmpeg() {
     --enable-indev=lavfi \
     --disable-outdevs \
     --enable-libx264 \
+    --enable-libx265 \
     --enable-libvpx \
     --enable-libopus \
     --enable-libmp3lame \
@@ -648,7 +702,8 @@ check_linkage() {
 # Run the new binaries when this machine can, and make sure every encoder the
 # app needs is in.
 smoke_test() {
-  local dir=$1 encoders enc missing="" run=()
+  local dir=$1 encoders enc missing="" run=() required=$REQUIRED_ENCODERS
+  [ "$OS" = macos ] && required="$required $REQUIRED_ENCODERS_MACOS"
   case $OS in
     macos)
       if [ "$CROSS" = 1 ]; then
@@ -666,7 +721,7 @@ smoke_test() {
   esac
   local ffmpeg="$dir/${NAME_PREFIX}ffmpeg-$TARGET$EXE"
   encoders=$(${run[@]+"${run[@]}"} "$ffmpeg" -hide_banner -encoders)
-  for enc in $REQUIRED_ENCODERS; do
+  for enc in $required; do
     printf '%s\n' "$encoders" | awk '{print $2}' | grep -qxF "$enc" || missing="$missing $enc"
   done
   [ -z "$missing" ] || die "ffmpeg lacks encoders the app needs:$missing"
@@ -719,12 +774,16 @@ write_licenses() {
     echo "Third-party software in CatConvert"
     echo
     echo "CatConvert runs these programs, which ship inside the app, as separate processes:"
-    echo "ffmpeg and ffprobe (GPL-2.0-or-later; ffmpeg includes x264), and cjxl, djxl"
+    echo "ffmpeg and ffprobe (GPL-2.0-or-later; ffmpeg includes x264 and x265), and cjxl, djxl"
     echo "and jxlinfo from libjxl. They were built from the unmodified upstream sources"
     echo "listed below. The complete corresponding source code, together with the script"
     echo "that built these programs, is attached to every CatConvert release as"
     echo "catconvert-<version>-media-tools-source.tar.xz:"
     echo "https://github.com/Jotrorox/catconvert/releases"
+    echo
+    echo "H.264 and H.265 (HEVC) are covered by patents licensed through patent pools."
+    echo "x264 and x265 come without a patent license; whether one is needed depends on"
+    echo "where and how the videos are used."
     for name in $(components); do
       printf '\n%s\n%s %s (%s)\n%s\n%s\n' "$rule" "$name" "$(lock "$name" 2)" \
         "$(lock "$name" 3 | sed 's/,/ AND /g')" "$(lock "$name" 4)" "$rule"
@@ -766,6 +825,7 @@ build_target() {
   build_highway
   build_libjxl
   build_x264
+  build_x265
   build_libvpx
   build_opus
   build_lame
@@ -813,7 +873,8 @@ pack_sources() {
   cp "$HERE/build.sh" "$HERE/sources.lock" "$stage/"
   cat >"$stage/README" <<'EOF'
 Corresponding source of the media tools bundled with CatConvert: ffmpeg and
-ffprobe (GPL-2.0-or-later, with x264) and libjxl's cjxl, djxl and jxlinfo.
+ffprobe (GPL-2.0-or-later, with x264 and x265) and libjxl's cjxl, djxl and
+jxlinfo.
 
 sources/      the exact upstream source archives the tools were built from
 sources.lock  versions, origins and SHA-256 checksums of those archives
