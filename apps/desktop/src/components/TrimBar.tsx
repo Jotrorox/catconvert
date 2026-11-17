@@ -10,6 +10,8 @@ type Props = {
   onChange: (start: number, end: number) => void;
   /** A position worth previewing (handle moved, track clicked). */
   onScrub: (time: number) => void;
+  /** Fade lengths in seconds, drawn as ramps at the ends of the kept range. */
+  fades?: { fadeIn: number; fadeOut: number } | undefined;
   /** Track background: filmstrip or waveform. */
   children?: JSX.Element;
 };
@@ -24,6 +26,11 @@ export const TrimBar: Component<Props> = (props) => {
   let track: HTMLDivElement | undefined;
   const minGap = () => Math.min(0.1, props.duration / 2);
   const pct = (t: number) => (props.duration > 0 ? (t / props.duration) * 100 : 0);
+  /** A span as a share of the kept range, in percent. */
+  const rampPct = (secs: number) => {
+    const length = props.end - props.start;
+    return length > 0 ? Math.min(100, (secs / length) * 100) : 0;
+  };
 
   const timeAt = (clientX: number) => {
     if (!track) return 0;
@@ -129,6 +136,14 @@ export const TrimBar: Component<Props> = (props) => {
       <div class="trim-bg">{props.children}</div>
       <div class="trim-shade left" style={{ left: 0, width: `${pct(props.start)}%` }} />
       <div class="trim-shade right" style={{ right: 0, width: `${100 - pct(props.end)}%` }} />
+      <Show when={props.fades && (props.fades.fadeIn > 0 || props.fades.fadeOut > 0)}>
+        <FadeRamps
+          left={pct(props.start)}
+          right={100 - pct(props.end)}
+          fadeIn={rampPct(props.fades?.fadeIn ?? 0)}
+          fadeOut={rampPct(props.fades?.fadeOut ?? 0)}
+        />
+      </Show>
       <div
         class="trim-range"
         style={{ left: `${pct(props.start)}%`, right: `${100 - pct(props.end)}%` }}
@@ -142,3 +157,28 @@ export const TrimBar: Component<Props> = (props) => {
     </div>
   );
 };
+
+/**
+ * The volume envelope over the kept range: the area above each ramp is
+ * dimmed, like the trimmed-off ends, so the fade reads as sound going away.
+ */
+const FadeRamps: Component<{ left: number; right: number; fadeIn: number; fadeOut: number }> = (
+  props,
+) => (
+  <svg
+    class="trim-fades"
+    style={{ left: `${props.left}%`, right: `${props.right}%` }}
+    viewBox="0 0 100 100"
+    preserveAspectRatio="none"
+    aria-hidden="true"
+  >
+    <Show when={props.fadeIn > 0}>
+      <polygon class="fade-shade" points={`0,0 ${props.fadeIn},0 0,100`} />
+      <line class="fade-line" x1="0" y1="100" x2={props.fadeIn} y2="0" />
+    </Show>
+    <Show when={props.fadeOut > 0}>
+      <polygon class="fade-shade" points={`${100 - props.fadeOut},0 100,0 100,100`} />
+      <line class="fade-line" x1={100 - props.fadeOut} y1="0" x2="100" y2="100" />
+    </Show>
+  </svg>
+);

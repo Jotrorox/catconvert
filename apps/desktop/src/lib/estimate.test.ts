@@ -15,9 +15,11 @@ const clip: MediaInfo = {
   fps: 30,
   videoCodec: "h264",
   audioCodec: "aac",
+  sampleRate: 48000,
   reconstructsJpeg: false,
   hasLocation: false,
   locationTags: [],
+  tileGrid: null,
 };
 
 const photo: MediaInfo = {
@@ -33,6 +35,7 @@ const photo: MediaInfo = {
   fps: null,
   videoCodec: "mjpeg",
   audioCodec: null,
+  sampleRate: null,
 };
 
 const song: MediaInfo = {
@@ -48,6 +51,7 @@ const song: MediaInfo = {
   fps: null,
   videoCodec: null,
   audioCodec: "pcm_s16le",
+  sampleRate: 48000,
 };
 
 const opts = (format: OutputFormat, patch: Partial<ConvertOptions> = {}): ConvertOptions => ({
@@ -96,6 +100,21 @@ describe("estimateBytes", () => {
     expect(size(clip, "mp4", { keepAudio: false })).toBeLessThan(full);
     expect(size(clip, "mp4", { fps: 15 })).toBeLessThan(full);
     expect(size(clip, "mp4", { maxSize: 480 })).toBeLessThan(size(clip, "mp4", { maxSize: 720 }));
+    // A 9:16 crop keeps under a third of a 16:9 picture; smaller frames cost
+    // more bits per pixel, so the file shrinks a little less than that.
+    const vertical = size(clip, "mp4", { keepAudio: false, crop: { aspect: [9, 16], area: null } });
+    expect(vertical).toBeLessThan(size(clip, "mp4", { keepAudio: false }) / 2);
+  });
+
+  it("follows the speed and direction of animations, not of videos", () => {
+    const gif = size(clip, "gif");
+    // 2× halves the length; the 15 fps cap keeps the frame rate.
+    expect(size(clip, "gif", { speed: 2 })).toBeCloseTo(gif / 2);
+    expect(size(clip, "gif", { speed: 2, direction: "boomerang" })).toBeCloseTo(gif);
+    expect(size(clip, "gif", { direction: "reverse" })).toBeCloseTo(gif);
+    // At 0.25× a 30 fps clip plays at 7.5 fps for four times as long.
+    expect(size(clip, "gif", { speed: 0.25 })).toBeCloseTo(gif * 2);
+    expect(size(clip, "mp4", { speed: 2, direction: "boomerang" })).toBeCloseTo(size(clip, "mp4"));
   });
 
   it("uses the source for lossless sound", () => {

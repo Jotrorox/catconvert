@@ -66,9 +66,11 @@ const VIDEO: MediaInfo = {
   fps: 30,
   videoCodec: "h264",
   audioCodec: "aac",
+  sampleRate: 48000,
   reconstructsJpeg: false,
   hasLocation: false,
   locationTags: [],
+  tileGrid: null,
 };
 
 const PHOTO: MediaInfo = {
@@ -83,6 +85,7 @@ const PHOTO: MediaInfo = {
   fps: null,
   videoCodec: "mjpeg",
   audioCodec: null,
+  sampleRate: null,
 };
 
 const PACKED: MediaInfo = {
@@ -92,6 +95,7 @@ const PACKED: MediaInfo = {
   extension: "jxl",
   videoCodec: "jpegxl",
   reconstructsJpeg: true,
+  tileGrid: null,
 };
 
 const SONG: MediaInfo = {
@@ -105,6 +109,7 @@ const SONG: MediaInfo = {
   fps: null,
   videoCodec: null,
   audioCodec: "pcm_s16le",
+  sampleRate: 48000,
 };
 
 beforeEach(() => {
@@ -164,6 +169,40 @@ describe("CatConvert", () => {
     expect(screen.getByRole("button", { name: "Hide licenses" })).toBeInTheDocument();
   });
 
+  it("cleans up the sound and draws the fades on the trim bar", async () => {
+    await openVideo();
+    expect(screen.getByRole("heading", { name: "Sound" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("switch", { name: "Even out loudness" }));
+    const fadeIn = within(screen.getByRole("group", { name: "Fade in" }));
+    const fadeOut = within(screen.getByRole("group", { name: "Fade out" }));
+    expect(fadeIn.getByRole("button", { name: "Off" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(fadeIn.getByRole("button", { name: "1 s" }));
+    fireEvent.click(fadeOut.getByRole("button", { name: "3 s" }));
+    expect(document.querySelectorAll(".trim-fades .fade-line")).toHaveLength(2);
+    expect(screen.getByText(/picture fades from and to black/)).toBeInTheDocument();
+
+    const changes = within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "Even loudness",
+      "Fades in 1 s",
+      "Fades out 3 s",
+    ]);
+
+    // Without sound there is nothing to clean up.
+    fireEvent.click(screen.getByRole("switch", { name: "Keep sound" }));
+    expect(screen.queryByRole("heading", { name: "Sound" })).not.toBeInTheDocument();
+    expect(document.querySelector(".trim-fades")).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: "Keep sound" }));
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ sound: { normalize: true, fadeIn: 1, fadeOut: 3 } }),
+    );
+  });
+
   it("edits a video and queues it with the chosen settings", async () => {
     await openVideo();
     expect(screen.getByText(/1920×1080 · 0:42 · H264/)).toBeInTheDocument();
@@ -201,10 +240,14 @@ describe("CatConvert", () => {
       fps: null,
       rotate: 90,
       flip: false,
+      crop: null,
       quality: 60,
       keepAudio: false,
       jxl: { lossless: false, effort: 7, progressive: false },
+      sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
       metadata: "noLocation",
+      speed: 1,
+      direction: "forward",
     });
 
     applyProgress({
@@ -231,6 +274,55 @@ describe("CatConvert", () => {
     expect(api.revealInFolder).toHaveBeenCalledWith("/clips/clip.webm");
     expect(screen.getByText("All done. Purrfect.")).toBeInTheDocument();
     expect(state.history[0]?.outputBytes).toBe(3_000_000);
+  });
+
+  it("crops to a shape that follows the picture when it turns", async () => {
+    await openVideo();
+    expect(screen.queryByRole("group", { name: "Crop shape" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Crop" }));
+    expect(screen.getByRole("button", { name: "Crop" })).toHaveAttribute("aria-pressed", "true");
+    const shapes = within(screen.getByRole("group", { name: "Crop shape" }));
+    expect(shapes.getByRole("button", { name: "Free" })).toHaveAttribute("aria-pressed", "true");
+    expect(shapes.getByRole("button", { name: "Reset" })).toBeDisabled();
+
+    fireEvent.click(shapes.getByRole("button", { name: "9:16" }));
+    expect(shapes.getByRole("button", { name: "9:16" })).toHaveAttribute("aria-pressed", "true");
+    const changes = () =>
+      within(screen.getByRole("list", { name: "Changes" }))
+        .getAllByRole("listitem")
+        .map((li) => li.textContent);
+    expect(changes()).toEqual(["Cropped 9:16"]);
+    // 9:16 of 1920×1080 is 608×1080, so sizes are offered for a 608 px wide picture.
+    expect(screen.getByRole("combobox", { name: "Size" })).toHaveDisplayValue("Original (608p)");
+
+    // Turning the picture turns the crop with it.
+    fireEvent.click(screen.getByRole("button", { name: "Rotate 90°" }));
+    expect(shapes.getByRole("button", { name: "16:9" })).toHaveAttribute("aria-pressed", "true");
+    expect(changes()).toEqual(["Turned 90°", "Cropped 16:9"]);
+
+    // Free keeps the box but lets it change shape.
+    fireEvent.click(shapes.getByRole("button", { name: "Free" }));
+    expect(changes()).toEqual(["Turned 90°", "Cropped 1080×608"]);
+    fireEvent.click(shapes.getByRole("button", { name: "1:1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Done cropping" }));
+    expect(screen.queryByRole("group", { name: "Crop shape" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ rotate: 90, crop: { aspect: [1, 1], area: null } }),
+    );
+  });
+
+  it("resets a crop", async () => {
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "Crop" }));
+    const shapes = within(screen.getByRole("group", { name: "Crop shape" }));
+    fireEvent.click(shapes.getByRole("button", { name: "1:1" }));
+    fireEvent.click(shapes.getByRole("button", { name: "Reset" }));
+    expect(state.draft?.options.crop).toBeNull();
+    expect(screen.getByText("Same picture and length, fresh format.")).toBeInTheDocument();
   });
 
   it("handles progress events that arrive before startJob resolves", async () => {
@@ -337,6 +429,44 @@ describe("CatConvert", () => {
       "720p",
       "Animated",
     ]);
+  });
+
+  it("changes how a GIF plays and says so, since the preview is a still", async () => {
+    await openVideo();
+    // Videos keep their own pace for now.
+    expect(screen.queryByRole("group", { name: "Speed" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "GIF" }));
+    const speed = within(screen.getByRole("group", { name: "Speed" }));
+    const direction = within(screen.getByRole("group", { name: "Direction" }));
+    expect(speed.getByRole("button", { name: "1×" })).toHaveAttribute("aria-pressed", "true");
+    expect(direction.getByRole("button", { name: "Forward" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const before = screen.getByText(/^About /).textContent;
+
+    fireEvent.click(speed.getByRole("button", { name: "2×" }));
+    fireEvent.click(direction.getByRole("button", { name: "Boomerang" }));
+    const changes = within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "480p",
+      "15 fps",
+      "2× · Boomerang · 42 s",
+    ]);
+    // Same length and frame rate, so about the same size.
+    expect(screen.getByText(/^About /).textContent).toBe(before);
+
+    fireEvent.click(speed.getByRole("button", { name: "4×" }));
+    fireEvent.click(direction.getByRole("button", { name: "Reverse" }));
+    expect(changes.getAllByRole("listitem").at(-1)?.textContent).toBe("4× · Reverse · 10.5 s");
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ format: "gif", speed: 4, direction: "reverse" }),
+    );
   });
 
   it("restores the original JPEG from a repacked JPEG XL", async () => {

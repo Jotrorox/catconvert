@@ -10,7 +10,7 @@
 //! are available:
 //!
 //! 1. [`Ffmpeg::probe`] reads duration, size and codecs of a file.
-//! 2. [`plan`] turns [`ConvertOptions`] (format, trim, size, rotation, …) into
+//! 2. [`plan`] turns [`ConvertOptions`] (format, trim, size, rotation, crop, …) into
 //!    one or more command lines ([`Step`]s).
 //! 3. [`Queue`] runs planned conversions one after another and reports
 //!    [`JobProgress`] events.
@@ -24,8 +24,8 @@ mod media;
 mod scrub;
 
 pub use convert::{
-    ConvertOptions, JxlOptions, JxlSupport, Metadata, OutputFormat, Plan, Step, Tool, output_path,
-    plan,
+    ConvertOptions, Crop, CropArea, Direction, JxlOptions, JxlSupport, Metadata, OutputFormat,
+    Plan, SoundOptions, Step, Tool, output_path, plan,
 };
 pub use error::{Error, Result};
 pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, RunProgress};

@@ -370,6 +370,26 @@ mod tests {
             stage => assert_eq!(stage, JobStage::Done),
         }
 
+        // A fast boomerang GIF: 1.2 s at 2× is 0.6 s, there and back
+        // without repeating the turnaround frames: 9 + 7 frames at 15 fps.
+        if ffmpeg.supports(OutputFormat::Gif) {
+            let boomerang = ConvertOptions {
+                format: OutputFormat::Gif,
+                trim_start: Some(0.4),
+                trim_end: Some(1.6),
+                max_size: Some(60),
+                speed: 2.0,
+                direction: crate::Direction::Boomerang,
+                ..ConvertOptions::default()
+            };
+            let ticket = queue.submit(&input, &boomerang).expect("submit");
+            let done = finish_of(&rx, ticket.id);
+            assert_eq!(done.stage, JobStage::Done, "{done:?}");
+            let out = ffmpeg.probe(&ticket.output).expect("probe gif");
+            let secs = out.duration_secs.expect("duration");
+            assert!((secs - 16.0 / 15.0).abs() < 0.1, "{secs}");
+        }
+
         // Preview helpers.
         let frame = ffmpeg.frame(&input, 1.0, 90).expect("frame");
         assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
@@ -580,6 +600,19 @@ mod tests {
         let out = ffmpeg.probe(&ticket.output).expect("probe");
         assert_eq!((out.width, out.height), (Some(240), Some(320)));
 
+        // Turned and cropped square.
+        let square = ConvertOptions {
+            crop: Some(crate::Crop {
+                aspect: Some([1, 1]),
+                area: None,
+            }),
+            ..turned
+        };
+        let ticket = queue.submit(&jpeg, &square).expect("submit");
+        assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
+        let out = ffmpeg.probe(&ticket.output).expect("probe");
+        assert_eq!((out.width, out.height), (Some(240), Some(240)));
+
         // Video → animated JXL.
         let animated = ConvertOptions {
             format: OutputFormat::Jxl,
@@ -618,5 +651,65 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(hidden.is_empty(), "{hidden:?}");
+    }
+
+    /// A tiled HEIC like an iPhone's: probe, preview and convert the whole
+    /// picture, not its first tile. ffmpeg can't write HEIC, so this needs
+    /// macOS's `sips` to make one; skipped (passes) without it, and with an
+    /// ffprobe older than 7 that knows no tile grids.
+    #[test]
+    fn tiled_heic_end_to_end() {
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping HEIC test");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let jpeg = dir.path().join("photo.jpg");
+        let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=1200x900"])
+            .args(["-frames:v", "1"])
+            .arg(&jpeg)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+        let heic = dir.path().join("IMG_0001.HEIC");
+        let made = std::process::Command::new("sips")
+            .args(["-s", "format", "heic"])
+            .arg(&jpeg)
+            .arg("--out")
+            .arg(&heic)
+            .output();
+        if !made.is_ok_and(|out| out.status.success()) {
+            eprintln!("sips not available; skipping HEIC test");
+            return;
+        }
+
+        let info = ffmpeg.probe(&heic).expect("probe");
+        assert_eq!(info.kind, crate::MediaKind::Image);
+        if info.tile_grid.is_none() {
+            eprintln!("this ffprobe knows no tile grids; skipping HEIC test");
+            return;
+        }
+        assert_eq!((info.width, info.height), (Some(1200), Some(900)));
+
+        let frame = ffmpeg.frame(&heic, 0.0, 90).expect("frame");
+        assert_eq!(&frame[..2], &[0xFF, 0xD8], "JPEG magic");
+
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        for (max_size, size) in [(None, (1200, 900)), (Some(300), (400, 300))] {
+            let options = ConvertOptions {
+                format: OutputFormat::Png,
+                max_size,
+                ..ConvertOptions::default()
+            };
+            let ticket = queue.submit(&heic, &options).expect("submit");
+            assert_eq!(finish_of(&rx, ticket.id).stage, JobStage::Done);
+            let out = ffmpeg.probe(&ticket.output).expect("probe png");
+            assert_eq!((out.width, out.height), (Some(size.0), Some(size.1)));
+            std::fs::remove_file(&ticket.output).expect("remove output");
+        }
     }
 }
