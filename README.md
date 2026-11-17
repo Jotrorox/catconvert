@@ -191,7 +191,7 @@ Alternatively, native shells can use `catconvert-ffi` through UniFFI.
 
 ## License
 
-CatConvert is [BSD-3-Clause](LICENSE). The desktop app bundles ffmpeg and
-ffprobe built with x264, which are GPL-2.0-or-later, and libjxl's tools; they run
+CatConvert is [BSD-3-Clause](LICENSE). The desktop app bundles ffmpeg (built
+with x264) and ffprobe, which are GPL-2.0-or-later, and libjxl's tools; they run
 as separate programs. Their licenses are listed in the app (Settings →
 Open-source licenses), and each release includes their source code.

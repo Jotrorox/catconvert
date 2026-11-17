@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build the media tools the desktop app bundles: ffmpeg and ffprobe (with x264,
-# so GPL-2.0-or-later) and libjxl's cjxl, djxl and jxlinfo. Everything is
-# built from the pinned sources in sources.lock and linked statically, so the
-# binaries only need what the OS itself provides.
+# Build the media tools the desktop app bundles: ffmpeg (with x264) and a
+# decode-only ffprobe, both GPL-2.0-or-later, and libjxl's cjxl, djxl and
+# jxlinfo. Everything is built from the pinned sources in sources.lock and
+# linked statically, so the binaries only need what the OS itself provides.
 #
 # Usage:
 #   build.sh <target> [out-dir]     build for a Rust target triple
@@ -442,10 +442,40 @@ build_svt_av1() {
     ${extra[@]+"${extra[@]}"}
 }
 
+# ffmpeg is built twice from the same source. The full build gives ffmpeg with
+# every encoder the app uses. ffprobe only ever reads files, so the second build
+# leaves out encoders, muxers, filters and the encoder-only libraries (x264,
+# SVT-AV1, LAME, libwebp, libvpx), which would otherwise more than double its
+# size for nothing.
 build_ffmpeg() {
-  local src args
+  local hw=()
+  [ "$OS" = macos ] && hw=(--enable-videotoolbox --enable-audiotoolbox)
   unpack ffmpeg
-  src=$UNPACKED
+  configure_ffmpeg "$UNPACKED/_build" \
+    --disable-ffprobe \
+    --disable-indevs \
+    --enable-indev=lavfi \
+    --disable-outdevs \
+    --enable-libx264 \
+    --enable-libvpx \
+    --enable-libopus \
+    --enable-libmp3lame \
+    --enable-libwebp \
+    --enable-libsvtav1 \
+    ${hw[@]+"${hw[@]}"}
+  configure_ffmpeg "$UNPACKED/_build_probe" \
+    --disable-ffmpeg \
+    --disable-encoders \
+    --disable-muxers \
+    --disable-avdevice \
+    --disable-avfilter \
+    --disable-swscale
+}
+
+# configure_ffmpeg <build dir> [configure options...]
+configure_ffmpeg() {
+  local dir=$1 args
+  shift
   args=(
     --prefix="$PREFIX"
     --pkg-config=pkg-config
@@ -459,27 +489,19 @@ build_ffmpeg() {
     --enable-gpl
     --disable-shared
     --enable-static
-    # Nothing found by accident: only the libraries listed below.
+    # Nothing found by accident: only the libraries listed here and by the caller.
     --disable-autodetect
     --disable-debug
     --disable-doc
     --disable-ffplay
     --disable-network
-    --disable-indevs
-    --enable-indev=lavfi
-    --disable-outdevs
     --enable-zlib
-    --enable-libx264
-    --enable-libvpx
-    --enable-libopus
-    --enable-libmp3lame
-    --enable-libwebp
-    --enable-libsvtav1
     --enable-libjxl
+    "$@"
   )
   case $OS in
     macos)
-      args+=(--enable-videotoolbox --enable-audiotoolbox --extra-libs=-lc++)
+      args+=(--extra-libs=-lc++)
       if [ "$CROSS" = 1 ]; then
         args+=(--enable-cross-compile --arch="$ARCH" --target-os=darwin)
       fi
@@ -496,9 +518,9 @@ build_ffmpeg() {
         "--extra-cflags=-DJXL_STATIC_DEFINE -DJXL_THREADS_STATIC_DEFINE -DJXL_CMS_STATIC_DEFINE")
       ;;
   esac
-  mkdir -p "$src/_build"
+  mkdir -p "$dir"
   (
-    cd "$src/_build"
+    cd "$dir"
     ../configure "${args[@]}" || {
       tail -n 60 ffbuild/config.log >&2
       exit 1
@@ -580,7 +602,12 @@ smoke_test() {
     printf '%s\n' "$listed" | grep -qxF "$name" || missing="$missing $name"
   done
   [ -z "$missing" ] || die "ffmpeg lacks filters the app needs:$missing"
-  ${run[@]+"${run[@]}"} "$dir/${NAME_PREFIX}ffprobe-$TARGET$EXE" -hide_banner -version >/dev/null
+  # ffprobe has its own, decode-only build.
+  listed=$(${run[@]+"${run[@]}"} "$dir/${NAME_PREFIX}ffprobe-$TARGET$EXE" -hide_banner -decoders | awk '{print $2}')
+  for name in $REQUIRED_DECODERS libjxl; do
+    printf '%s\n' "$listed" | grep -qxF "$name" || missing="$missing $name"
+  done
+  [ -z "$missing" ] || die "ffprobe lacks decoders the app needs:$missing"
   ${run[@]+"${run[@]}"} "$dir/${NAME_PREFIX}cjxl-$TARGET$EXE" --version >/dev/null
   ${run[@]+"${run[@]}"} "$dir/${NAME_PREFIX}djxl-$TARGET$EXE" --version >/dev/null
   log "Smoke test passed: $(${run[@]+"${run[@]}"} "$ffmpeg" -hide_banner -version | head -n 1)"
@@ -592,7 +619,8 @@ collect() {
   mkdir -p "$dir"
   for tool in $TOOLS; do
     case $tool in
-      ffmpeg | ffprobe) from="$SRC/ffmpeg/_build/$tool$EXE" ;;
+      ffmpeg) from="$SRC/ffmpeg/_build/ffmpeg$EXE" ;;
+      ffprobe) from="$SRC/ffmpeg/_build_probe/ffprobe$EXE" ;;
       *) from="$PREFIX/bin/$tool$EXE" ;;
     esac
     [ -f "$from" ] || die "$from was not built"
@@ -612,7 +640,7 @@ write_licenses() {
     echo "Third-party software in CatConvert"
     echo
     echo "CatConvert runs these programs, which ship inside the app, as separate processes:"
-    echo "ffmpeg and ffprobe (GPL-2.0-or-later, because they include x264), and cjxl, djxl"
+    echo "ffmpeg and ffprobe (GPL-2.0-or-later; ffmpeg includes x264), and cjxl, djxl"
     echo "and jxlinfo from libjxl. They were built from the unmodified upstream sources"
     echo "listed below. The complete corresponding source code, together with the script"
     echo "that built these programs, is attached to every CatConvert release as"
