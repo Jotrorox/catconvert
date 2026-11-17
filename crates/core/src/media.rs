@@ -76,6 +76,14 @@ pub struct MediaInfo {
     /// default). Pictures and GIFs made from it are tone-mapped to SDR.
     #[serde(default)]
     pub hdr: bool,
+    /// The file records where it was made: GPS coordinates in a photo's EXIF
+    /// or XMP, or a location tag in a video or song.
+    #[serde(default)]
+    pub has_location: bool,
+    /// Container tags that hold a location, e.g. `location`, to clear when
+    /// keeping everything else.
+    #[serde(default)]
+    pub location_tags: Vec<String>,
     /// HEIF/AVIF only: index of the stream group (a tile grid) holding the
     /// picture. Large HEIC photos are stored as tiles that ffprobe lists as
     /// separate streams; ffmpeg stitches them back together from this group.
@@ -164,6 +172,8 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         sample_rate: None,
         reconstructs_jpeg: false,
         hdr: false,
+        has_location: false,
+        location_tags: Vec::new(),
         tile_grid: None,
     })
 }
@@ -194,6 +204,8 @@ pub(crate) mod tests {
             sample_rate: None,
             reconstructs_jpeg: false,
             hdr: false,
+            has_location: false,
+            location_tags: Vec::new(),
             tile_grid: None,
         }
     }

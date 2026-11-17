@@ -9,6 +9,9 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+brotli-decompressor.workspace = true
+kamadak-exif.workspace = true
+miniz_oxide.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

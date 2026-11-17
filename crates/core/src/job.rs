@@ -473,6 +473,110 @@ mod tests {
 
     /// Real JPEG XL round trips through cjxl/djxl. Skipped (passes) when
     /// ffmpeg or the libjxl tools are not installed.
+    /// A geotagged photo through every path that has to drop its location.
+    /// Skipped (passes) without ffmpeg and libjxl's tools.
+    #[test]
+    fn location_is_dropped_end_to_end() {
+        use crate::scrub::tests::{mentions_make, with_exif};
+        use crate::{Metadata, scrub::has_location};
+
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping location test");
+            return;
+        };
+        let tools = ffmpeg.jxl_tools();
+        if tools.cjxl.is_none() || tools.djxl.is_none() {
+            eprintln!("libjxl tools not found; skipping location test");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let plain = dir.path().join("plain.jpg");
+        let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x240:d=1"])
+            .args(["-frames:v", "1", "-q:v", "3"])
+            .arg(&plain)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+        let photo = dir.path().join("photo.jpg");
+        let original = with_exif(&std::fs::read(&plain).expect("read"), true);
+        std::fs::write(&photo, &original).expect("write");
+        assert!(ffmpeg.probe(&photo).expect("probe").has_location);
+
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let run = |options: ConvertOptions| {
+            let ticket = queue.submit(&photo, &options).expect("submit");
+            assert_eq!(
+                finish_of(&rx, ticket.id).stage,
+                JobStage::Done,
+                "{}",
+                ticket.command
+            );
+            ticket
+        };
+
+        // Lossless JPEG XL stays a repack, and restores to the photo minus its GPS.
+        let jxl = run(ConvertOptions {
+            format: OutputFormat::Jxl,
+            jxl: crate::JxlOptions {
+                lossless: true,
+                ..crate::JxlOptions::default()
+            },
+            ..ConvertOptions::default()
+        });
+        assert!(
+            jxl.command.starts_with("catconvert scrub "),
+            "{}",
+            jxl.command
+        );
+        let packed = ffmpeg.probe(&jxl.output).expect("probe jxl");
+        assert!(packed.reconstructs_jpeg);
+        assert!(!packed.has_location);
+        let restored = dir.path().join("restored.jpg");
+        let djxl = std::process::Command::new(tools.djxl.as_ref().expect("djxl"))
+            .arg(&jxl.output)
+            .arg(&restored)
+            .args(["--reconstruct_jpeg", "--quiet"])
+            .status()
+            .expect("run djxl");
+        assert!(djxl.success());
+        let expected = dir.path().join("expected.jpg");
+        crate::scrub_file(&photo, &expected, Metadata::NoLocation).expect("scrub");
+        let restored = std::fs::read(&restored).expect("read");
+        assert_eq!(restored, std::fs::read(&expected).expect("read"));
+        assert_eq!(restored.len(), original.len());
+        assert!(mentions_make(&restored));
+
+        // ffmpeg writes the EXIF into PNGs; it is cleaned afterwards.
+        let png = |metadata| {
+            let ticket = run(ConvertOptions {
+                format: OutputFormat::Png,
+                metadata,
+                ..ConvertOptions::default()
+            });
+            (
+                has_location(&ticket.output),
+                mentions_make(&std::fs::read(&ticket.output).expect("read")),
+            )
+        };
+        assert_eq!(png(Metadata::Keep), (true, true));
+        assert_eq!(png(Metadata::NoLocation), (false, true));
+        assert_eq!(png(Metadata::None), (false, false));
+        assert!(
+            std::fs::read_dir(dir.path()).expect("list").all(|entry| {
+                !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')
+            }),
+            "scratch files are cleaned up"
+        );
+    }
+
     #[test]
     fn jpeg_xl_end_to_end() {
         let Ok(ffmpeg) = Ffmpeg::locate() else {

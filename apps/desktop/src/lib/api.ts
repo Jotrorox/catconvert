@@ -40,6 +40,10 @@ export type MediaInfo = {
   reconstructsJpeg: boolean;
   /** HDR video (PQ or HLG, as iPhones record); pictures made from it are tone-mapped. */
   hdr: boolean;
+  /** GPS in a photo's EXIF or XMP, or a location tag in a video or song. */
+  hasLocation: boolean;
+  /** Container tags holding the location, cleared when everything else is kept. */
+  locationTags: string[];
   /** HEIF only: the stream group ffmpeg stitches a tiled photo from. */
   tileGrid: number | null;
 };
@@ -62,6 +66,9 @@ export type OutputFormat =
   | "jxl";
 
 export type Rotation = 0 | 90 | 180 | 270;
+
+/** What to carry over besides the picture and sound. */
+export type MetadataMode = "keep" | "noLocation" | "none";
 
 /** Which way an animation plays; a boomerang plays forward, then back. */
 export type Direction = "forward" | "reverse" | "boomerang";
@@ -125,8 +132,8 @@ export type ConvertOptions = {
   keepAudio: boolean;
   jxl: JxlOptions;
   sound: SoundOptions;
-  /** Carry over dates, location and other tags where the format can hold them. */
-  keepMetadata: boolean;
+  /** Which dates, places and other tags to carry over, where the format can hold them. */
+  metadata: MetadataMode;
   /** Playback speed of animations (GIF, animated JPEG XL), 0.25–4. Ignored otherwise. */
   speed: number;
   /** Playback direction of animations. Ignored otherwise. */

@@ -74,7 +74,7 @@ fn parse_version(output: &str) -> Option<String> {
 /// Signature of a bare JPEG XL codestream.
 const CODESTREAM_MAGIC: [u8; 2] = [0xFF, 0x0A];
 /// Signature box that starts a JPEG XL container file.
-const CONTAINER_MAGIC: [u8; 12] = [
+pub(crate) const CONTAINER_MAGIC: [u8; 12] = [
     0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
 ];
 

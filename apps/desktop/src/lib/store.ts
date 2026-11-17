@@ -25,6 +25,7 @@ import {
   type Defaults,
   fitOptions,
   initialOptions,
+  metadataFrom,
   RECIPES,
   type Recipe,
   type RecipeId,
@@ -144,20 +145,30 @@ function saveHistory(items: HistoryItem[]) {
 }
 
 function loadSettings(): Defaults {
-  const parsed = load(SETTINGS_KEY) as Partial<Defaults> | null;
+  const parsed = load(SETTINGS_KEY) as (Partial<Defaults> & { keepMetadata?: unknown }) | null;
   if (!parsed || typeof parsed !== "object") return structuredClone(DEFAULTS);
+  const { keepMetadata: _old, ...rest } = parsed;
   return {
     ...DEFAULTS,
-    ...parsed,
+    ...rest,
     formats: { ...DEFAULTS.formats, ...parsed.formats },
+    metadata: metadataFrom(parsed) ?? DEFAULTS.metadata,
   };
 }
 
 function loadRecipes(): Recipe[] {
   const parsed = load(RECIPES_KEY);
-  return Array.isArray(parsed)
-    ? (parsed as Recipe[]).filter((r) => r && typeof r.id === "string" && r.options?.format)
-    : [];
+  if (!Array.isArray(parsed)) return [];
+  return (parsed as Recipe[])
+    .filter((r) => r && typeof r.id === "string" && r.options?.format)
+    .map((recipe) => {
+      // Recipes saved before the three-way choice stored `keepMetadata`.
+      const { keepMetadata: _old, ...options } = recipe.options as Recipe["options"] & {
+        keepMetadata?: unknown;
+      };
+      const metadata = metadataFrom(recipe.options);
+      return { ...recipe, options: metadata ? { ...options, metadata } : options };
+    });
 }
 
 const [state, setState] = createStore<State>({
@@ -707,7 +718,7 @@ export function errorText(error: unknown): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-/** Test helper: reset everything to a fresh state. */
+/** Test helper: reset everything to a fresh start, reading storage as at launch. */
 export function resetStore() {
   early.clear();
   setState({
@@ -720,10 +731,10 @@ export function resetStore() {
     opening: null,
     recipe: null,
     jobs: [],
-    history: [],
+    history: loadHistory(),
     missing: [],
-    settings: structuredClone(DEFAULTS),
-    recipes: [],
+    settings: loadSettings(),
+    recipes: loadRecipes(),
     batch: null,
     toasts: [],
   });

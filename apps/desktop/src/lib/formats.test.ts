@@ -9,6 +9,10 @@ import {
   fpsChoices,
   initialOptions,
   isUntouched,
+  keepsLocation,
+  keepsMetadata,
+  locationLine,
+  metadataFrom,
   outputHasSound,
   outputSeconds,
   RECIPES,
@@ -33,6 +37,8 @@ const clip: MediaInfo = {
   sampleRate: 48000,
   reconstructsJpeg: false,
   hdr: false,
+  hasLocation: false,
+  locationTags: [],
   tileGrid: null,
 };
 
@@ -97,13 +103,13 @@ describe("formats", () => {
     const defaults = {
       formats: { video: "webm", audio: null, image: "webp" },
       quality: 80,
-      keepMetadata: false,
+      metadata: "none",
     } as const;
     const options = initialOptions(clip, all, null, {
       ...defaults,
       formats: { ...defaults.formats },
     });
-    expect(options).toMatchObject({ format: "webm", quality: 80, keepMetadata: false });
+    expect(options).toMatchObject({ format: "webm", quality: 80, metadata: "none" });
 
     // Not for a file that already is one, nor when the encoder is missing.
     const webp = { ...clip, kind: "image" as const, extension: "webp" };
@@ -111,6 +117,48 @@ describe("formats", () => {
     expect(initialOptions(webp, all, null, custom).format).toBe("png");
     expect(initialOptions(clip, (f) => f !== "webm", null, custom).format).toBe("mp4");
     expect(initialOptions(clip, all, null, DEFAULTS).format).toBe("mp4");
+  });
+
+  it("drops the location by default and reads the old on/off setting", () => {
+    expect(DEFAULTS.metadata).toBe("noLocation");
+    expect(initialOptions(clip, all, null).metadata).toBe("noLocation");
+    expect(metadataFrom({ keepMetadata: true })).toBe("keep");
+    expect(metadataFrom({ keepMetadata: false })).toBe("none");
+    expect(metadataFrom({ metadata: "noLocation", keepMetadata: true })).toBe("noLocation");
+    expect(metadataFrom({ metadata: "everything" })).toBeNull();
+    expect(metadataFrom({})).toBeNull();
+  });
+
+  it("knows which outputs can carry metadata and a location", () => {
+    expect(keepsMetadata("png", "image")).toBe(true);
+    expect(keepsMetadata("jxl", "image")).toBe(true);
+    for (const format of ["jpg", "webp", "avif"] as const) {
+      expect(keepsMetadata(format, "image")).toBe(false);
+    }
+    expect(keepsMetadata("png", "video")).toBe(false); // a still from a clip
+    expect(keepsMetadata("gif", "video")).toBe(false);
+    expect(keepsMetadata("jxl", "video")).toBe(false);
+    expect(keepsMetadata("mp4", "video")).toBe(true);
+    expect(keepsMetadata("m4a", "video")).toBe(true);
+
+    const photo: MediaInfo = { ...clip, kind: "image", extension: "jpg", hasLocation: true };
+    const keep = { ...defaultOptions("png"), metadata: "keep" } as const;
+    expect(locationLine(photo)).toBe("This photo knows where it was taken");
+    expect(locationLine({ ...clip, hasLocation: true })).toBe(
+      "This video knows where it was filmed",
+    );
+    expect(locationLine(clip)).toBeNull();
+    expect(keepsLocation(photo, keep)).toBe(true);
+    expect(keepsLocation(photo, { ...keep, metadata: "noLocation" })).toBe(false);
+    expect(keepsLocation(photo, { ...keep, format: "jpg" })).toBe(false);
+    expect(keepsLocation({ ...photo, hasLocation: false }, keep)).toBe(false);
+  });
+
+  it("mentions metadata in recipe details only when it isn't the default", () => {
+    const options = defaultOptions("mp4");
+    expect(recipeDetail(clip, options)).toBe("Balanced");
+    expect(recipeDetail(clip, { ...options, metadata: "keep" })).toBe("Balanced · all metadata");
+    expect(recipeDetail(clip, { ...options, metadata: "none" })).toBe("Balanced · no metadata");
   });
 
   it("fits one file's settings to another, or says they don't fit", () => {
