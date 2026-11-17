@@ -7,9 +7,17 @@
  * is usual for its codec). Content still matters more than any of this, so
  * the UI calls it "about".
  */
-import type { ConvertOptions, MediaInfo } from "./api";
+import type { ConvertOptions, MediaInfo, SequenceOptions } from "./api";
 import { formatBytes } from "./format";
-import { autoLimits, formatKind, isAnimatedImage, repacksJpeg, restoresJpeg } from "./formats";
+import {
+  autoLimits,
+  formatKind,
+  isAnimatedImage,
+  playbackOrder,
+  repacksJpeg,
+  restoresJpeg,
+  sequenceFrame,
+} from "./formats";
 
 /** Same as `lerp` in convert.rs: quality 0–100 onto `worst..=best`, rounded. */
 function lerp(quality: number, worst: number, best: number): number {
@@ -213,13 +221,65 @@ function roughly(bytes: number): number {
   return Math.round(bytes / scale) * scale;
 }
 
+/**
+ * Estimated size of an animation made from `pictures`, or `null` when the
+ * first picture's size is unknown. Every shown picture is a full new frame;
+ * a video slideshow repeats each one, which costs next to nothing after the
+ * first frame.
+ */
+export function estimateSequenceBytes(
+  pictures: readonly MediaInfo[],
+  options: ConvertOptions,
+  sequence: SequenceOptions,
+): number | null {
+  const first = pictures[0];
+  if (!first) return null;
+  const frame = sequenceFrame(first, options);
+  if (!frame) return null;
+  const pixels = frame.width * frame.height;
+  const shown = playbackOrder(pictures.length, sequence.playback).length;
+  const q = options.quality;
+  // Photos are busier than the typical frame of a video.
+  const busy = 1.3;
+  let bpp: number;
+  switch (options.format) {
+    case "gif":
+      bpp = 0.35 * Math.log2(lerp(q, 32, 256)) * busy * 2;
+      break;
+    case "webp":
+      bpp = imageBpp(options) * busy;
+      break;
+    case "jxl":
+      bpp = jxlBpp(options) * busy;
+      break;
+    default:
+      // An H.264/VP9 key frame costs about ten times a typical frame.
+      bpp = 10 * 0.08 * 2 ** ((23 - lerp(q, 34, 18)) / 6) * resolutionFactor(pixels) * busy;
+  }
+  return (shown * pixels * bpp) / 8;
+}
+
+/** The animation estimate as one line, compared with the pictures' total size. */
+export function describeSequenceEstimate(
+  pictures: readonly MediaInfo[],
+  options: ConvertOptions,
+  sequence: SequenceOptions,
+): string | null {
+  const total = pictures.reduce((sum, info) => sum + info.sizeBytes, 0);
+  return describeBytes(estimateSequenceBytes(pictures, options, sequence), total);
+}
+
 /** One line for the editor, e.g. "About 12 MB · 75% smaller". */
 export function describeEstimate(info: MediaInfo, options: ConvertOptions): string | null {
-  const bytes = estimateBytes(info, options);
+  return describeBytes(estimateBytes(info, options), info.sizeBytes);
+}
+
+/** "About 12 MB · 75% smaller" for an estimate against the input's size. */
+function describeBytes(bytes: number | null, inputBytes: number): string | null {
   if (bytes === null || !Number.isFinite(bytes)) return null;
   const size = `About ${formatBytes(roughly(bytes)).replace(".0 ", " ")}`;
-  if (info.sizeBytes <= 0) return size;
-  const ratio = bytes / info.sizeBytes;
+  if (inputBytes <= 0) return size;
+  const ratio = bytes / inputBytes;
   if (ratio >= 2) return `${size} · ${Math.round(ratio)}× bigger`;
   if (ratio > 1.05) return `${size} · ${Math.max(5, Math.round((ratio - 1) * 20) * 5)}% bigger`;
   if (ratio <= 0.1) return `${size} · ${Math.round(1 / ratio)}× smaller`;

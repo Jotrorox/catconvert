@@ -16,6 +16,7 @@ use std::sync::{Arc, RwLock};
 
 use catconvert_core::{
     ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat, Queue,
+    SequenceOptions,
 };
 use serde::Serialize;
 use tauri::ipc::Response;
@@ -94,6 +95,8 @@ async fn blocking<T: Send + 'static>(
 struct FormatSupport {
     format: OutputFormat,
     available: bool,
+    /// Pictures or a video can become an animation in this format.
+    animated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +121,9 @@ fn status_of(state: &AppState) -> FfmpegStatus {
         .map(|&format| FormatSupport {
             format,
             available: ffmpeg.as_ref().is_some_and(|f| f.supports(format)),
+            animated: ffmpeg
+                .as_ref()
+                .is_some_and(|f| f.supports_animation(format)),
         })
         .collect();
     FfmpegStatus {
@@ -219,6 +225,33 @@ fn preview_command(
         .map_err(|err| err.to_string())
 }
 
+/// The command(s) making one animation from `pictures` would run.
+#[tauri::command]
+fn preview_sequence_command(
+    state: State<'_, AppState>,
+    pictures: Vec<MediaInfo>,
+    options: ConvertOptions,
+    sequence: SequenceOptions,
+) -> Result<String, String> {
+    let jxl = state.ffmpeg().map(|f| f.jxl_support()).unwrap_or_default();
+    let output = catconvert_core::sequence_output_path(&pictures, options.format, |_| false);
+    catconvert_core::plan_sequence(&pictures, &options, &sequence, &output, jxl)
+        .map(|plan| plan.command_line())
+        .map_err(|err| err.to_string())
+}
+
+/// Queue one animation made from `paths`, in this order.
+#[tauri::command]
+async fn start_sequence(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    options: ConvertOptions,
+    sequence: SequenceOptions,
+) -> Result<JobTicket, String> {
+    let queue = state.queue()?;
+    blocking(move || queue.submit_sequence(&paths, &options, &sequence)).await
+}
+
 /// Queue a conversion; progress arrives as `job-progress` events.
 #[tauri::command]
 async fn start_job(
@@ -276,7 +309,9 @@ pub fn run() {
             preview_frame,
             waveform,
             preview_command,
+            preview_sequence_command,
             start_job,
+            start_sequence,
             cancel_job,
             relaunch,
             missing_files,

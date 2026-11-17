@@ -24,7 +24,11 @@ export const RecentRow: Component<{ item: HistoryItem }> = (props) => {
         <Icon name={KIND_ICON[props.item.kind]} size={18} />
       </span>
       <div class="item-main">
-        <span class="item-name">{props.item.name}</span>
+        <span class="item-name">
+          {props.item.pictures
+            ? `${props.item.pictures} pictures → ${props.item.name}`
+            : props.item.name}
+        </span>
         <span class="item-meta">
           {label(props.item.format)} · {formatBytes(props.item.inputBytes)} →{" "}
           {formatBytes(props.item.outputBytes)} ·{" "}

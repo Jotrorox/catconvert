@@ -68,6 +68,11 @@ pub struct MediaInfo {
     /// original JPEG can be restored bit for bit.
     #[serde(default)]
     pub reconstructs_jpeg: bool,
+    /// How the picture is turned or mirrored for display, as an EXIF
+    /// orientation from 2 to 8 (`None` when it is shown as stored). ffmpeg
+    /// applies it while decoding; `width` and `height` already account for it.
+    #[serde(default)]
+    pub orientation: Option<u8>,
 }
 
 impl MediaInfo {
@@ -123,6 +128,89 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         video_codec: None,
         audio_codec: None,
         reconstructs_jpeg: false,
+        orientation: None,
+    })
+}
+
+/// The EXIF orientation of a JPEG (2 to 8), or `None` when it has none, it
+/// is the default (1), or the file is not a JPEG.
+///
+/// ffprobe doesn't report it, but ffmpeg turns the picture accordingly when
+/// decoding, so the displayed size swaps for orientations 5 to 8.
+#[must_use]
+pub fn jpeg_orientation(path: &Path) -> Option<u8> {
+    use std::io::Read;
+    // EXIF lives in an APP1 segment near the start; 256 KiB covers files with
+    // big embedded thumbnails or colour profiles before it.
+    let mut head = Vec::with_capacity(64 * 1024);
+    std::fs::File::open(path)
+        .ok()?
+        .take(256 * 1024)
+        .read_to_end(&mut head)
+        .ok()?;
+    parse_jpeg_orientation(&head)
+}
+
+fn parse_jpeg_orientation(data: &[u8]) -> Option<u8> {
+    if !data.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut at = 2;
+    while at + 4 <= data.len() {
+        if data[at] != 0xFF {
+            return None;
+        }
+        let marker = data[at + 1];
+        // Start of scan or end of image: no EXIF before the picture data.
+        if matches!(marker, 0xDA | 0xD9) {
+            return None;
+        }
+        let len = usize::from(u16::from_be_bytes([data[at + 2], data[at + 3]]));
+        let body = data.get(at + 4..at + 2 + len)?;
+        if marker == 0xE1
+            && let Some(tiff) = body.strip_prefix(b"Exif\0\0")
+        {
+            return tiff_orientation(tiff);
+        }
+        at += 2 + len;
+    }
+    None
+}
+
+/// Orientation tag (0x0112) of the first IFD of a TIFF/EXIF block.
+fn tiff_orientation(tiff: &[u8]) -> Option<u8> {
+    let big = match tiff.get(..4)? {
+        b"MM\0\x2a" => true,
+        b"II\x2a\0" => false,
+        _ => return None,
+    };
+    let u16_at = |at: usize| {
+        let b = tiff.get(at..at + 2)?;
+        Some(if big {
+            u16::from_be_bytes([b[0], b[1]])
+        } else {
+            u16::from_le_bytes([b[0], b[1]])
+        })
+    };
+    let u32_at = |at: usize| {
+        let b = tiff.get(at..at + 4)?;
+        let b = [b[0], b[1], b[2], b[3]];
+        Some(if big {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        })
+    };
+    let ifd = usize::try_from(u32_at(4)?).ok()?;
+    let count = usize::from(u16_at(ifd)?);
+    (0..count).find_map(|i| {
+        let entry = ifd + 2 + i * 12;
+        // Tag 0x0112, type SHORT (3): the value sits in the entry itself.
+        (u16_at(entry)? == 0x0112 && u16_at(entry + 2)? == 3)
+            .then(|| u16_at(entry + 8))
+            .flatten()
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|value| (2..=8).contains(value))
     })
 }
 
@@ -150,7 +238,84 @@ pub(crate) mod tests {
             video_codec: None,
             audio_codec: None,
             reconstructs_jpeg: false,
+            orientation: None,
         }
+    }
+
+    /// A minimal JPEG start with an EXIF orientation tag, in either byte order.
+    pub(crate) fn jpeg_with_orientation(orientation: u16, big_endian: bool) -> Vec<u8> {
+        let u16b = |v: u16| {
+            if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let u32b = |v: u32| {
+            if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let mut tiff = if big_endian {
+            b"MM\0\x2a".to_vec()
+        } else {
+            b"II\x2a\0".to_vec()
+        };
+        tiff.extend(u32b(8));
+        tiff.extend(u16b(2));
+        // An unrelated tag first (ImageDescription), then Orientation.
+        for (tag, kind, value) in [(0x010E_u16, 2_u16, 0_u16), (0x0112, 3, orientation)] {
+            tiff.extend(u16b(tag));
+            tiff.extend(u16b(kind));
+            tiff.extend(u32b(1));
+            tiff.extend(u16b(value));
+            tiff.extend([0, 0]);
+        }
+        tiff.extend(u32b(0));
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend(tiff);
+        let mut jpeg = vec![0xFF, 0xD8];
+        // An APP0 (JFIF) segment before the EXIF one, as cameras write it.
+        jpeg.extend([0xFF, 0xE0, 0x00, 0x06, b'J', b'F', b'I', b'F']);
+        jpeg.extend([0xFF, 0xE1]);
+        jpeg.extend(u16::try_from(app1.len() + 2).expect("small").to_be_bytes());
+        jpeg.extend(app1);
+        jpeg.extend([0xFF, 0xDA, 0x00, 0x02]);
+        jpeg
+    }
+
+    #[test]
+    fn reads_jpeg_orientation() {
+        assert_eq!(
+            parse_jpeg_orientation(&jpeg_with_orientation(6, true)),
+            Some(6)
+        );
+        assert_eq!(
+            parse_jpeg_orientation(&jpeg_with_orientation(8, false)),
+            Some(8)
+        );
+        // The default orientation and nonsense values count as none.
+        assert_eq!(
+            parse_jpeg_orientation(&jpeg_with_orientation(1, true)),
+            None
+        );
+        assert_eq!(
+            parse_jpeg_orientation(&jpeg_with_orientation(9, true)),
+            None
+        );
+        // Not a JPEG, truncated, or no EXIF before the picture data.
+        assert_eq!(parse_jpeg_orientation(b"\x89PNG\r\n"), None);
+        let full = jpeg_with_orientation(6, true);
+        assert_eq!(parse_jpeg_orientation(&full[..20]), None);
+        assert_eq!(
+            parse_jpeg_orientation(&[0xFF, 0xD8, 0xFF, 0xDA, 0, 2]),
+            None
+        );
+
+        let (_dir, path) = temp_file("turned.jpg", &full);
+        assert_eq!(jpeg_orientation(&path), Some(6));
     }
 
     fn temp_file(name: &str, contents: &[u8]) -> (tempfile::TempDir, PathBuf) {

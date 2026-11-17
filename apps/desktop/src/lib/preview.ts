@@ -136,3 +136,55 @@ export function createWaveform(
   );
   return url;
 }
+
+/**
+ * One small frame per picture, keyed by path so reordering never refetches.
+ * Loaded a few at a time; read with the returned lookup.
+ */
+export function createThumbnails(
+  paths: Accessor<readonly string[]>,
+  height: number,
+): (path: string) => string | null {
+  const [urls, setUrls] = createSignal<Readonly<Record<string, string>>>({});
+  const requested = new Set<string>();
+  const waiting: string[] = [];
+  let running = 0;
+  let alive = true;
+  onCleanup(() => {
+    alive = false;
+    for (const url of Object.values(urls())) URL.revokeObjectURL(url);
+  });
+
+  const pump = () => {
+    while (alive && running < 3) {
+      const path = waiting.shift();
+      if (path === undefined) return;
+      running++;
+      api
+        .previewFrame(path, 0, height)
+        .then(
+          (url) => {
+            if (alive) setUrls((all) => ({ ...all, [path]: url }));
+            else URL.revokeObjectURL(url);
+          },
+          () => {
+            // Leave the tile blank; the backend reports real problems on convert.
+          },
+        )
+        .finally(() => {
+          running--;
+          pump();
+        });
+    }
+  };
+
+  createEffect(() => {
+    for (const path of paths()) {
+      if (requested.has(path)) continue;
+      requested.add(path);
+      waiting.push(path);
+    }
+    pump();
+  });
+  return (path) => urls()[path] ?? null;
+}

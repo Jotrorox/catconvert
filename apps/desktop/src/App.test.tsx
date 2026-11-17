@@ -13,7 +13,9 @@ vi.mock("./lib/api", () => ({
   previewFrame: vi.fn(async () => "blob:frame"),
   waveform: vi.fn(async () => "blob:wave"),
   previewCommand: vi.fn(async () => "ffmpeg -i clip.mov clip.mp4"),
+  previewSequenceCommand: vi.fn(async () => "ffmpeg -f concat -i list.txt cat.gif"),
   startJob: vi.fn(),
+  startSequence: vi.fn(),
   cancelJob: vi.fn(async () => true),
   pickFiles: vi.fn(async () => []),
   thirdPartyLicenses: vi.fn(async () => "ffmpeg 9.0.2 (GPL-2.0-or-later)"),
@@ -41,7 +43,11 @@ function status(found = true): FfmpegStatus {
     version: found ? "7.1" : null,
     path: found ? "/opt/homebrew/bin/ffmpeg" : null,
     error: found ? null : "ffmpeg was not found",
-    formats: ALL.map((format) => ({ format, available: found && format !== "webp" })),
+    formats: ALL.map((format) => ({
+      format,
+      available: found && format !== "webp",
+      animated: found && ["mp4", "webm", "mov", "mkv", "gif", "jxl"].includes(format),
+    })),
     libjxl: found ? "0.13.0" : null,
     jxl: {
       cjxl: found,
@@ -122,7 +128,7 @@ beforeEach(() => {
   vi.mocked(api.startJob).mockImplementation(async (path, options) => ({
     id: 7,
     output: path.replace(/\.\w+$/, `.${options.format}`),
-    input: VIDEO,
+    inputs: [VIDEO],
     command: "ffmpeg …",
   }));
 });
@@ -241,7 +247,7 @@ describe("CatConvert", () => {
         outputBytes: null,
         error: null,
       });
-      return { id: 9, output: `${path}.${options.format}`, input: VIDEO, command: "" };
+      return { id: 9, output: `${path}.${options.format}`, inputs: [VIDEO], command: "" };
     });
     await openVideo();
     fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
@@ -519,6 +525,144 @@ describe("CatConvert", () => {
       "/clips/b.mov",
       expect.objectContaining({ format: "webm", trimStart: null }),
     );
+  });
+
+  describe("pictures → animation", () => {
+    const picture = (path: string): MediaInfo => ({
+      ...PHOTO,
+      path,
+      fileName: path.split("/").pop() ?? path,
+      sizeBytes: 2_000_000,
+    });
+    const PICS = ["/pics/cat 10.jpg", "/pics/cat 2.jpg", "/pics/cat 1.jpg"];
+
+    beforeEach(() => {
+      vi.mocked(api.probeFile).mockImplementation(async (path) =>
+        path.endsWith(".mov") ? VIDEO : picture(path),
+      );
+      vi.mocked(api.startSequence).mockImplementation(async (paths, options) => ({
+        id: 11,
+        output: `/pics/cat.${options.format}`,
+        inputs: paths.map(picture),
+        command: "ffmpeg …",
+      }));
+    });
+
+    async function openAnimation() {
+      render(() => <App />);
+      await screen.findByText("ffmpeg 7.1");
+      openPaths(PICS);
+      expect(await screen.findByRole("heading", { name: "3 pictures" })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /Make an animation/ }));
+      return screen.findByRole("list", { name: "Pictures in order" });
+    }
+
+    const order = () =>
+      within(screen.getByRole("list", { name: "Pictures in order" }))
+        .getAllByRole("listitem")
+        .map((li) => li.getAttribute("aria-label"));
+
+    it("makes one animation from dropped pictures", async () => {
+      await openAnimation();
+      // Natural filename order: 2 before 10.
+      expect(order()).toEqual(["1. cat 1.jpg", "2. cat 2.jpg", "3. cat 10.jpg"]);
+      expect(screen.getByRole("button", { name: "GIF" })).toHaveAttribute("aria-pressed", "true");
+      expect(screen.getByRole("button", { name: "WEBP" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "0.5 s" })).toHaveAttribute("aria-pressed", "true");
+      expect(screen.getByText("cat.gif")).toBeInTheDocument();
+      expect(screen.getByRole("combobox", { name: "Size" })).toHaveDisplayValue("Auto (480 px)");
+
+      fireEvent.click(screen.getByRole("button", { name: "0.25 s" }));
+      fireEvent.click(screen.getByRole("button", { name: "Boomerang" }));
+      fireEvent.click(screen.getByRole("button", { name: "Crop to fill" }));
+      const animation = within(screen.getByRole("list", { name: "Animation" }));
+      expect(animation.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+        "4 frames",
+        "1 s loop",
+        "640×480",
+        "Boomerang",
+      ]);
+      expect(screen.getByText(/^About [\d.]+ (KB|MB) · /)).toBeInTheDocument();
+
+      // Reorder with the keyboard, then leave one out.
+      fireEvent.keyDown(screen.getByRole("listitem", { name: "3. cat 10.jpg" }), {
+        key: "ArrowLeft",
+      });
+      expect(order()).toEqual(["1. cat 1.jpg", "2. cat 10.jpg", "3. cat 2.jpg"]);
+      fireEvent.click(screen.getByRole("button", { name: "Leave out cat 2.jpg" }));
+      expect(order()).toEqual(["1. cat 1.jpg", "2. cat 10.jpg"]);
+      fireEvent.keyDown(screen.getByRole("listitem", { name: "1. cat 1.jpg" }), {
+        key: "Delete",
+      });
+      expect(screen.getByText("An animation needs at least two pictures")).toBeInTheDocument();
+      expect(order()).toHaveLength(2);
+
+      fireEvent.click(screen.getByRole("button", { name: /Make animation/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startSequence).toHaveBeenCalledWith(
+        ["/pics/cat 1.jpg", "/pics/cat 10.jpg"],
+        expect.objectContaining({ format: "gif", maxSize: null, keepMetadata: false }),
+        { frameSecs: 0.25, fit: "crop", playback: "boomerang" },
+      );
+      expect(screen.getByText("2 PICTURES → GIF · Waiting")).toBeInTheDocument();
+
+      applyProgress({
+        jobId: 11,
+        stage: "done",
+        progress: 1,
+        speed: null,
+        outputBytes: 400_000,
+        error: null,
+      });
+      expect(state.history[0]).toEqual(
+        expect.objectContaining({ name: "cat.gif", pictures: 2, inputBytes: 4_000_000 }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "History" }));
+      expect(await screen.findByText("2 pictures → cat.gif")).toBeInTheDocument();
+    });
+
+    it("converts each picture on its own when asked", async () => {
+      render(() => <App />);
+      await screen.findByText("ffmpeg 7.1");
+      openPaths(["/pics/a.png", "/pics/b.png"]);
+      fireEvent.click(await screen.findByRole("button", { name: /Convert each/ }));
+      expect(await screen.findByRole("heading", { name: "a.png" })).toBeInTheDocument();
+      expect(screen.getByText("Up next")).toBeInTheDocument();
+      expect(api.startSequence).not.toHaveBeenCalled();
+    });
+
+    it("doesn't ask when the drop isn't only pictures", async () => {
+      render(() => <App />);
+      await screen.findByText("ffmpeg 7.1");
+      openPaths([VIDEO.path, "/pics/a.png"]);
+      expect(await screen.findByRole("heading", { name: "clip.mov" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Make an animation/ })).not.toBeInTheDocument();
+    });
+
+    it("retries without pictures that were moved since", async () => {
+      await openAnimation();
+      fireEvent.click(screen.getByRole("button", { name: /Make animation/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      applyProgress({
+        jobId: 11,
+        stage: "failed",
+        progress: 0.2,
+        speed: null,
+        outputBytes: null,
+        error: "Disk full",
+      });
+      vi.mocked(api.missingFiles).mockResolvedValue(["/pics/cat 2.jpg"]);
+      fireEvent.click(await screen.findByRole("button", { name: /Retry/ }));
+      await waitFor(() => expect(api.startSequence).toHaveBeenCalledTimes(2));
+      expect(api.startSequence).toHaveBeenLastCalledWith(
+        ["/pics/cat 1.jpg", "/pics/cat 10.jpg"],
+        expect.objectContaining({ format: "gif" }),
+        { frameSecs: 0.5, fit: "pad", playback: "forward" },
+      );
+      expect(
+        screen.getByText("1 picture was moved or deleted, so it's made from the other 2"),
+      ).toBeInTheDocument();
+    });
   });
 
   it("marks history entries whose files were moved and can forget them", async () => {

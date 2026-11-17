@@ -1,7 +1,8 @@
 /**
- * App state: which screen is showing, the file being edited, files waiting
- * their turn, the conversion queue, the history of finished conversions, and
- * the user's starting settings and saved recipes.
+ * App state: which screen is showing, the file (or pictures for an
+ * animation) being edited, files waiting their turn, the conversion queue,
+ * the history of finished conversions, and the user's starting settings and
+ * saved recipes.
  *
  * All backend calls go through `./api`; components only call the actions
  * exported here.
@@ -16,19 +17,24 @@ import type {
   JobStage,
   MediaInfo,
   OutputFormat,
+  SequenceOptions,
   UpdateInfo,
 } from "./api";
 import * as api from "./api";
 import { baseName } from "./format";
 import {
+  DEFAULT_SEQUENCE,
   DEFAULTS,
   type Defaults,
   fitOptions,
   initialOptions,
+  looksLikePicture,
+  naturalOrder,
   RECIPES,
   type Recipe,
   type RecipeId,
   recipeFrom,
+  sequenceOptions,
 } from "./formats";
 
 export type Screen = "convert" | "edit" | "queue" | "recipes" | "history" | "settings";
@@ -38,12 +44,24 @@ export type Draft = {
   options: ConvertOptions;
 };
 
+/** Pictures being made into one animation, in the order they play. */
+export type SequenceDraft = {
+  pictures: MediaInfo[];
+  options: ConvertOptions;
+  sequence: SequenceOptions;
+};
+
 export type JobEntry = {
   id: JobId;
   name: string;
+  /** The file, or the first picture of an animation. */
   input: MediaInfo;
+  /** Every input: just `input`, or an animation's pictures in order. */
+  inputs: MediaInfo[];
   output: string;
   options: ConvertOptions;
+  /** Set for an animation made from pictures. */
+  sequence: SequenceOptions | null;
   command: string;
   stage: JobStage;
   progress: number;
@@ -63,6 +81,8 @@ export type HistoryItem = {
   inputBytes: number;
   outputBytes: number;
   finishedAt: number;
+  /** How many pictures an animation was made from. */
+  pictures?: number;
 };
 
 export type Toast = {
@@ -92,7 +112,11 @@ type State = {
   ffmpeg: FfmpegStatus | null;
   /** Paths waiting to be opened in the editor, in drop order. */
   inbox: string[];
+  /** Dropped pictures waiting for "Convert each" or "Make an animation". */
+  choice: string[] | null;
   draft: Draft | null;
+  /** Pictures being made into one animation. */
+  sequence: SequenceDraft | null;
   /** Path currently being probed, if any. */
   opening: string | null;
   /** Recipe picked before choosing files; applied to the next files. */
@@ -166,7 +190,9 @@ const [state, setState] = createStore<State>({
   update: { status: "idle" },
   ffmpeg: null,
   inbox: [],
+  choice: null,
   draft: null,
+  sequence: null,
   opening: null,
   recipe: null,
   jobs: [],
@@ -229,6 +255,11 @@ export async function refreshFfmpeg(relocate = false) {
 
 export function isAvailable(format: OutputFormat): boolean {
   return state.ffmpeg?.formats.find((f) => f.format === format)?.available ?? false;
+}
+
+/** Whether pictures or a video can become an animation in `format`. */
+export function isAnimated(format: OutputFormat): boolean {
+  return state.ffmpeg?.formats.find((f) => f.format === format)?.animated ?? false;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,12 +338,104 @@ export async function restartApp() {
 // Opening files
 // ---------------------------------------------------------------------------
 
-/** Queue dropped or picked files for editing; opens the first right away. */
+/**
+ * Queue dropped or picked files for editing; opens the first right away.
+ * Two or more pictures dropped with nothing open first ask whether to
+ * convert each or make one animation of them.
+ */
 export function openPaths(paths: string[]) {
-  if (paths.length === 0) return;
-  setState("inbox", (inbox) => [...inbox, ...paths.filter((p) => !inbox.includes(p))]);
-  if (!state.draft && !state.opening) void openNext();
-  else if (state.draft) toast(`${paths.length} more waiting their turn`);
+  const fresh = [...new Set(paths)].filter((p) => !state.inbox.includes(p));
+  if (fresh.length === 0) return;
+  const pictures = fresh.every(looksLikePicture);
+  if (state.choice) {
+    if (pictures) {
+      setState("choice", (choice) => [
+        ...(choice ?? []),
+        ...fresh.filter((p) => !choice?.includes(p)),
+      ]);
+      return;
+    }
+  } else if (pictures && fresh.length >= 2 && !state.recipe && !busyEditing()) {
+    batch(() => {
+      setState("choice", fresh);
+      navigate("edit");
+    });
+    return;
+  }
+  setState("inbox", (inbox) => [...inbox, ...fresh]);
+  if (busyEditing() || state.choice) toast(`${fresh.length} more waiting their turn`);
+  else void openNext();
+}
+
+/** Whether the editor already holds something. */
+function busyEditing(): boolean {
+  return state.draft !== null || state.sequence !== null || state.opening !== null;
+}
+
+/** "Convert each": the dropped pictures wait their turn like any other files. */
+export function convertEach() {
+  const paths = state.choice ?? [];
+  setState({ choice: null, inbox: [...paths, ...state.inbox.filter((p) => !paths.includes(p))] });
+  void openNext();
+}
+
+/** Probe `paths` a few at a time, keeping the order. */
+async function probeAll(paths: string[], limit = 4) {
+  const results: PromiseSettledResult<MediaInfo>[] = new Array(paths.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < paths.length) {
+      const i = next++;
+      const path = paths[i] ?? "";
+      results[i] = await api.probeFile(path).then(
+        (value) => ({ status: "fulfilled", value }) as const,
+        (reason: unknown) => ({ status: "rejected", reason }) as const,
+      );
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, paths.length) }, worker));
+  return results;
+}
+
+/**
+ * "Make an animation": probe the dropped pictures and open them in the
+ * sequence editor, in natural filename order.
+ */
+export async function makeAnimation() {
+  const paths = state.choice ?? [];
+  batch(() => {
+    setState({ choice: null, opening: `${paths.length} pictures` });
+    navigate("edit");
+  });
+  const results = await probeAll(paths);
+  const pictures: MediaInfo[] = [];
+  const left: string[] = [];
+  results.forEach((result, i) => {
+    if (result.status === "fulfilled" && result.value.kind === "image") pictures.push(result.value);
+    else left.push(paths[i] ?? "");
+  });
+  if (left.length > 0) {
+    toast(
+      left.length === 1
+        ? `${baseName(left[0] ?? "")} isn't a still picture, so it's left out`
+        : `${left.length} files aren't still pictures, so they're left out`,
+    );
+  }
+  if (pictures.length < 2) {
+    setState("opening", null);
+    toast("An animation needs at least two pictures", { tone: "error" });
+    setState("inbox", (inbox) => [...pictures.map((p) => p.path), ...inbox]);
+    return openNext();
+  }
+  pictures.sort(naturalOrder);
+  setState({
+    opening: null,
+    sequence: {
+      pictures,
+      options: sequenceOptions(isAnimated, state.settings),
+      sequence: { ...DEFAULT_SEQUENCE },
+    },
+  });
 }
 
 /** Pick files with the native dialog, optionally applying a recipe to them. */
@@ -370,10 +493,17 @@ export function skipDraft() {
   void openNext();
 }
 
-/** Drop the current file and everything waiting. */
+/** Drop the current file (or animation) and everything waiting. */
 export function closeEditor() {
   batch(() => {
-    setState({ draft: null, inbox: [], opening: null, recipe: null });
+    setState({
+      draft: null,
+      sequence: null,
+      choice: null,
+      inbox: [],
+      opening: null,
+      recipe: null,
+    });
     navigate("convert");
   });
 }
@@ -381,6 +511,108 @@ export function closeEditor() {
 export function updateOptions(patch: Partial<ConvertOptions>) {
   if (!state.draft) return;
   setState("draft", "options", (options) => ({ ...options, ...patch }));
+}
+
+// ---------------------------------------------------------------------------
+// Animations from pictures
+// ---------------------------------------------------------------------------
+
+/** Change the format, size, turn or quality of the animation being made. */
+export function updateSequenceOptions(patch: Partial<ConvertOptions>) {
+  if (!state.sequence) return;
+  setState("sequence", "options", (options) => ({ ...options, ...patch }));
+}
+
+/** Change the frame time, fit or playback of the animation being made. */
+export function updateSequence(patch: Partial<SequenceOptions>) {
+  if (!state.sequence) return;
+  setState("sequence", "sequence", (sequence) => ({ ...sequence, ...patch }));
+}
+
+/** Move the picture at `from` to `to` in the filmstrip. */
+export function movePicture(from: number, to: number) {
+  const list = state.sequence?.pictures;
+  if (!list || from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) {
+    return;
+  }
+  setState("sequence", "pictures", (pictures) => {
+    const next = [...pictures];
+    const [moved] = next.splice(from, 1);
+    if (moved) next.splice(to, 0, moved);
+    return next;
+  });
+}
+
+/** Leave a picture out of the animation; at least two stay. */
+export function removePicture(index: number) {
+  const list = state.sequence?.pictures;
+  if (!list) return;
+  if (list.length <= 2) {
+    toast("An animation needs at least two pictures", { tone: "error" });
+    return;
+  }
+  setState("sequence", "pictures", (pictures) => pictures.filter((_, i) => i !== index));
+}
+
+/** Put the pictures back in natural filename order. */
+export function sortPictures() {
+  setState("sequence", "pictures", (pictures) => [...pictures].sort(naturalOrder));
+}
+
+/** Queue the animation and move on to the next waiting file (or the queue). */
+export async function convertSequence() {
+  const draft = state.sequence;
+  if (!draft) return;
+  const options = { ...draft.options, jxl: { ...draft.options.jxl } };
+  const sequence = { ...draft.sequence };
+  try {
+    const ticket = await api.startSequence(
+      draft.pictures.map((p) => p.path),
+      options,
+      sequence,
+    );
+    addJob(ticket, options, sequence);
+    setState("sequence", null);
+    if (state.inbox.length > 0) {
+      toast("The animation is in the queue", {
+        action: { label: "View", run: () => navigate("queue") },
+      });
+      await openNext();
+    } else {
+      batch(() => {
+        setState("recipe", null);
+        navigate("queue");
+      });
+    }
+  } catch (error) {
+    toast(errorText(error), { tone: "error" });
+  }
+}
+
+/**
+ * An animation job's pictures that are still where they were, saying which
+ * were moved or deleted since. `null` (after saying so) when fewer than two
+ * are left.
+ */
+async function picturesLeft(job: JobEntry): Promise<MediaInfo[] | null> {
+  let missing: string[] = [];
+  try {
+    missing = await api.missingFiles(job.inputs.map((p) => p.path));
+  } catch {
+    // Best effort: the backend reports a missing picture when it is queued.
+  }
+  const left = job.inputs.filter((p) => !missing.includes(p.path));
+  if (left.length < 2) {
+    toast(`Only ${left.length} of the ${job.inputs.length} pictures are still there`, {
+      tone: "error",
+    });
+    return null;
+  }
+  if (missing.length > 0) {
+    const gone = missing.length === 1 ? "1 picture was" : `${missing.length} pictures were`;
+    toast(`${gone} moved or deleted, so it's made from the other ${left.length}`);
+  }
+  return left;
 }
 
 // ---------------------------------------------------------------------------
@@ -460,13 +692,21 @@ export async function convertAll() {
   }
 }
 
-function addJob(ticket: api.JobTicket, options: ConvertOptions) {
+function addJob(
+  ticket: api.JobTicket,
+  options: ConvertOptions,
+  sequence: SequenceOptions | null = null,
+) {
+  const input = ticket.inputs[0];
+  if (!input) return;
   const entry: JobEntry = {
     id: ticket.id,
-    name: ticket.input.fileName,
-    input: ticket.input,
+    name: sequence ? `${ticket.inputs.length} pictures` : input.fileName,
+    input,
+    inputs: ticket.inputs,
     output: ticket.output,
     options,
+    sequence,
     command: ticket.command,
     stage: "queued",
     progress: 0,
@@ -515,9 +755,10 @@ export function applyProgress(event: JobProgress) {
       output: job.output,
       format: job.options.format,
       kind: job.input.kind,
-      inputBytes: job.input.sizeBytes,
+      inputBytes: inputBytes(job),
       outputBytes: event.outputBytes ?? 0,
       finishedAt: Date.now(),
+      ...(job.sequence ? { pictures: job.inputs.length } : {}),
     };
     setState("history", (items) => {
       const next = [item, ...items].slice(0, HISTORY_LIMIT);
@@ -532,6 +773,11 @@ export function applyProgress(event: JobProgress) {
   }
 }
 
+/** Size of everything a job reads. */
+export function inputBytes(job: JobEntry): number {
+  return job.inputs.reduce((sum, info) => sum + info.sizeBytes, 0);
+}
+
 export function isFinal(stage: JobStage) {
   return stage === "done" || stage === "failed" || stage === "cancelled";
 }
@@ -544,12 +790,30 @@ export async function cancelJob(id: JobId) {
   }
 }
 
-/** Reopen a finished or failed job's file in the editor with the same settings. */
-export function tweakJob(id: JobId) {
+/** Reopen a finished or failed job's file(s) in the editor with the same settings. */
+export async function tweakJob(id: JobId) {
   const job = state.jobs.find((j) => j.id === id);
   if (!job) return;
+  if (job.sequence) {
+    const sequence = { ...job.sequence };
+    const pictures = await picturesLeft(job);
+    if (!pictures) return;
+    batch(() => {
+      setState({
+        sequence: { pictures, options: { ...job.options }, sequence },
+        draft: null,
+        opening: null,
+      });
+      navigate("edit");
+    });
+    return;
+  }
   batch(() => {
-    setState({ draft: { info: job.input, options: { ...job.options } }, opening: null });
+    setState({
+      draft: { info: job.input, options: { ...job.options } },
+      sequence: null,
+      opening: null,
+    });
     navigate("edit");
   });
 }
@@ -558,11 +822,23 @@ export async function retryJob(id: JobId) {
   const job = state.jobs.find((j) => j.id === id);
   if (!job) return;
   try {
-    const options = { ...job.options };
-    const ticket = await api.startJob(job.input.path, options);
+    const options = { ...job.options, jxl: { ...job.options.jxl } };
+    const sequence = job.sequence ? { ...job.sequence } : null;
+    let ticket: api.JobTicket;
+    if (sequence) {
+      const pictures = await picturesLeft(job);
+      if (!pictures) return;
+      ticket = await api.startSequence(
+        pictures.map((p) => p.path),
+        options,
+        sequence,
+      );
+    } else {
+      ticket = await api.startJob(job.input.path, options);
+    }
     batch(() => {
       removeJob(id);
-      addJob(ticket, options);
+      addJob(ticket, options, sequence);
     });
   } catch (error) {
     toast(errorText(error), { tone: "error" });
@@ -681,7 +957,9 @@ export function resetStore() {
     update: { status: "idle" },
     ffmpeg: null,
     inbox: [],
+    choice: null,
     draft: null,
+    sequence: null,
     opening: null,
     recipe: null,
     jobs: [],
