@@ -55,29 +55,3 @@ export const CatPeek: Component<CatProps> = (props) => (
     <ellipse class="cat-paw right" cx="75" cy={props.sleepy ? 87 : 94} rx="12" ry="7" fill="#fff" />
   </svg>
 );
-
-/** Small round cat face used as the app logo. */
-export const CatLogo: Component<{ class?: string }> = (props) => (
-  <svg
-    class={props.class ? `cat ${props.class}` : "cat"}
-    viewBox="0 0 40 38"
-    fill="none"
-    stroke="currentColor"
-    stroke-width="2.4"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M7.5 17 8.5 3.5l9 6.5M32.5 17l-1-13.5-9 6.5" fill="#fff" />
-    <path
-      d="m10.5 12.5.4-5.5 3.8 2.8ZM29.5 12.5l-.4-5.5-3.8 2.8Z"
-      fill="var(--cat-pink)"
-      stroke="none"
-    />
-    <ellipse cx="20" cy="22.5" rx="15" ry="13" fill="#fff" />
-    <path d="M12.5 21.5q2.5-2.8 5 0M22.5 21.5q2.5-2.8 5 0" stroke-width="2" />
-    <ellipse cx="11.5" cy="26" rx="2.6" ry="1.5" fill="var(--cat-pink)" stroke="none" />
-    <ellipse cx="28.5" cy="26" rx="2.6" ry="1.5" fill="var(--cat-pink)" stroke="none" />
-    <path d="M17.5 26q1.25 1.8 2.5 0 1.25 1.8 2.5 0" stroke-width="1.8" />
-  </svg>
-);

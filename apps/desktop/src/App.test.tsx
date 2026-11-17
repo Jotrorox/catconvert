@@ -147,19 +147,24 @@ beforeEach(() => {
   }));
 });
 
+function ffmpegFound() {
+  return waitFor(() => expect(state.ffmpeg?.found).toBe(true));
+}
+
 async function openVideo() {
   render(() => <App />);
-  await screen.findByText("ffmpeg 7.1");
+  await ffmpegFound();
   openPaths([VIDEO.path]);
   return screen.findByRole("heading", { name: "clip.mov" });
 }
 
 describe("CatConvert", () => {
-  it("starts on Convert and reports the ffmpeg it found", async () => {
+  it("starts on Convert once it has found ffmpeg", async () => {
     render(() => <App />);
     expect(screen.getByRole("heading", { name: "Drop files on the kitty" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Convert" })).toHaveAttribute("aria-current", "page");
-    expect(await screen.findByText("ffmpeg 7.1")).toBeInTheDocument();
+    await ffmpegFound();
+    expect(screen.queryByText("ffmpeg is missing.")).not.toBeInTheDocument();
     expect(screen.getByText(/Nothing yet/)).toBeInTheDocument();
   });
 
@@ -417,7 +422,7 @@ describe("CatConvert", () => {
 
   it("walks through several dropped files one after another", async () => {
     render(() => <App />);
-    await screen.findByText("ffmpeg 7.1");
+    await ffmpegFound();
     openPaths(["/clips/a.mov", "/clips/b.mov"]);
     await screen.findByRole("heading", { name: "a.mov" });
     expect(screen.getByText("Up next")).toBeInTheDocument();
@@ -429,7 +434,7 @@ describe("CatConvert", () => {
   it("applies a recipe to picked files", async () => {
     vi.mocked(api.pickFiles).mockResolvedValue([VIDEO.path]);
     render(() => <App />);
-    await screen.findByText("ffmpeg 7.1");
+    await ffmpegFound();
     fireEvent.click(screen.getByRole("button", { name: /Make a GIF/ }));
     await screen.findByRole("heading", { name: "clip.mov" });
     expect(screen.getByRole("button", { name: "GIF" })).toHaveAttribute("aria-pressed", "true");
@@ -439,7 +444,7 @@ describe("CatConvert", () => {
 
   it("repacks a JPEG into lossless JPEG XL with libjxl settings", async () => {
     render(() => <App />);
-    await screen.findByText("ffmpeg 7.1");
+    await ffmpegFound();
     expect(screen.queryByText(/libjxl 0.13.0/)).not.toBeInTheDocument();
     openPaths([PHOTO.path]);
     await screen.findByRole("heading", { name: "cat.jpg" });
@@ -527,7 +532,7 @@ describe("CatConvert", () => {
 
   it("restores the original JPEG from a repacked JPEG XL", async () => {
     render(() => <App />);
-    await screen.findByText("ffmpeg 7.1");
+    await ffmpegFound();
     openPaths([PACKED.path]);
     await screen.findByRole("heading", { name: "cat.jxl" });
     expect(screen.getByText(/4032×3024 · JPEG XL/)).toBeInTheDocument();
@@ -537,7 +542,7 @@ describe("CatConvert", () => {
 
   it("offers only sound formats and no picture tools for audio", async () => {
     render(() => <App />);
-    await screen.findByText("ffmpeg 7.1");
+    await ffmpegFound();
     openPaths([SONG.path]);
     await screen.findByRole("heading", { name: "purr.wav" });
     const formats = screen.getByRole("group", { name: "Turn it into" });
@@ -598,7 +603,7 @@ describe("CatConvert", () => {
 
   it("estimates the output size as the quality changes", async () => {
     render(() => <App />);
-    await screen.findByText("ffmpeg 7.1");
+    await ffmpegFound();
     openPaths([VIDEO.path]);
     await screen.findByRole("heading", { name: "clip.mov" });
 
@@ -613,7 +618,7 @@ describe("CatConvert", () => {
 
   it("starts files from the defaults chosen in Settings and remembers them", async () => {
     render(() => <App />);
-    await screen.findByText("ffmpeg 7.1");
+    await ffmpegFound();
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     fireEvent.change(screen.getByRole("combobox", { name: "Videos become" }), {
       target: { value: "mkv" },
@@ -668,7 +673,7 @@ describe("CatConvert", () => {
   it("tells when a photo knows where it was taken and drops it, repack and all", async () => {
     vi.mocked(api.probeFile).mockResolvedValue({ ...PHOTO, hasLocation: true });
     render(() => <App />);
-    await screen.findByText("ffmpeg 7.1");
+    await ffmpegFound();
     openPaths([PHOTO.path]);
     await screen.findByRole("heading", { name: "cat.jpg" });
     expect(screen.getByText(/This photo knows where it was taken/)).toHaveTextContent(
@@ -739,7 +744,7 @@ describe("CatConvert", () => {
 
   it("converts every waiting file with one set of settings", async () => {
     render(() => <App />);
-    await screen.findByText("ffmpeg 7.1");
+    await ffmpegFound();
     openPaths(["/clips/a.mov", "/clips/b.mov", SONG.path]);
     await screen.findByRole("heading", { name: "a.mov" });
     fireEvent.click(screen.getByRole("button", { name: "WEBM" }));
@@ -788,7 +793,7 @@ describe("CatConvert", () => {
 
     async function openAnimation() {
       render(() => <App />);
-      await screen.findByText("ffmpeg 7.1");
+      await ffmpegFound();
       openPaths(PICS);
       expect(await screen.findByRole("heading", { name: "3 pictures" })).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: /Make an animation/ }));
@@ -866,7 +871,7 @@ describe("CatConvert", () => {
 
     it("converts each picture on its own when asked", async () => {
       render(() => <App />);
-      await screen.findByText("ffmpeg 7.1");
+      await ffmpegFound();
       openPaths(["/pics/a.png", "/pics/b.png"]);
       fireEvent.click(await screen.findByRole("button", { name: /Convert each/ }));
       expect(await screen.findByRole("heading", { name: "a.png" })).toBeInTheDocument();
@@ -876,7 +881,7 @@ describe("CatConvert", () => {
 
     it("doesn't ask when the drop isn't only pictures", async () => {
       render(() => <App />);
-      await screen.findByText("ffmpeg 7.1");
+      await ffmpegFound();
       openPaths([VIDEO.path, "/pics/a.png"]);
       expect(await screen.findByRole("heading", { name: "clip.mov" })).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: /Make an animation/ })).not.toBeInTheDocument();

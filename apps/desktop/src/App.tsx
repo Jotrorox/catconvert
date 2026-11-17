@@ -57,12 +57,7 @@ export default function App() {
         <div class="titlebar" data-tauri-drag-region />
       </Show>
       <Show when={!compact()}>
-        <Sidebar
-          active={activeTab()}
-          queueCount={activeCount()}
-          ffmpeg={state.ffmpeg}
-          onNavigate={navigate}
-        />
+        <Sidebar active={activeTab()} queueCount={activeCount()} onNavigate={navigate} />
       </Show>
       <main class="content" classList={{ "with-tabbar": showTabBar() }}>
         <Switch>

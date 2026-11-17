@@ -113,7 +113,7 @@ export const ConvertHome: Component<Props> = (props) => {
         <h2 class="display dropzone-title">
           {props.dropHover ? "Let go, I've got it!" : "Drop files on the kitty"}
         </h2>
-        <p class="dropzone-hint">Video, audio or images — one file or a whole litter.</p>
+        <p class="dropzone-hint">Video, audio or images. One file or a whole litter.</p>
         <button type="button" class="btn btn-primary" onClick={() => void chooseFiles()}>
           Choose files
         </button>

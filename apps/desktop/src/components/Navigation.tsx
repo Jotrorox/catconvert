@@ -1,7 +1,6 @@
 import { type Component, For, Show } from "solid-js";
-import type { FfmpegStatus } from "../lib/api";
-import { CatLogo } from "./Cat";
 import { Icon, type IconName } from "./Icon";
+import { Logo } from "./Logo";
 
 export type Tab = "convert" | "queue" | "recipes" | "history" | "settings";
 
@@ -15,13 +14,12 @@ const TABS: readonly { id: Tab; label: string; icon: IconName }[] = [
 type Props = {
   active: Tab;
   queueCount: number;
-  ffmpeg: FfmpegStatus | null;
   onNavigate: (tab: Tab) => void;
 };
 
 export const Brand: Component = () => (
   <span class="brand">
-    <CatLogo class="brand-logo" />
+    <Logo class="brand-logo" />
     CatConvert
   </span>
 );
@@ -52,40 +50,6 @@ export const Sidebar: Component<Props> = (props) => (
     <div class="sidebar-footer">
       <button
         type="button"
-        class="status-card"
-        data-state={props.ffmpeg === null ? "checking" : props.ffmpeg.found ? "ready" : "missing"}
-        onClick={() => props.onNavigate("settings")}
-      >
-        <span class="status-dot" />
-        <span class="status-text">
-          <Show
-            when={props.ffmpeg}
-            fallback={
-              <>
-                <strong>Sniffing for ffmpeg…</strong>
-                <span>One moment</span>
-              </>
-            }
-          >
-            {(status) => (
-              <Show
-                when={status().found}
-                fallback={
-                  <>
-                    <strong>ffmpeg missing</strong>
-                    <span>Tap to fix</span>
-                  </>
-                }
-              >
-                <strong>ffmpeg {status().version}</strong>
-                <span>Ready to convert</span>
-              </Show>
-            )}
-          </Show>
-        </span>
-      </button>
-      <button
-        type="button"
         class="nav-item"
         aria-current={props.active === "settings" ? "page" : undefined}
         onClick={() => props.onNavigate("settings")}
@@ -97,7 +61,7 @@ export const Sidebar: Component<Props> = (props) => (
   </aside>
 );
 
-export const TabBar: Component<Omit<Props, "ffmpeg">> = (props) => (
+export const TabBar: Component<Props> = (props) => (
   <nav class="tabbar" aria-label="Main">
     <For each={TABS}>
       {(tab) => (
