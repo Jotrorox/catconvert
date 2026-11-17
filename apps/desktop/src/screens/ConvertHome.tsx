@@ -1,5 +1,6 @@
-import { type Component, For, onMount, Show } from "solid-js";
+import { type Component, createSignal, For, onMount, Show } from "solid-js";
 import { CatPeek } from "../components/Cat";
+import { ContextMenu, type MenuItem } from "../components/ContextMenu";
 import { Icon } from "../components/Icon";
 import { Brand } from "../components/Navigation";
 import { PlayButton } from "../components/PlayButton";
@@ -8,11 +9,14 @@ import { dragIcon, startDragOnMove } from "../lib/drag";
 import { baseName, formatBytes, formatWhen } from "../lib/format";
 import { formatKind, KIND_TONE, label } from "../lib/formats";
 import {
+  allRecipes,
   checkHistory,
   chooseFiles,
+  convertAgain,
   dragOut,
   type HistoryItem,
   navigate,
+  reconvertSource,
   reveal,
   state,
 } from "../lib/store";
@@ -25,54 +29,144 @@ type Props = {
 
 const KIND_ICON = { video: "video", audio: "music", image: "image", unknown: "paw" } as const;
 
-export const RecentRow: Component<{ item: HistoryItem }> = (props) => {
+/** What "Convert again" says about where it starts from, if anything. */
+function reconvertHint(item: HistoryItem): string | undefined {
+  switch (reconvertSource(item)) {
+    case "output":
+      return item.sequence
+        ? "The pictures are gone; opens the animation instead"
+        : "The original is gone; opens the converted file instead";
+    case "none":
+      return item.sequence
+        ? "The pictures and the animation are both gone"
+        : "The original and the converted file are both gone";
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * A finished conversion. With `actions` (History) it can also be converted
+ * again, from a button or by right-clicking the row.
+ */
+export const RecentRow: Component<{ item: HistoryItem; actions?: boolean }> = (props) => {
   const missing = () => state.missing.includes(props.item.output);
+  const source = () => (props.actions ? reconvertSource(props.item) : null);
+  const [menu, setMenu] = createSignal<{ x: number; y: number } | null>(null);
   const drag = (event: PointerEvent) => {
     if (missing()) return;
     const { output, format, kind } = props.item;
     startDragOnMove(event, () => void dragOut(output, dragIcon(format, kind)));
   };
+  /** The kind of file a recipe would be applied to, if that file is still there. */
+  const recipeKind = () => {
+    const item = props.item;
+    if (source() === "original" && !item.sequence) return item.kind;
+    if (source() !== null && !missing()) return formatKind(item.format, item.kind);
+    return null;
+  };
+  const menuItems = (): MenuItem[] => {
+    const item = props.item;
+    const items: MenuItem[] = [];
+    if (source() !== null) {
+      items.push({
+        label: "Convert again…",
+        run: () => void convertAgain(item.id),
+        disabled: source() === "none",
+        hint: reconvertHint(item),
+      });
+      const kind = recipeKind();
+      const recipes = kind ? allRecipes().filter((r) => r.accepts.includes(kind)) : [];
+      if (recipes.length > 0) {
+        items.push({ heading: "Convert again with" });
+        for (const recipe of recipes) {
+          items.push({ label: recipe.title, run: () => void convertAgain(item.id, recipe.id) });
+        }
+      }
+      items.push({ separator: true });
+    }
+    items.push({
+      label: "Show in folder",
+      run: () => void reveal(item.output),
+      disabled: missing(),
+      hint: missing() ? "No longer where it was saved" : undefined,
+    });
+    return items;
+  };
+  const openMenu = (event: MouseEvent) => {
+    if (!props.actions) return;
+    event.preventDefault();
+    setMenu({ x: event.clientX, y: event.clientY });
+  };
   return (
-    <li
-      class="recent-item"
-      classList={{ missing: missing(), "drag-out": !missing() }}
-      title={missing() ? undefined : "Drag into another app or folder"}
-      onPointerDown={drag}
-    >
-      <span class="tile" data-tone={KIND_TONE[props.item.kind]}>
-        <Icon name={KIND_ICON[props.item.kind]} size={18} />
-      </span>
-      <div class="item-main">
-        <span class="item-name">
-          {props.item.pictures
-            ? `${props.item.pictures} pictures → ${props.item.name}`
-            : props.item.name}
-        </span>
-        <span class="item-meta">
-          {label(props.item.format)} · {formatBytes(props.item.inputBytes)} →{" "}
-          {formatBytes(props.item.outputBytes)} ·{" "}
-          {missing() ? "Moved or deleted" : formatWhen(props.item.finishedAt)}
-        </span>
-      </div>
-      <Show when={formatKind(props.item.format, props.item.kind) === "audio"}>
-        <PlayButton
-          path={props.item.output}
-          name={baseName(props.item.output)}
-          format={props.item.format}
-          disabled={missing()}
-        />
-      </Show>
-      <button
-        type="button"
-        class="icon-btn plain"
-        aria-label={`Show ${baseName(props.item.output)} in folder`}
-        title={missing() ? "No longer where it was saved" : "Show in folder"}
-        disabled={missing()}
-        onClick={() => void reveal(props.item.output)}
+    <>
+      <li
+        class="recent-item"
+        classList={{ missing: missing(), "drag-out": !missing() }}
+        title={missing() ? undefined : "Drag into another app or folder"}
+        onPointerDown={drag}
+        onContextMenu={openMenu}
       >
-        <Icon name="folder" size={18} />
-      </button>
-    </li>
+        <span class="tile" data-tone={KIND_TONE[props.item.kind]}>
+          <Icon name={KIND_ICON[props.item.kind]} size={18} />
+        </span>
+        <div class="item-main">
+          <span class="item-name">
+            {props.item.pictures
+              ? `${props.item.pictures} pictures → ${props.item.name}`
+              : props.item.name}
+          </span>
+          <span class="item-meta">
+            {label(props.item.format)}
+            {props.item.recipe ? ` · ${props.item.recipe}` : ""} ·{" "}
+            {formatBytes(props.item.inputBytes)} → {formatBytes(props.item.outputBytes)} ·{" "}
+            {missing() ? "Moved or deleted" : formatWhen(props.item.finishedAt)}
+          </span>
+        </div>
+        <Show when={formatKind(props.item.format, props.item.kind) === "audio"}>
+          <PlayButton
+            path={props.item.output}
+            name={baseName(props.item.output)}
+            format={props.item.format}
+            disabled={missing()}
+          />
+        </Show>
+        <Show when={source() !== null}>
+          <button
+            type="button"
+            class="icon-btn plain"
+            aria-label={`Convert ${props.item.name} again`}
+            title={reconvertHint(props.item) ?? "Convert again with different settings"}
+            disabled={source() === "none"}
+            onClick={() => void convertAgain(props.item.id)}
+          >
+            <Icon name="convert" size={18} />
+          </button>
+        </Show>
+        <button
+          type="button"
+          class="icon-btn plain"
+          aria-label={`Show ${baseName(props.item.output)} in folder`}
+          title={missing() ? "No longer where it was saved" : "Show in folder"}
+          disabled={missing()}
+          onClick={() => void reveal(props.item.output)}
+        >
+          <Icon name="folder" size={18} />
+        </button>
+      </li>
+      {/* Outside the row, so presses in the menu don't start a drag or a new menu. */}
+      <Show when={menu()}>
+        {(at) => (
+          <ContextMenu
+            x={at().x}
+            y={at().y}
+            label={props.item.name}
+            items={menuItems()}
+            onClose={() => setMenu(null)}
+          />
+        )}
+      </Show>
+    </>
   );
 };
 
