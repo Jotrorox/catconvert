@@ -15,6 +15,7 @@ const clip: MediaInfo = {
   fps: 30,
   videoCodec: "h264",
   audioCodec: "aac",
+  sampleRate: 48000,
   reconstructsJpeg: false,
   tileGrid: null,
 };
@@ -32,6 +33,7 @@ const photo: MediaInfo = {
   fps: null,
   videoCodec: "mjpeg",
   audioCodec: null,
+  sampleRate: null,
 };
 
 const song: MediaInfo = {
@@ -47,6 +49,7 @@ const song: MediaInfo = {
   fps: null,
   videoCodec: null,
   audioCodec: "pcm_s16le",
+  sampleRate: 48000,
 };
 
 const opts = (format: OutputFormat, patch: Partial<ConvertOptions> = {}): ConvertOptions => ({

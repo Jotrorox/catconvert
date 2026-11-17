@@ -66,6 +66,7 @@ const VIDEO: MediaInfo = {
   fps: 30,
   videoCodec: "h264",
   audioCodec: "aac",
+  sampleRate: 48000,
   reconstructsJpeg: false,
   tileGrid: null,
 };
@@ -82,6 +83,7 @@ const PHOTO: MediaInfo = {
   fps: null,
   videoCodec: "mjpeg",
   audioCodec: null,
+  sampleRate: null,
 };
 
 const PACKED: MediaInfo = {
@@ -105,6 +107,7 @@ const SONG: MediaInfo = {
   fps: null,
   videoCodec: null,
   audioCodec: "pcm_s16le",
+  sampleRate: 48000,
 };
 
 beforeEach(() => {
@@ -164,6 +167,40 @@ describe("CatConvert", () => {
     expect(screen.getByRole("button", { name: "Hide licenses" })).toBeInTheDocument();
   });
 
+  it("cleans up the sound and draws the fades on the trim bar", async () => {
+    await openVideo();
+    expect(screen.getByRole("heading", { name: "Sound" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("switch", { name: "Even out loudness" }));
+    const fadeIn = within(screen.getByRole("group", { name: "Fade in" }));
+    const fadeOut = within(screen.getByRole("group", { name: "Fade out" }));
+    expect(fadeIn.getByRole("button", { name: "Off" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(fadeIn.getByRole("button", { name: "1 s" }));
+    fireEvent.click(fadeOut.getByRole("button", { name: "3 s" }));
+    expect(document.querySelectorAll(".trim-fades .fade-line")).toHaveLength(2);
+    expect(screen.getByText(/picture fades from and to black/)).toBeInTheDocument();
+
+    const changes = within(screen.getByRole("list", { name: "Changes" }));
+    expect(changes.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "Even loudness",
+      "Fades in 1 s",
+      "Fades out 3 s",
+    ]);
+
+    // Without sound there is nothing to clean up.
+    fireEvent.click(screen.getByRole("switch", { name: "Keep sound" }));
+    expect(screen.queryByRole("heading", { name: "Sound" })).not.toBeInTheDocument();
+    expect(document.querySelector(".trim-fades")).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: "Keep sound" }));
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ sound: { normalize: true, fadeIn: 1, fadeOut: 3 } }),
+    );
+  });
+
   it("edits a video and queues it with the chosen settings", async () => {
     await openVideo();
     expect(screen.getByText(/1920×1080 · 0:42 · H264/)).toBeInTheDocument();
@@ -205,6 +242,7 @@ describe("CatConvert", () => {
       quality: 60,
       keepAudio: false,
       jxl: { lossless: false, effort: 7, progressive: false },
+      sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
       keepMetadata: true,
     });
 

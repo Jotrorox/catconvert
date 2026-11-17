@@ -34,6 +34,8 @@ export type MediaInfo = {
   fps: number | null;
   videoCodec: string | null;
   audioCodec: string | null;
+  /** Sample rate of the sound in Hz. */
+  sampleRate: number | null;
   /** JPEG XL only: a losslessly recompressed JPEG whose original can be restored. */
   reconstructsJpeg: boolean;
   /** HEIF only: the stream group ffmpeg stitches a tiled photo from. */
@@ -83,6 +85,16 @@ export type JxlOptions = {
   progressive: boolean;
 };
 
+/** Clean-up for the sound; ignored when the output has none. */
+export type SoundOptions = {
+  /** Even out loudness (to -16 LUFS). */
+  normalize: boolean;
+  /** Seconds to fade in from silence (and black, for video); 0 is off. */
+  fadeIn: number;
+  /** Seconds to fade out to silence (and black, for video); 0 is off. */
+  fadeOut: number;
+};
+
 /** Which JPEG XL code paths are installed. */
 export type JxlSupport = {
   cjxl: boolean;
@@ -107,6 +119,7 @@ export type ConvertOptions = {
   quality: number;
   keepAudio: boolean;
   jxl: JxlOptions;
+  sound: SoundOptions;
   /** Carry over dates, location and other tags where the format can hold them. */
   keepMetadata: boolean;
 };

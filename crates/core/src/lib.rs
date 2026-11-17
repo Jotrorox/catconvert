@@ -23,8 +23,8 @@ mod jxl;
 mod media;
 
 pub use convert::{
-    ConvertOptions, Crop, CropArea, JxlOptions, JxlSupport, OutputFormat, Plan, Step, Tool,
-    output_path, plan,
+    ConvertOptions, Crop, CropArea, JxlOptions, JxlSupport, OutputFormat, Plan, SoundOptions, Step,
+    Tool, output_path, plan,
 };
 pub use error::{Error, Result};
 pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, RunProgress};
