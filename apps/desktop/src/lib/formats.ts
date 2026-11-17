@@ -133,9 +133,9 @@ export function videoCodecs(format: OutputFormat): readonly VideoCodec[] {
   switch (format) {
     case "mp4":
     case "mkv":
-      return ["h264", "av1"];
+      return ["h264", "h265", "av1"];
     case "mov":
-      return ["h264"];
+      return ["h264", "h265"];
     case "webm":
       return ["vp9", "av1"];
     default:
@@ -158,7 +158,12 @@ export function codecFor(format: OutputFormat, codec: VideoCodec | null): VideoC
   return codec && videoCodecs(format).includes(codec) ? codec : null;
 }
 
-export const CODEC_LABELS: Record<VideoCodec, string> = { h264: "H.264", vp9: "VP9", av1: "AV1" };
+export const CODEC_LABELS: Record<VideoCodec, string> = {
+  h264: "H.264",
+  h265: "H.265",
+  vp9: "VP9",
+  av1: "AV1",
+};
 
 /**
  * The streams of a video or sound file with their bitrates, for the file
@@ -188,6 +193,8 @@ export function describeStreams(info: MediaInfo): string | null {
 /** One line on what picking `codec` means. */
 export function codecHint(codec: VideoCodec): string {
   switch (codec) {
+    case "h265":
+      return "Smaller files that keep HDR. Plays on Apple devices, recent PCs, TVs and phones.";
     case "av1":
       return "Smaller files that keep HDR, but slower to make. Plays on recent devices and browsers.";
     case "vp9":
@@ -286,6 +293,7 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     keepAudio: true,
     videoCodec: null,
     videoBitrate: null,
+    hardware: false,
     jxl: { lossless: false, effort: 7, progressive: false },
     sound: { normalize: false, fadeIn: 0, fadeOut: 0 },
     metadata: "noLocation",
@@ -575,6 +583,7 @@ export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
   const video = out === "video" && !isAnimatedImage(options.format, info.kind);
   const codec = codecOf(options);
   if (video && codec && codec !== videoCodecs(options.format)[0]) parts.push(CODEC_LABELS[codec]);
+  if (video && codec === "h265" && options.hardware) parts.push("hardware");
   if (video && !options.keepAudio) parts.push("no sound");
   const exact = video && codec !== null ? (options.videoBitrate ?? null) : null;
   if (exact !== null) parts.push(formatBitrate(exact * 1000));

@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use crate::convert::{
-    ConvertOptions, JxlSupport, OutputFormat, Plan, Step, Support, TONE_MAP_FILTER, Tool,
-    VideoCodec,
+    ConvertOptions, HEVC_HARDWARE_ENCODER, JxlSupport, OutputFormat, Plan, Step, Support,
+    TONE_MAP_FILTER, Tool, VideoCodec,
 };
 use crate::jxl::{self, JxlTools};
 use crate::media::{self, MediaInfo, MediaKind};
@@ -207,7 +207,18 @@ impl Ffmpeg {
         Support {
             jxl: self.jxl_support(),
             tone_map: self.tone_map,
+            hevc_hardware: self.encodes_hevc_in_hardware(),
         }
+    }
+
+    /// Whether H.265 can be encoded in hardware, for
+    /// [`ConvertOptions::hardware`]: with VideoToolbox on Apple silicon.
+    /// Intel Macs are left out: ffmpeg only offers VideoToolbox's constant
+    /// quality mode on Apple silicon.
+    #[must_use]
+    pub fn encodes_hevc_in_hardware(&self) -> bool {
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && self.has_encoder(HEVC_HARDWARE_ENCODER)
     }
 
     /// Path of the ffmpeg binary in use.

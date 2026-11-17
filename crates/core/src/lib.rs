@@ -33,9 +33,10 @@ mod scrub;
 mod sequence;
 
 pub use convert::{
-    AudioRate, ConvertOptions, Crop, CropArea, Direction, JxlOptions, JxlSupport, Metadata,
-    OutputFormat, Plan, QualitySummary, SoundOptions, Step, Support, Tool, VIDEO_KBPS, VideoCodec,
-    VideoRate, crf_range, frame_output_path, frame_plan, output_path, plan, quality_summary,
+    AudioRate, ConvertOptions, Crop, CropArea, Direction, HARDWARE_QUALITY_RANGE,
+    HEVC_HARDWARE_ENCODER, JxlOptions, JxlSupport, Metadata, OutputFormat, Plan, QualitySummary,
+    SoundOptions, Step, Support, Tool, VIDEO_KBPS, VideoCodec, VideoRate, crf_range,
+    frame_output_path, frame_plan, output_path, plan, quality_summary,
 };
 pub use custom::{
     INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER, command_template, custom_plan, fill_command,

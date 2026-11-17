@@ -270,6 +270,7 @@ export async function refreshFfmpeg(relocate = false) {
       error: String(error),
       formats: [],
       videoCodecs: [],
+      hevcHardware: false,
       readsAv1: false,
       libjxl: null,
       jxl: api.NO_JXL,
@@ -286,6 +287,11 @@ export function isAvailable(format: OutputFormat): boolean {
 /** Whether ffmpeg can write video in `codec`. */
 export function isCodecAvailable(codec: VideoCodec): boolean {
   return state.ffmpeg?.videoCodecs?.includes(codec) ?? false;
+}
+
+/** Whether H.265 can be encoded in hardware (VideoToolbox on Apple silicon). */
+export function canEncodeHevcInHardware(): boolean {
+  return state.ffmpeg?.hevcHardware ?? false;
 }
 
 /** Whether ffmpeg can read the picture of `info`: AV1 needs dav1d or libaom. */
