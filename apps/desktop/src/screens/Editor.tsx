@@ -5,13 +5,16 @@ import {
   createSignal,
   For,
   Index,
+  Match,
   on,
   onCleanup,
   Show,
+  Switch,
 } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { CropOverlay } from "../components/CropOverlay";
 import { Icon } from "../components/Icon";
+import { QualityField } from "../components/QualityField";
 import { TrimBar } from "../components/TrimBar";
 import { type Aspect, type ConvertOptions, type MediaInfo, previewCommand } from "../lib/api";
 import {
@@ -46,8 +49,6 @@ import {
   METADATA_CHOICES,
   outputHasSound,
   outputSeconds,
-  QUALITY_STEPS,
-  qualityStep,
   repacksJpeg,
   restoresJpeg,
   SPEEDS,
@@ -62,14 +63,17 @@ import {
   closeEditor,
   convertAll,
   convertDraft,
+  convertEach,
   type Draft,
   isAvailable,
+  makeAnimation,
   saveFrame,
   saveRecipe,
   skipDraft,
   state,
   updateOptions,
 } from "../lib/store";
+import { SequenceEditor } from "./SequenceEditor";
 
 const FILMSTRIP_FRAMES = 10;
 
@@ -99,17 +103,43 @@ const Sniffing: Component<{ path: string }> = (props) => (
 );
 
 export const Editor: Component<{ compact: boolean }> = (props) => (
-  <Show
-    when={state.draft}
-    keyed
+  <Switch
     fallback={
       <Show when={state.opening} fallback={<EmptyEditor />}>
         {(path) => <Sniffing path={path()} />}
       </Show>
     }
   >
-    {(draft) => <DraftEditor draft={draft} compact={props.compact} />}
-  </Show>
+    <Match when={state.choice}>{(paths) => <PictureChoice count={paths().length} />}</Match>
+    <Match when={state.sequence} keyed>
+      {(draft) => <SequenceEditor draft={draft} compact={props.compact} />}
+    </Match>
+    <Match when={state.draft} keyed>
+      {(draft) => <DraftEditor draft={draft} compact={props.compact} />}
+    </Match>
+  </Switch>
+);
+
+/** Several pictures were dropped: one by one, or one animation? */
+const PictureChoice: Component<{ count: number }> = (props) => (
+  <div class="page sniffing choice">
+    <CatPeek class="sniff-cat" />
+    <h1 class="display sniff-title">{props.count} pictures</h1>
+    <p class="item-meta">Convert them one by one, or flip through them as one animation?</p>
+    <div class="choice-actions">
+      <button type="button" class="btn btn-outline btn-lg" onClick={() => convertEach()}>
+        <Icon name="convert" size={18} />
+        Convert each
+      </button>
+      <button type="button" class="btn btn-primary btn-lg" onClick={() => void makeAnimation()}>
+        <Icon name="sparkle" size={18} />
+        Make an animation
+      </button>
+    </div>
+    <button type="button" class="link-btn" onClick={() => closeEditor()}>
+      Never mind
+    </button>
+  </div>
 );
 
 const EmptyEditor: Component = () => (
@@ -298,7 +328,6 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
 
   // Settings ------------------------------------------------------------------
 
-  const step = () => qualityStep(options().quality);
   const sizes = createMemo(() => sizeChoices(info(), options()));
   const rates = createMemo(() => fpsChoices(info()));
   const isJxl = () => options().format === "jxl";
@@ -784,27 +813,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
               </p>
             }
           >
-            <div class="field">
-              <label class="field-label" for="quality">
-                Quality
-              </label>
-              <input
-                id="quality"
-                class="range"
-                type="range"
-                min="0"
-                max="100"
-                aria-describedby={estimate() ? "size-estimate" : undefined}
-                value={options().quality}
-                style={{ "--pct": `${options().quality}%` }}
-                onInput={(event) => updateOptions({ quality: event.currentTarget.valueAsNumber })}
-              />
-              <div class="range-scale">
-                <For each={QUALITY_STEPS}>
-                  {(name) => <span classList={{ active: step() === name }}>{name}</span>}
-                </For>
-              </div>
-            </div>
+            <QualityField
+              quality={options().quality}
+              describedBy={estimate() ? "size-estimate" : undefined}
+              onChange={(quality) => updateOptions({ quality })}
+            />
           </Show>
 
           <Show when={estimate()}>

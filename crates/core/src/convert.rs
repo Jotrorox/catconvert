@@ -77,8 +77,9 @@ impl OutputFormat {
         }
     }
 
-    /// What kind of file this produces. GIFs count as (silent) video. JPEG XL
-    /// counts as an image, but becomes an animation when made from a video.
+    /// What kind of file this produces. GIFs count as (silent) video. WebP
+    /// and JPEG XL count as images, but become animations when made from a
+    /// video (see [`OutputFormat::animates`]).
     #[must_use]
     pub fn kind(self) -> MediaKind {
         match self {
@@ -122,13 +123,24 @@ impl OutputFormat {
     }
 
     /// Whether writing this format from an input of `kind` makes an animation
-    /// rather than a still: GIFs always, JPEG XL when the input moves.
+    /// rather than a still: GIFs always, WebP and JPEG XL when the input moves.
     #[must_use]
     pub fn animates(self, kind: MediaKind) -> bool {
         match self {
             Self::Gif => true,
-            Self::Jxl => kind == MediaKind::Video,
+            Self::Webp | Self::Jxl => kind == MediaKind::Video,
             _ => false,
+        }
+    }
+
+    /// The ffmpeg encoder that writes this format as an animation, where it
+    /// differs from [`OutputFormat::encoder`].
+    #[must_use]
+    pub fn animation_encoder(self) -> &'static str {
+        match self {
+            Self::Webp => "libwebp_anim",
+            Self::Jxl => "libjxl_anim",
+            _ => self.encoder(),
         }
     }
 }
@@ -431,6 +443,9 @@ pub struct Plan {
     /// Intermediate files the steps pass along; deleted when the job ends,
     /// whatever the outcome.
     pub scratch: Vec<PathBuf>,
+    /// Text files the steps read, such as ffmpeg concat lists: written just
+    /// before the first step. Their paths are in `scratch` too.
+    pub writes: Vec<(PathBuf, String)>,
 }
 
 impl Plan {
@@ -461,16 +476,21 @@ impl Plan {
 }
 
 /// Default output height for GIFs, which get huge quickly.
-const GIF_MAX_SIZE: u32 = 480;
+pub(crate) const GIF_MAX_SIZE: u32 = 480;
 /// Default frame rate for GIFs.
 const GIF_FPS: f64 = 15.0;
 /// Default short side of animated JPEG XL.
-const ANIMATED_JXL_MAX_SIZE: u32 = 720;
+pub(crate) const ANIMATED_JXL_MAX_SIZE: u32 = 720;
 /// Default frame-rate cap of animated JPEG XL.
 const ANIMATED_JXL_FPS: f64 = 30.0;
+/// Default short side of animated WebP. libwebp has no motion prediction,
+/// so big animations get heavy; this matches GIFs.
+pub(crate) const ANIMATED_WEBP_MAX_SIZE: u32 = 480;
+/// Default frame-rate cap of animated WebP.
+const ANIMATED_WEBP_FPS: f64 = 24.0;
 /// `cjxl` and ffmpeg's `reverse` filter hold every decoded frame in memory;
 /// refuse animations whose raw frames would exceed this many bytes.
-const FRAME_MEMORY_BUDGET: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
+pub(crate) const FRAME_MEMORY_BUDGET: f64 = 4.0 * 1024.0 * 1024.0 * 1024.0;
 /// Slowest and fastest animation speed.
 const SPEEDS: std::ops::RangeInclusive<f64> = 0.25..=4.0;
 /// Inputs `cjxl` reads itself, keeping metadata, bit depth and (for JPEG) the
@@ -573,6 +593,7 @@ pub fn plan(
                 steps,
                 output: output.to_path_buf(),
                 scratch,
+                writes: Vec::new(),
             });
         }
     }
@@ -605,6 +626,7 @@ pub fn plan(
                 steps,
                 output: output.to_path_buf(),
                 scratch,
+                writes: Vec::new(),
             });
         }
     }
@@ -771,6 +793,7 @@ pub fn plan(
         steps,
         output: output.to_path_buf(),
         scratch,
+        writes: Vec::new(),
     })
 }
 
@@ -897,15 +920,7 @@ fn ffmpeg_step(
                     push(&["-af", &audio.join(",")]);
                 }
             }
-            if format == OutputFormat::Webm {
-                let crf = lerp(q, 48.0, 28.0).to_string();
-                push(&["-c:v", "libvpx-vp9", "-crf", &crf, "-b:v", "0"]);
-                push(&["-row-mt", "1", "-deadline", "good", "-cpu-used", "4"]);
-            } else {
-                let crf = lerp(q, 34.0, 18.0).to_string();
-                push(&["-c:v", "libx264", "-preset", "fast", "-crf", &crf]);
-            }
-            push(&["-pix_fmt", "yuv420p"]);
+            push_video_encoder(&mut push, format, q);
             if keep_audio {
                 if format == OutputFormat::Webm {
                     push(&["-c:a", "libopus", "-b:a", tiered(q, ["64k", "96k", "160k"])]);
@@ -937,6 +952,12 @@ fn ffmpeg_step(
             push(&["-c:v", "libjxl_anim"]);
             push_ffmpeg_jxl(&mut push, options);
             push(&["-an", "-sn", "-dn", "-f", "data"]);
+        }
+        (OutputFormat::Webp, Sink::Output) if animated => {
+            let filters = tone_mapped(animation_filters(input, options, lead_trim));
+            push_video(&mut push, input, &[], &filters);
+            push_animated_webp(&mut push, q);
+            push(&["-an", "-sn", "-dn"]);
         }
         (
             OutputFormat::Mp3
@@ -1133,8 +1154,28 @@ fn push_video(
     }
 }
 
+/// The video encoder of MP4, MOV, MKV (H.264) or WebM (VP9) at quality `q`,
+/// in a pixel format every player reads.
+pub(crate) fn push_video_encoder(push: &mut impl FnMut(&[&str]), format: OutputFormat, q: u8) {
+    if format == OutputFormat::Webm {
+        let crf = lerp(q, 48.0, 28.0).to_string();
+        push(&["-c:v", "libvpx-vp9", "-crf", &crf, "-b:v", "0"]);
+        push(&["-row-mt", "1", "-deadline", "good", "-cpu-used", "4"]);
+    } else {
+        let crf = lerp(q, 34.0, 18.0).to_string();
+        push(&["-c:v", "libx264", "-preset", "fast", "-crf", &crf]);
+    }
+    push(&["-pix_fmt", "yuv420p"]);
+}
+
+/// libwebp's animation encoder at quality `q`, looping forever.
+pub(crate) fn push_animated_webp(push: &mut impl FnMut(&[&str]), q: u8) {
+    let quality = lerp(q, 40.0, 95.0).to_string();
+    push(&["-c:v", "libwebp_anim", "-quality", &quality, "-loop", "0"]);
+}
+
 /// Distance and effort for ffmpeg's libjxl encoders.
-fn push_ffmpeg_jxl(push: &mut impl FnMut(&[&str]), options: &ConvertOptions) {
+pub(crate) fn push_ffmpeg_jxl(push: &mut impl FnMut(&[&str]), options: &ConvertOptions) {
     let distance = jxl_distance(options);
     // ffmpeg's libjxl wrapper caps effort at 9.
     let effort = options.jxl.effort.clamp(1, 9).to_string();
@@ -1143,7 +1184,7 @@ fn push_ffmpeg_jxl(push: &mut impl FnMut(&[&str]), options: &ConvertOptions) {
 
 /// `cjxl` reading `input` and writing `output`. `jpeg` marks a JPEG input,
 /// which is recompressed losslessly when `lossless` is on.
-fn cjxl_step(
+pub(crate) fn cjxl_step(
     input: &Path,
     output: &Path,
     options: &ConvertOptions,
@@ -1191,6 +1232,7 @@ fn animation_defaults(format: OutputFormat) -> (Option<u32>, Option<f64>) {
     match format {
         OutputFormat::Gif => (Some(GIF_MAX_SIZE), Some(GIF_FPS)),
         OutputFormat::Jxl => (Some(ANIMATED_JXL_MAX_SIZE), Some(ANIMATED_JXL_FPS)),
+        OutputFormat::Webp => (Some(ANIMATED_WEBP_MAX_SIZE), Some(ANIMATED_WEBP_FPS)),
         _ => (None, None),
     }
 }
@@ -1294,7 +1336,7 @@ fn output_dims(
 
 /// A hidden intermediate next to `output`, e.g. `.cat.jxl.frames.png`.
 /// Unique because the output path is.
-fn scratch_path(output: &Path, tag: &str, ext: &str) -> PathBuf {
+pub(crate) fn scratch_path(output: &Path, tag: &str, ext: &str) -> PathBuf {
     let name = output
         .file_name()
         .map_or_else(|| "output".into(), |n| n.to_string_lossy().into_owned());
@@ -1382,7 +1424,12 @@ fn file_stem(input: &Path) -> String {
 
 /// `{stem}.{ext}` next to `input`, or `{stem} 2.{ext}`, `{stem} 3.{ext}`, …,
 /// whichever is first neither `input`, on disk, nor `taken`.
-fn free_path(input: &Path, stem: &str, ext: &str, taken: impl Fn(&Path) -> bool) -> PathBuf {
+pub(crate) fn free_path(
+    input: &Path,
+    stem: &str,
+    ext: &str,
+    taken: impl Fn(&Path) -> bool,
+) -> PathBuf {
     let dir = input.parent().unwrap_or_else(|| Path::new(""));
     (1..)
         .map(|n| {
@@ -1547,16 +1594,7 @@ fn picture_filters(
     default_max: Option<u32>,
     even: bool,
 ) -> Vec<String> {
-    let mut filters = Vec::new();
-    match options.rotate {
-        90 => filters.push("transpose=clock".to_owned()),
-        180 => filters.push("hflip,vflip".to_owned()),
-        270 => filters.push("transpose=cclock".to_owned()),
-        _ => {}
-    }
-    if options.flip {
-        filters.push("hflip".to_owned());
-    }
+    let mut filters = turn_filters(options);
 
     // Display size after our rotation, then after the crop.
     let mut dims = turned_dims(input, options);
@@ -1596,8 +1634,23 @@ fn picture_filters(
     filters
 }
 
+/// The user's quarter turns and mirroring, in that order.
+pub(crate) fn turn_filters(options: &ConvertOptions) -> Vec<String> {
+    let mut filters = Vec::new();
+    match options.rotate {
+        90 => filters.push("transpose=clock".to_owned()),
+        180 => filters.push("hflip,vflip".to_owned()),
+        270 => filters.push("transpose=cclock".to_owned()),
+        _ => {}
+    }
+    if options.flip {
+        filters.push("hflip".to_owned());
+    }
+    filters
+}
+
 /// Map quality 0–100 linearly onto `worst..=best` and round.
-fn lerp(quality: u8, worst: f64, best: f64) -> i64 {
+pub(crate) fn lerp(quality: u8, worst: f64, best: f64) -> i64 {
     #[allow(clippy::cast_possible_truncation)]
     let value = (worst + (best - worst) * f64::from(quality) / 100.0).round() as i64;
     value
@@ -1656,6 +1709,7 @@ mod tests {
             has_location: false,
             location_tags: Vec::new(),
             tile_grid: None,
+            orientation: None,
         }
     }
 
@@ -1939,6 +1993,46 @@ mod tests {
         assert!(cmd.contains("palettegen=max_colors=166"), "{cmd}");
         assert!(
             cmd.ends_with("-loop 0 -an -sn -dn /clips/loop.gif"),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn video_becomes_an_animated_webp_with_caps() {
+        let options = ConvertOptions {
+            format: OutputFormat::Webp,
+            trim_end: Some(4.0),
+            ..ConvertOptions::default()
+        };
+        assert!(OutputFormat::Webp.animates(MediaKind::Video));
+        assert!(!OutputFormat::Webp.animates(MediaKind::Image));
+        assert_eq!(OutputFormat::Webp.animation_encoder(), "libwebp_anim");
+        let plan = plan(
+            &video("loop.mov"),
+            &options,
+            Path::new("/clips/loop.webp"),
+            JxlSupport::default(),
+        )
+        .expect("plan");
+        let cmd = plan.command_line();
+        assert!(
+            cmd.contains("-vf fps=24,scale=-2:480:flags=lanczos -c:v libwebp_anim -quality 73 -loop 0 -an -sn -dn"),
+            "{cmd}"
+        );
+        assert_eq!(plan.duration_secs(), Some(4.0));
+
+        // Played as a boomerang like GIFs and animated JPEG XL.
+        let boomerang = ConvertOptions {
+            direction: Direction::Boomerang,
+            ..options.clone()
+        };
+        let cmd = command(&video("loop.mov"), &boomerang, "/clips/loop.webp");
+        assert!(cmd.contains("reverse"), "{cmd}");
+
+        // A picture still makes a still.
+        let cmd = command(&image("cat.png", 800, 600), &options, "/clips/cat.webp");
+        assert!(
+            cmd.contains("-frames:v 1 -c:v libwebp -quality 73"),
             "{cmd}"
         );
     }

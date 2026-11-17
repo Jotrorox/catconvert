@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::convert::{self, ConvertOptions, OutputFormat, Plan};
 use crate::ffmpeg::{Ffmpeg, RunOutcome};
+use crate::sequence::{self, SequenceOptions};
 use crate::{Error, MediaInfo, Result};
 
 /// Process-unique identifier of a conversion job.
@@ -85,8 +86,8 @@ pub struct JobTicket {
     pub id: JobId,
     /// Where the result will be written.
     pub output: PathBuf,
-    /// The probed input.
-    pub input: MediaInfo,
+    /// The probed input, or the pictures of an animation in the order given.
+    pub inputs: Vec<MediaInfo>,
     /// The exact command(s) that will run.
     pub command: String,
 }
@@ -177,20 +178,70 @@ impl Queue {
             return Err(Error::Unsupported { message });
         }
         let info = ffmpeg.probe(input)?;
+        if options.format.animates(info.kind)
+            && let Some(message) = ffmpeg.missing_animation(options.format)
+        {
+            return Err(Error::Unsupported { message });
+        }
 
-        let (plan, id, cancel) = {
+        let plan = {
             let mut reserved = lock(&self.shared.reserved);
             let output = convert::output_path(&info.path, options.format, |p| reserved.contains(p));
             let plan = convert::plan(&info, options, &output, ffmpeg.support())?;
             reserved.insert(output);
-            (plan, JobId::next(), Arc::new(AtomicBool::new(false)))
+            plan
         };
+        self.enqueue(plan, vec![info])
+    }
+
+    /// Probe `pictures`, plan one animation from them in this order (see
+    /// [`sequence::plan_sequence`]) and queue it.
+    ///
+    /// The output goes next to the first picture (see
+    /// [`sequence::sequence_output_path`]). A `Queued` event is emitted before
+    /// this returns.
+    ///
+    /// # Errors
+    ///
+    /// Probe errors of any picture, [`Error::Unsupported`] if the request
+    /// doesn't make an animation or the tools to write it are missing.
+    pub fn submit_sequence(
+        &self,
+        pictures: &[impl AsRef<Path>],
+        options: &ConvertOptions,
+        sequence: &SequenceOptions,
+    ) -> Result<JobTicket> {
+        let ffmpeg = &self.shared.ffmpeg;
+        if let Some(message) = ffmpeg.missing_animation(options.format) {
+            return Err(Error::Unsupported { message });
+        }
+        let infos = pictures
+            .iter()
+            .map(|path| ffmpeg.probe(path))
+            .collect::<Result<Vec<_>>>()?;
+
+        let plan = {
+            let mut reserved = lock(&self.shared.reserved);
+            let output =
+                sequence::sequence_output_path(&infos, options.format, |p| reserved.contains(p));
+            let plan =
+                sequence::plan_sequence(&infos, options, sequence, &output, ffmpeg.support())?;
+            reserved.insert(output);
+            plan
+        };
+        self.enqueue(plan, infos)
+    }
+
+    /// Register a planned job whose output is already reserved and hand it to
+    /// the worker.
+    fn enqueue(&self, plan: Plan, inputs: Vec<MediaInfo>) -> Result<JobTicket> {
+        let (id, cancel) = (JobId::next(), Arc::new(AtomicBool::new(false)));
         lock(&self.shared.active).insert(id, Arc::clone(&cancel));
 
         let ticket = JobTicket {
             id,
             output: plan.output.clone(),
-            input: info,
+            inputs,
             command: plan.command_line(),
         };
         (self.shared.emit)(JobProgress::new(id, JobStage::Queued, 0.0));
@@ -306,7 +357,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::OutputFormat;
+    use crate::{OutputFormat, SequenceOptions};
 
     #[test]
     fn job_ids_are_unique() {
@@ -459,6 +510,160 @@ mod tests {
             let again = queue.save_frame(&input, &options, 1.4).expect("save again");
             assert!(again.output.ends_with("test clip-frame-0m01s 2.png"));
         }
+    }
+
+    /// A copy of the JPEG `src` with an EXIF orientation tag, as phones write
+    /// portrait photos.
+    fn with_orientation(src: &Path, dst: &Path, orientation: u16) {
+        let jpeg = std::fs::read(src).expect("read jpeg");
+        let exif = crate::media::tests::jpeg_with_orientation(orientation, true);
+        // The test helper builds SOI, APP0, APP1, SOS; splice in its APP0+APP1.
+        let sos = exif
+            .windows(2)
+            .rposition(|w| w == [0xFF, 0xDA])
+            .expect("sos");
+        let mut out = jpeg[..2].to_vec();
+        out.extend(&exif[2..sos]);
+        out.extend(&jpeg[2..]);
+        std::fs::write(dst, out).expect("write jpeg");
+    }
+
+    /// Real ffmpeg runs of pictures → animation. Skipped (passes) when ffmpeg
+    /// is not installed.
+    #[test]
+    fn pictures_become_animations_end_to_end() {
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping sequence test");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let make = |source: &str, name: &str| {
+            let path = dir.path().join(name);
+            let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+                .args(["-v", "error", "-f", "lavfi", "-i", source, "-frames:v", "1"])
+                .arg(&path)
+                .status()
+                .expect("run ffmpeg");
+            assert!(status.success(), "{name}");
+            path
+        };
+        let a = make("testsrc2=s=640x480", "cat 1.jpg");
+        let b = make("color=red:s=640x480,format=gray", "cat 2.jpg");
+        let c = make("testsrc=s=300x500", "cat's 3.png");
+        let landscape = make("testsrc2=s=400x300", "plain.jpg");
+        let turned = dir.path().join("turned.jpg");
+        with_orientation(&landscape, &turned, 6);
+
+        let info = ffmpeg.probe(&turned).expect("probe");
+        assert_eq!(info.orientation, Some(6));
+        assert_eq!((info.width, info.height), (Some(300), Some(400)));
+
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let run = |pictures: &[&Path], options: ConvertOptions, sequence: SequenceOptions| {
+            let ticket = queue
+                .submit_sequence(pictures, &options, &sequence)
+                .expect("submit");
+            assert_eq!(ticket.inputs.len(), pictures.len());
+            let done = finish_of(&rx, ticket.id);
+            assert_eq!(done.stage, JobStage::Done, "{done:?}\n{}", ticket.command);
+            let out = ffmpeg.probe(&ticket.output).expect("probe output");
+            (ticket, out)
+        };
+
+        // Mixed codecs, sizes and a grey picture; boomerang at 0.25 s.
+        let quarter = SequenceOptions {
+            frame_secs: 0.25,
+            ..SequenceOptions::default()
+        };
+        let gif = ConvertOptions {
+            format: OutputFormat::Gif,
+            ..ConvertOptions::default()
+        };
+        let boomerang = ConvertOptions {
+            direction: crate::Direction::Boomerang,
+            ..gif.clone()
+        };
+        let (ticket, out) = run(&[&a, &b, &c, &turned], boomerang, quarter);
+        // No shared name ("turned"), so it's named after the folder.
+        let folder = dir.path().file_name().expect("name").to_string_lossy();
+        let expected = format!("{}.gif", folder.trim_start_matches('.'));
+        assert_eq!(ticket.output, dir.path().join(expected));
+        assert_eq!(out.kind, crate::MediaKind::Video);
+        assert_eq!((out.width, out.height), (Some(640), Some(480)));
+        // a b c turned c b: six pictures of a quarter second.
+        let secs = out.duration_secs.expect("duration");
+        assert!((secs - 1.5).abs() < 0.02, "{secs}");
+
+        // Portrait first: the frame is portrait, and an MP4 slideshow.
+        let mp4 = ConvertOptions {
+            format: OutputFormat::Mp4,
+            ..ConvertOptions::default()
+        };
+        if ffmpeg.supports(OutputFormat::Mp4) {
+            let crop = SequenceOptions {
+                fit: crate::Fit::Crop,
+                ..SequenceOptions::default()
+            };
+            let (_, out) = run(&[&turned, &a, &c], mp4, crop);
+            assert_eq!((out.width, out.height), (Some(300), Some(400)));
+            assert!((out.duration_secs.expect("duration") - 1.5).abs() < 0.05);
+            assert!((out.fps.expect("fps") - 24.0).abs() < 0.1);
+        }
+
+        // Many sizes: each picture is scaled on its own first.
+        let many: Vec<PathBuf> = (0..10)
+            .map(|i| {
+                make(
+                    &format!("testsrc=s={}x{}", 100 + i * 10, 80),
+                    &format!("p{i}.png"),
+                )
+            })
+            .collect();
+        let many: Vec<&Path> = many.iter().map(PathBuf::as_path).collect();
+        let (ticket, out) = run(
+            &many,
+            gif.clone(),
+            SequenceOptions {
+                frame_secs: 0.1,
+                ..SequenceOptions::default()
+            },
+        );
+        assert!(
+            ticket.command.matches("ffmpeg ").count() > 10,
+            "{}",
+            ticket.command
+        );
+        assert_eq!((out.width, out.height), (Some(100), Some(80)));
+        assert!((out.duration_secs.expect("duration") - 1.0).abs() < 0.02);
+
+        // Animated JPEG XL through cjxl, when installed.
+        if ffmpeg.jxl_tools().cjxl.is_some() {
+            let jxl = ConvertOptions {
+                format: OutputFormat::Jxl,
+                ..ConvertOptions::default()
+            };
+            let (ticket, _) = run(&[&a, &b], jxl, SequenceOptions::default());
+            assert!(ticket.command.contains("cjxl "), "{}", ticket.command);
+        }
+
+        // A picture that has gone missing fails the submit, not the queue.
+        let gone = dir.path().join("gone.jpg");
+        assert!(
+            queue
+                .submit_sequence(&[&a, &gone], &gif, &SequenceOptions::default())
+                .is_err()
+        );
+
+        // Only the pictures and outputs are left: no lists or scratch files.
+        let hidden: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(hidden.is_empty(), "{hidden:?}");
     }
 
     /// Wait for the final event of `id`.

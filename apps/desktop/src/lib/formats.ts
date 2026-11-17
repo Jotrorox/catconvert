@@ -9,6 +9,7 @@ import type {
   MediaKind,
   MetadataMode,
   OutputFormat,
+  SequenceOptions,
 } from "./api";
 import { aspectText, cropBox, cropForOtherFile, pictureSize, turnedSize } from "./crop";
 
@@ -21,13 +22,13 @@ export type FormatGroup = {
   formats: readonly OutputFormat[];
 };
 
-/** JPEG XL appears twice: as an animation for videos, as a still for pictures. */
+/** WebP and JPEG XL appear twice: as animations for videos, as stills for pictures. */
 export const FORMAT_GROUPS: readonly FormatGroup[] = [
   {
     kind: "video",
     label: "Video",
     tone: "pink",
-    formats: ["mp4", "webm", "mov", "mkv", "gif", "jxl"],
+    formats: ["mp4", "webm", "mov", "mkv", "gif", "webp", "jxl"],
   },
   { kind: "audio", label: "Sound", tone: "yellow", formats: ["mp3", "m4a", "wav", "flac", "ogg"] },
   {
@@ -38,27 +39,32 @@ export const FORMAT_GROUPS: readonly FormatGroup[] = [
   },
 ];
 
-/** What writing `format` from an `input` file makes. JPEG XL moves when the input does. */
+/** Formats that are a still or an animation, depending on the input. */
+const STILL_OR_ANIMATED: ReadonlySet<OutputFormat> = new Set(["webp", "jxl"]);
+
+/** What writing `format` from an `input` file makes. WebP and JPEG XL move when the input does. */
 export function formatKind(format: OutputFormat, input: MediaKind): FormatGroup["kind"] {
-  if (format === "jxl") return input === "video" ? "video" : "image";
+  if (STILL_OR_ANIMATED.has(format)) return input === "video" ? "video" : "image";
   return FORMAT_GROUPS.find((group) => group.formats.includes(format))?.kind ?? "video";
 }
 
 /** Formats that become animated images rather than video files (no sound). */
 export function isAnimatedImage(format: OutputFormat, input: MediaKind): boolean {
-  return format === "gif" || (format === "jxl" && input === "video");
+  return format === "gif" || (STILL_OR_ANIMATED.has(format) && input === "video");
 }
 
 /**
  * Size and frame-rate caps the backend applies to animations when the user
- * keeps "Auto". Mirrors GIF_MAX_SIZE/GIF_FPS and ANIMATED_JXL_* in convert.rs.
+ * keeps "Auto". Mirrors GIF_MAX_SIZE/GIF_FPS and ANIMATED_* in convert.rs.
  */
 export function autoLimits(
   format: OutputFormat,
   input: MediaKind,
 ): { size: number; fps: number } | null {
   if (format === "gif") return { size: 480, fps: 15 };
-  if (format === "jxl" && input === "video") return { size: 720, fps: 30 };
+  if (input !== "video") return null;
+  if (format === "webp") return { size: 480, fps: 24 };
+  if (format === "jxl") return { size: 720, fps: 30 };
   return null;
 }
 
@@ -518,4 +524,117 @@ export function recipeFrom(
     options: { ...kept, crop, jxl: { ...kept.jxl }, sound: { ...kept.sound } },
     accepts,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Pictures → animation
+// ---------------------------------------------------------------------------
+
+/** What pictures can become, in the order the sequence editor offers them. */
+export const SEQUENCE_FORMATS: readonly OutputFormat[] = ["gif", "webp", "jxl", "mp4"];
+
+/** Frame-time choices, in seconds. */
+export const FRAME_TIMES = [0.1, 0.25, 0.5, 1] as const;
+
+export const DEFAULT_SEQUENCE: SequenceOptions = {
+  frameSecs: 0.5,
+  fit: "pad",
+};
+
+/** Extensions of still pictures. GIF and APNG may move, so they don't count. */
+const PICTURE_EXTENSIONS = new Set([
+  ...["jpg", "jpeg", "png", "webp", "avif", "heic", "heif", "hif", "tif", "tiff", "bmp", "jxl"],
+]);
+
+/** Whether a dropped path looks like a still picture, judging by its name. */
+export function looksLikePicture(path: string): boolean {
+  const dot = path.lastIndexOf(".");
+  return dot > 0 && PICTURE_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
+}
+
+const NATURAL = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+/** Natural filename order: `cat 2` before `cat 10`. */
+export function naturalOrder(a: MediaInfo, b: MediaInfo): number {
+  return NATURAL.compare(a.fileName, b.fileName) || NATURAL.compare(a.path, b.path);
+}
+
+/**
+ * Default short-side cap of an animation made from pictures, when "Auto" is
+ * kept. Mirrors `frame_size` in sequence.rs.
+ */
+export function sequenceAutoSize(format: OutputFormat): number | null {
+  if (format === "gif" || format === "webp") return 480;
+  if (format === "jxl") return 720;
+  return null;
+}
+
+/** The animation's frame: the first picture's size, capped, with even sides. */
+export function sequenceFrame(
+  first: MediaInfo,
+  options: ConvertOptions,
+): { width: number; height: number } | null {
+  if (!first.width || !first.height) return null;
+  const [w, h] = [first.width, first.height];
+  const cap = options.maxSize ?? sequenceAutoSize(options.format);
+  const target = cap === null ? null : Math.max(2, cap) & ~1;
+  let [width, height] = [w, h];
+  if (target !== null && target < Math.min(w, h)) {
+    const long = Math.round((Math.max(w, h) * target) / Math.min(w, h));
+    [width, height] = w >= h ? [long, target] : [target, long];
+  }
+  const even = (n: number) => Math.max(2, n & ~1);
+  [width, height] = [even(width), even(height)];
+  return options.rotate % 180 === 90 ? { width: height, height: width } : { width, height };
+}
+
+/** The order pictures show in. Mirrors `Direction::order` in sequence.rs. */
+export function playbackOrder(count: number, direction: Direction): number[] {
+  const forward = Array.from({ length: count }, (_, i) => i);
+  if (direction === "reverse") return forward.reverse();
+  if (direction === "boomerang") return [...forward, ...forward.slice(1, -1).reverse()];
+  return forward;
+}
+
+/** Starting format for an animation: the first offered one that is installed. */
+export function sequenceFormat(animated: (f: OutputFormat) => boolean): OutputFormat {
+  return SEQUENCE_FORMATS.find(animated) ?? "gif";
+}
+
+/** Starting options for an animation made from pictures. */
+export function sequenceOptions(
+  animated: (f: OutputFormat) => boolean,
+  defaults: Defaults = DEFAULTS,
+): ConvertOptions {
+  return {
+    ...defaultOptions(sequenceFormat(animated)),
+    quality: defaults.quality,
+    // An animation never carries one picture's tags; the backend strips them.
+    metadata: "none",
+  };
+}
+
+/**
+ * The animation's file name without extension: what the pictures' names
+ * share (`cat 1`, `cat 2` → `cat`), else their folder. Mirrors
+ * `sequence_name` in sequence.rs; the backend adds ` 2` and so on if taken.
+ */
+export function sequenceName(pictures: readonly MediaInfo[]): string {
+  const stem = (info: MediaInfo) => {
+    const dot = info.fileName.lastIndexOf(".");
+    return dot > 0 ? info.fileName.slice(0, dot) : info.fileName;
+  };
+  const stems = pictures.map(stem);
+  let prefix = [...(stems[0] ?? "")];
+  for (const other of stems.slice(1)) {
+    const chars = [...other];
+    let shared = 0;
+    while (shared < prefix.length && prefix[shared] === chars[shared]) shared++;
+    prefix = prefix.slice(0, shared);
+  }
+  const trimmed = prefix.join("").replace(/[\d\s_\-.#(]+$/u, "");
+  if ((trimmed.match(/[\p{L}\p{N}]/gu) ?? []).length >= 2) return trimmed;
+  const parts = (pictures[0]?.path ?? "").split(/[\\/]/);
+  const folder = (parts[parts.length - 2] ?? "").replace(/^\.+/, "");
+  return folder || "animation";
 }

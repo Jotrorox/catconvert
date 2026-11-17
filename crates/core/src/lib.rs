@@ -14,6 +14,9 @@
 //!    one or more command lines ([`Step`]s).
 //! 3. [`Queue`] runs planned conversions one after another and reports
 //!    [`JobProgress`] events.
+//!
+//! Several pictures can also become one animation: [`plan_sequence`] plans
+//! it and [`Queue::submit_sequence`] runs it.
 
 mod convert;
 mod error;
@@ -22,6 +25,7 @@ mod job;
 mod jxl;
 mod media;
 mod scrub;
+mod sequence;
 
 pub use convert::{
     ConvertOptions, Crop, CropArea, Direction, JxlOptions, JxlSupport, Metadata, OutputFormat,
@@ -31,5 +35,6 @@ pub use error::{Error, Result};
 pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, RunProgress};
 pub use job::{JobId, JobProgress, JobStage, JobTicket, Queue, SavedFrame};
 pub use jxl::{JxlTools, LIBJXL_ENV, has_jpeg_reconstruction, is_jxl_file};
-pub use media::{MediaInfo, MediaKind, probe};
+pub use media::{MediaInfo, MediaKind, jpeg_orientation, probe};
 pub use scrub::scrub_file;
+pub use sequence::{Fit, MAX_PICTURES, SequenceOptions, plan_sequence, sequence_output_path};

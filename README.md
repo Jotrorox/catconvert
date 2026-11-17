@@ -22,6 +22,11 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 > Settings can add a "Convert with CatConvert" Finder Quick Action. Finished
 > files drag straight out of the Queue and History into other apps.
 >
+> Drop several pictures to convert each, or to make one animation of them: a GIF,
+> animated WebP or JPEG XL, or an MP4 slideshow. Reorder them in a filmstrip, pick
+> how long each one shows, play it forward, reversed or as a boomerang, and fit
+> other shapes to the first picture with black bars or by cropping.
+>
 > JPEG XL is fully supported, still and animated, with libjxl's tools (bundled in
 > releases; otherwise `brew install jpeg-xl`, found like ffmpeg or via
 > `CATCONVERT_LIBJXL`). You get
@@ -102,6 +107,7 @@ mise run cli -- convert clip.mov --to jxl --size 480 --effort 9    # animated JP
 mise run cli -- convert clip.mov --to mp3            # pull the audio
 mise run cli -- convert clip.mov --to mp4 --crop 9:16 --size 1080  # vertical, centred
 mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print the ffmpeg command
+mise run cli -- animate cat*.jpg --to gif --frame 0.25 --direction boomerang  # pictures → animation
 ```
 
 ## CI and releases

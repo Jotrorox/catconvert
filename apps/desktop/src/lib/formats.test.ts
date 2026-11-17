@@ -1,24 +1,33 @@
 import { describe, expect, it } from "vitest";
 import type { MediaInfo } from "./api";
 import {
+  autoLimits,
   DEFAULTS,
   defaultFormat,
   defaultOptions,
   fadeSpans,
   fitOptions,
+  formatKind,
   fpsChoices,
   initialOptions,
+  isAnimatedImage,
   isUntouched,
   keepsLocation,
   keepsMetadata,
   locationLine,
+  looksLikePicture,
   metadataFrom,
+  naturalOrder,
   outputHasSound,
   outputSeconds,
+  playbackOrder,
   RECIPES,
   recipeDetail,
   recipeFrom,
   repacksJpeg,
+  sequenceFormat,
+  sequenceFrame,
+  sequenceName,
   sizeChoices,
 } from "./formats";
 
@@ -279,5 +288,83 @@ describe("formats", () => {
       accepts: ["video", "audio"],
       detail: "Tiny file",
     });
+  });
+});
+
+describe("pictures → animation", () => {
+  const photo = (path: string, width = 4000, height = 3000): MediaInfo => ({
+    ...clip,
+    path,
+    fileName: path.split("/").pop() ?? path,
+    extension: "jpg",
+    kind: "image",
+    durationSecs: null,
+    width,
+    height,
+    fps: null,
+    videoCodec: "mjpeg",
+    audioCodec: null,
+  });
+
+  it("treats WebP like JPEG XL: animated from video, still from pictures", () => {
+    expect(formatKind("webp", "video")).toBe("video");
+    expect(formatKind("webp", "image")).toBe("image");
+    expect(isAnimatedImage("webp", "video")).toBe(true);
+    expect(isAnimatedImage("webp", "image")).toBe(false);
+    expect(autoLimits("webp", "video")).toEqual({ size: 480, fps: 24 });
+    expect(autoLimits("webp", "image")).toBeNull();
+  });
+
+  it("only asks about drops that look like still pictures", () => {
+    expect(looksLikePicture("/a/IMG_1.JPG")).toBe(true);
+    expect(looksLikePicture("/a/scan.tiff")).toBe(true);
+    expect(looksLikePicture("/a/loop.gif")).toBe(false);
+    expect(looksLikePicture("/a/clip.mov")).toBe(false);
+    expect(looksLikePicture("/a/README")).toBe(false);
+  });
+
+  it("orders names naturally and plays them back", () => {
+    const names = ["cat 10.jpg", "Cat 9.jpg", "cat 1.jpg"].map((n) => photo(`/p/${n}`));
+    expect(names.sort(naturalOrder).map((p) => p.fileName)).toEqual([
+      "cat 1.jpg",
+      "Cat 9.jpg",
+      "cat 10.jpg",
+    ]);
+    expect(playbackOrder(4, "forward")).toEqual([0, 1, 2, 3]);
+    expect(playbackOrder(4, "reverse")).toEqual([3, 2, 1, 0]);
+    expect(playbackOrder(4, "boomerang")).toEqual([0, 1, 2, 3, 2, 1]);
+    expect(playbackOrder(2, "boomerang")).toEqual([0, 1]);
+  });
+
+  it("sizes the frame like the backend", () => {
+    const gif = { ...defaultOptions("gif") };
+    expect(sequenceFrame(photo("/p/a.jpg"), gif)).toEqual({ width: 640, height: 480 });
+    expect(sequenceFrame(photo("/p/a.jpg", 1080, 1920), { ...gif, format: "webp" })).toEqual({
+      width: 480,
+      height: 852,
+    });
+    expect(sequenceFrame(photo("/p/a.jpg", 1001, 701), defaultOptions("mp4"))).toEqual({
+      width: 1000,
+      height: 700,
+    });
+    expect(sequenceFrame(photo("/p/a.jpg"), { ...gif, rotate: 90 })).toEqual({
+      width: 480,
+      height: 640,
+    });
+    expect(sequenceFrame({ ...photo("/p/a.jpg"), width: null }, gif)).toBeNull();
+  });
+
+  it("names the animation after the pictures or their folder", () => {
+    expect(sequenceName([photo("/p/cat 1.jpg"), photo("/p/cat 2.jpg")])).toBe("cat");
+    expect(sequenceName([photo("/p/IMG_0012.jpg"), photo("/p/IMG_0013.jpg")])).toBe("IMG");
+    expect(sequenceName([photo("/trip/dog.jpg"), photo("/trip/owl.jpg")])).toBe("trip");
+    // Windows paths, and never a hidden file from a hidden folder.
+    const windows = (name: string) => ({ ...photo(`C:\\.hidden\\${name}`), fileName: name });
+    expect(sequenceName([windows("a.jpg"), windows("b.jpg")])).toBe("hidden");
+  });
+
+  it("starts with the first installed animation format", () => {
+    expect(sequenceFormat(() => true)).toBe("gif");
+    expect(sequenceFormat((f) => f === "mp4")).toBe("mp4");
   });
 });

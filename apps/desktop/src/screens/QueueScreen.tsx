@@ -3,12 +3,13 @@ import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
 import { dragIcon, startDragOnMove } from "../lib/drag";
 import { baseName, formatBytes, formatClock } from "../lib/format";
-import { label } from "../lib/formats";
+import { label, playbackOrder } from "../lib/formats";
 import {
   cancelJob,
   chooseFiles,
   clearFinished,
   dragOut,
+  inputBytes,
   isFinal,
   type JobEntry,
   removeJob,
@@ -28,13 +29,24 @@ function dragDone(event: PointerEvent, job: JobEntry) {
 }
 
 function route(job: JobEntry) {
-  return `${(job.input.extension ?? "?").toUpperCase()} → ${label(job.options.format)}`;
+  const from = job.sequence
+    ? `${job.inputs.length} PICTURES`
+    : (job.input.extension ?? "?").toUpperCase();
+  return `${from} → ${label(job.options.format)}`;
+}
+
+/** Length of what the job writes, in seconds. */
+function outputLength(job: JobEntry): number {
+  if (job.sequence) {
+    return playbackOrder(job.inputs.length, job.options.direction).length * job.sequence.frameSecs;
+  }
+  const o = job.options;
+  return (o.trimEnd ?? job.input.durationSecs ?? 0) - (o.trimStart ?? 0);
 }
 
 /** Seconds of output still to encode, divided by the current speed. */
 function timeLeft(job: JobEntry): string | null {
-  const o = job.options;
-  const length = (o.trimEnd ?? job.input.durationSecs ?? 0) - (o.trimStart ?? 0);
+  const length = outputLength(job);
   if (!job.speed || job.speed <= 0 || length <= 0 || job.progress <= 0) return null;
   return formatClock(((1 - job.progress) * length) / job.speed);
 }
@@ -215,7 +227,7 @@ export const QueueScreen: Component<{ compact: boolean }> = (props) => {
                     </span>
                     <span class="item-meta">
                       <Show when={job.stage === "done"}>
-                        {route(job)} · {formatBytes(job.input.sizeBytes)} →{" "}
+                        {route(job)} · {formatBytes(inputBytes(job))} →{" "}
                         {formatBytes(job.outputBytes ?? 0)}
                       </Show>
                       <Show when={job.stage === "failed"}>

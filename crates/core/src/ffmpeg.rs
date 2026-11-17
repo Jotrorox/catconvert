@@ -258,6 +258,32 @@ impl Ffmpeg {
         }
     }
 
+    /// Why `format` can't be written as an animation, or `None` if it can.
+    /// WebP and JPEG XL animations need other encoders than their stills.
+    #[must_use]
+    pub fn missing_animation(&self, format: OutputFormat) -> Option<String> {
+        let jxl = self.jxl_support();
+        match format {
+            OutputFormat::Jxl if jxl.cjxl || jxl.ffmpeg_anim_encoder => None,
+            OutputFormat::Jxl => Some(
+                "animated JPEG XL needs libjxl's cjxl (e.g. `brew install jpeg-xl`) or an ffmpeg with the libjxl_anim encoder"
+                    .into(),
+            ),
+            OutputFormat::Webp if self.has_encoder(format.animation_encoder()) => None,
+            OutputFormat::Webp => Some(format!(
+                "this ffmpeg can't write animated WebP (missing the {} encoder)",
+                format.animation_encoder()
+            )),
+            _ => self.missing(format),
+        }
+    }
+
+    /// Whether pictures or a video can become an animation in `format`.
+    #[must_use]
+    pub fn supports_animation(&self, format: OutputFormat) -> bool {
+        format.animates_pictures() && self.missing_animation(format).is_none()
+    }
+
     /// Inspect a file with ffprobe: duration, display size, frame rate and codecs.
     ///
     /// JPEG XL files are also asked of `jxlinfo` (ffprobe can't tell how long
@@ -293,6 +319,17 @@ impl Ffmpeg {
             // Older ffprobes don't know JPEG XL at all; jxlinfo may.
             Err(err) if !is_jxl => return Err(err),
             Err(_) => {}
+        }
+        // ffprobe reports a JPEG's stored size, but ffmpeg turns it upright
+        // by its EXIF orientation when decoding.
+        if info.kind == MediaKind::Image
+            && info.video_codec.as_deref() == Some("mjpeg")
+            && let Some(orientation) = media::jpeg_orientation(path)
+        {
+            info.orientation = Some(orientation);
+            if orientation >= 5 {
+                (info.width, info.height) = (info.height, info.width);
+            }
         }
         if is_jxl {
             if info.kind == MediaKind::Unknown {
@@ -480,6 +517,15 @@ impl Ffmpeg {
         };
         // Leftovers of a crashed earlier run would make ffmpeg's `-n` refuse.
         remove_scratch();
+        for (path, contents) in &plan.writes {
+            if let Err(source) = std::fs::write(path, contents) {
+                remove_scratch();
+                return Err(Error::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
 
         let total: f32 = plan.steps.iter().map(|s| s.weight.max(0.0)).sum();
         let total = total.max(f32::EPSILON);
@@ -952,6 +998,7 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
         };
         info.width = width;
         info.height = height;
+        info.orientation = rotation_orientation(v);
         info.video_codec = v["codec_name"].as_str().map(str::to_owned);
         info.hdr = matches!(
             v["color_transfer"].as_str(),
@@ -976,6 +1023,7 @@ fn apply_probe(info: &mut MediaInfo, json: &Value) {
         } else {
             (width, height)
         };
+        info.orientation = rotation_orientation(grid);
     }
     info.audio_codec = audio.and_then(|a| a["codec_name"].as_str().map(str::to_owned));
     info.location_tags = format["tags"]
@@ -1040,18 +1088,35 @@ fn is_still_image(stream: &Value, format_name: &str) -> bool {
     format_name.ends_with("_pipe") || format_name == "image2" || stream["nb_frames"] == "1"
 }
 
-/// Rotation of ±90° (phone videos and photos) swaps the displayed width and
-/// height. Takes a stream or a tile grid component.
-fn is_quarter_turn(stream: &Value) -> bool {
+/// The display rotation of a stream or tile grid component, in degrees
+/// counter-clockwise as ffprobe reports it.
+fn rotation(stream: &Value) -> Option<f64> {
     let from_side_data = stream["side_data_list"]
         .as_array()
         .and_then(|list| list.iter().find_map(|d| d["rotation"].as_f64()));
     let from_tag = stream["tags"]["rotate"]
         .as_str()
         .and_then(|r| r.parse::<f64>().ok());
-    from_side_data
-        .or(from_tag)
-        .is_some_and(|rotation| (rotation.abs().round() as i64) % 180 == 90)
+    from_side_data.or(from_tag)
+}
+
+/// Rotation of ±90° (phone videos and photos) swaps the displayed width and
+/// height. Takes a stream or a tile grid component.
+fn is_quarter_turn(stream: &Value) -> bool {
+    rotation(stream).is_some_and(|rotation| (rotation.abs().round() as i64) % 180 == 90)
+}
+
+/// A stream's display rotation as the EXIF orientation it amounts to:
+/// counter-clockwise 90° (ffprobe's `-90`, a clockwise turn) is 6, and so on.
+fn rotation_orientation(stream: &Value) -> Option<u8> {
+    #[allow(clippy::cast_possible_truncation)]
+    let degrees = (rotation(stream)?.round() as i64).rem_euclid(360);
+    match degrees {
+        90 => Some(8),
+        180 => Some(3),
+        270 => Some(6),
+        _ => None,
+    }
 }
 
 fn as_f64(value: &Value) -> Option<f64> {
@@ -1156,6 +1221,7 @@ mod tests {
             has_location: false,
             location_tags: Vec::new(),
             tile_grid: None,
+            orientation: None,
         }
     }
 
@@ -1210,6 +1276,8 @@ mod tests {
         );
         assert_eq!(info.kind, MediaKind::Video);
         assert_eq!((info.width, info.height), (Some(1080), Some(1920)));
+        // ffprobe's -90 is a clockwise quarter turn: EXIF orientation 6.
+        assert_eq!(info.orientation, Some(6));
         assert_eq!(info.duration_secs, Some(42.5));
         assert!((info.fps.unwrap() - 29.97).abs() < 0.01);
         assert_eq!(info.video_codec.as_deref(), Some("hevc"));

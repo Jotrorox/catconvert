@@ -46,6 +46,8 @@ export type MediaInfo = {
   locationTags: string[];
   /** HEIF only: the stream group ffmpeg stitches a tiled photo from. */
   tileGrid: number | null;
+  /** EXIF orientation (2–8) ffmpeg applies when decoding; `width`/`height` already include it. */
+  orientation?: number | null;
 };
 
 export type OutputFormat =
@@ -134,10 +136,23 @@ export type ConvertOptions = {
   sound: SoundOptions;
   /** Which dates, places and other tags to carry over, where the format can hold them. */
   metadata: MetadataMode;
-  /** Playback speed of animations (GIF, animated JPEG XL), 0.25–4. Ignored otherwise. */
+  /** Playback speed of animations (GIF, animated WebP and JPEG XL), 0.25–4. Ignored otherwise. */
   speed: number;
   /** Playback direction of animations. Ignored otherwise. */
   direction: Direction;
+};
+
+/** How pictures of another shape fit an animation's frame (the first picture's size). */
+export type Fit = "pad" | "crop";
+
+/**
+ * Settings that only matter when making an animation from pictures. The order
+ * they play in is `ConvertOptions.direction`.
+ */
+export type SequenceOptions = {
+  /** Seconds each picture shows (to the hundredth). */
+  frameSecs: number;
+  fit: Fit;
 };
 
 export type JobId = number;
@@ -163,7 +178,8 @@ export type SavedFrame = {
 export type JobTicket = {
   id: JobId;
   output: string;
-  input: MediaInfo;
+  /** The probed file, or an animation's pictures in order. */
+  inputs: MediaInfo[];
   command: string;
 };
 
@@ -174,7 +190,8 @@ export type FfmpegStatus = {
   version: string | null;
   path: string | null;
   error: string | null;
-  formats: { format: OutputFormat; available: boolean }[];
+  /** `animated`: pictures or a video can become an animation in this format. */
+  formats: { format: OutputFormat; available: boolean; animated: boolean }[];
   /** Version of libjxl's cjxl/djxl, if installed. */
   libjxl: string | null;
   jxl: JxlSupport;
@@ -217,7 +234,15 @@ type Commands = {
   };
   preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
   save_frame: { args: { path: string; options: ConvertOptions; at: number }; result: SavedFrame };
+  preview_sequence_command: {
+    args: { pictures: MediaInfo[]; options: ConvertOptions; sequence: SequenceOptions };
+    result: string;
+  };
   start_job: { args: { path: string; options: ConvertOptions }; result: JobTicket };
+  start_sequence: {
+    args: { paths: string[]; options: ConvertOptions; sequence: SequenceOptions };
+    result: JobTicket;
+  };
   cancel_job: { args: { id: JobId }; result: boolean };
   relaunch: { args: Record<string, never>; result: null };
   missing_files: { args: { paths: string[] }; result: string[] };
@@ -327,6 +352,24 @@ export function previewCommand(info: MediaInfo, options: ConvertOptions): Promis
 /** Queue a conversion; progress arrives via {@link onJobProgress}. */
 export function startJob(path: string, options: ConvertOptions): Promise<JobTicket> {
   return command("start_job", { path, options });
+}
+
+/** The command(s) making one animation from `pictures` would run. */
+export function previewSequenceCommand(
+  pictures: MediaInfo[],
+  options: ConvertOptions,
+  sequence: SequenceOptions,
+): Promise<string> {
+  return command("preview_sequence_command", { pictures, options, sequence });
+}
+
+/** Queue one animation made from the pictures at `paths`, in this order. */
+export function startSequence(
+  paths: string[],
+  options: ConvertOptions,
+  sequence: SequenceOptions,
+): Promise<JobTicket> {
+  return command("start_sequence", { paths, options, sequence });
 }
 
 export function cancelJob(id: JobId): Promise<boolean> {

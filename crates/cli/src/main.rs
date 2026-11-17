@@ -5,8 +5,8 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use catconvert_core::{
-    ConvertOptions, Crop, Direction, Ffmpeg, JxlOptions, Metadata, OutputFormat, RunOutcome,
-    SoundOptions,
+    ConvertOptions, Crop, Direction, Ffmpeg, Fit, JxlOptions, Metadata, OutputFormat, Plan,
+    RunOutcome, SequenceOptions, SoundOptions,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -97,6 +97,48 @@ enum Command {
         /// GIF and animated JPEG XL: play forward, reversed, or forward then back.
         #[arg(long, value_enum, default_value_t = Playback::Forward)]
         direction: Playback,
+        /// Print the command(s) instead of running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Make one animation (GIF, WebP, JPEG XL or a video slideshow) from
+    /// several pictures, in the order given. It takes the size of the first
+    /// picture and is written next to it.
+    Animate {
+        /// Pictures, in order.
+        #[arg(required = true, num_args = 2..)]
+        pictures: Vec<PathBuf>,
+        /// Target format.
+        #[arg(long, short)]
+        to: Format,
+        /// Seconds each picture shows.
+        #[arg(long, default_value_t = 0.5)]
+        frame: f64,
+        /// Crop pictures of another shape to fill the frame instead of adding
+        /// black bars.
+        #[arg(long)]
+        crop: bool,
+        /// Order the pictures play in.
+        #[arg(long, value_enum, default_value_t = Playback::Forward)]
+        direction: Playback,
+        /// Shrink so the short side is at most this many pixels (e.g. 480).
+        #[arg(long)]
+        size: Option<u32>,
+        /// Clockwise rotation in degrees (0, 90, 180, 270).
+        #[arg(long, default_value_t = 0)]
+        rotate: u16,
+        /// Mirror horizontally.
+        #[arg(long)]
+        flip: bool,
+        /// 0 = smallest file, 100 = best quality.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u8).range(0..=100))]
+        quality: u8,
+        /// JPEG XL: mathematically lossless.
+        #[arg(long)]
+        lossless: bool,
+        /// JPEG XL: encoder effort, 1 (fast) to 10 (smallest).
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(1..=10))]
+        effort: u8,
         /// Print the command(s) instead of running them.
         #[arg(long)]
         dry_run: bool,
@@ -222,6 +264,32 @@ fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<()
     let output = catconvert_core::output_path(&info.path, options.format, |_| false);
     let plan = catconvert_core::plan(&info, options, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
+    run(&ffmpeg, &plan, dry_run)
+}
+
+fn animate(
+    pictures: &[PathBuf],
+    options: &ConvertOptions,
+    sequence: &SequenceOptions,
+    dry_run: bool,
+) -> Result<(), String> {
+    let ffmpeg = Ffmpeg::locate().map_err(|e| e.to_string())?;
+    if let Some(reason) = ffmpeg.missing_animation(options.format) {
+        return Err(reason);
+    }
+    let infos = pictures
+        .iter()
+        .map(|path| ffmpeg.probe(path))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let output = catconvert_core::sequence_output_path(&infos, options.format, |_| false);
+    let plan = catconvert_core::plan_sequence(&infos, options, sequence, &output, ffmpeg.support())
+        .map_err(|e| e.to_string())?;
+    run(&ffmpeg, &plan, dry_run)
+}
+
+fn run(ffmpeg: &Ffmpeg, plan: &Plan, dry_run: bool) -> Result<(), String> {
+    let output = &plan.output;
     if dry_run {
         println!("{}", plan.command_line());
         return Ok(());
@@ -229,7 +297,7 @@ fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<()
     let cancel = AtomicBool::new(false);
     let mut shown = 0.0_f32;
     let outcome = ffmpeg
-        .run(&plan, &cancel, |p| {
+        .run(plan, &cancel, |p| {
             if let Some(fraction) = p.fraction.filter(|f| *f > shown) {
                 shown = fraction;
                 eprint!("\r{:>5.1}%", fraction * 100.0);
@@ -328,13 +396,41 @@ fn main() -> ExitCode {
                 speed,
                 direction: direction.into(),
             };
-            match convert(&file, &options, dry_run) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    ExitCode::FAILURE
-                }
-            }
+            report(convert(&file, &options, dry_run))
+        }
+        Command::Animate {
+            pictures,
+            to,
+            frame,
+            crop,
+            direction,
+            size,
+            rotate,
+            flip,
+            quality,
+            lossless,
+            effort,
+            dry_run,
+        } => {
+            let options = ConvertOptions {
+                format: to.into(),
+                max_size: size,
+                rotate,
+                flip,
+                quality,
+                jxl: JxlOptions {
+                    lossless,
+                    effort,
+                    progressive: false,
+                },
+                direction: direction.into(),
+                ..ConvertOptions::default()
+            };
+            let sequence = SequenceOptions {
+                frame_secs: frame,
+                fit: if crop { Fit::Crop } else { Fit::Pad },
+            };
+            report(animate(&pictures, &options, &sequence, dry_run))
         }
         Command::Scrub {
             input,
@@ -345,13 +441,19 @@ fn main() -> ExitCode {
                 Strip::Location => Metadata::NoLocation,
                 Strip::All => Metadata::None,
             };
-            match catconvert_core::scrub_file(&input, &output, metadata) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    ExitCode::FAILURE
-                }
-            }
+            report(
+                catconvert_core::scrub_file(&input, &output, metadata).map_err(|e| e.to_string()),
+            )
+        }
+    }
+}
+
+fn report(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -376,6 +478,42 @@ mod tests {
         };
         assert_eq!(file, PathBuf::from("a.png"));
         assert!(compact);
+    }
+
+    #[test]
+    fn parses_animate() {
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "animate",
+            "a.jpg",
+            "b.png",
+            "--to",
+            "webp",
+            "--frame",
+            "0.25",
+            "--crop",
+            "--direction",
+            "boomerang",
+        ])
+        .expect("parse");
+        let Command::Animate {
+            pictures,
+            to,
+            frame,
+            crop,
+            direction,
+            ..
+        } = cli.command
+        else {
+            panic!("expected animate");
+        };
+        assert_eq!(pictures, [PathBuf::from("a.jpg"), PathBuf::from("b.png")]);
+        assert_eq!(OutputFormat::from(to), OutputFormat::Webp);
+        assert_eq!(frame, 0.25);
+        assert!(crop);
+        assert_eq!(Direction::from(direction), Direction::Boomerang);
+        // One picture is not an animation.
+        assert!(Cli::try_parse_from(["catconvert", "animate", "a.jpg", "--to", "gif"]).is_err());
     }
 
     #[test]

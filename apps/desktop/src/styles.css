@@ -2887,6 +2887,147 @@ button.format-chip:not(:disabled):active {
 /* Responsive                                                                */
 /* ------------------------------------------------------------------------ */
 
+/* ---------------------------------------------------------------------------
+ * Pictures → animation
+ * ------------------------------------------------------------------------- */
+
+.choice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+/* The frame of the animation, at the first picture's shape, turned as a whole. */
+.sequence-stage {
+  position: relative;
+  overflow: hidden;
+  width: min(100cqw, calc(100cqh * var(--ratio)));
+  aspect-ratio: var(--ratio);
+  border-radius: 6px;
+  background: #000;
+  box-shadow: 0 4px 20px -8px rgb(59 34 38 / 0.35);
+  transition: transform 520ms var(--spring);
+}
+
+/* A quarter turn swaps which side has to fit. */
+.sequence-stage.quarter {
+  width: min(100cqh, calc(100cqw * var(--ratio)));
+}
+
+.sequence-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.sequence-stage[data-fit="crop"] .sequence-frame {
+  object-fit: cover;
+}
+
+.pictures {
+  display: grid;
+  gap: 10px;
+}
+
+.picture-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.picture-tile {
+  position: relative;
+  overflow: hidden;
+  aspect-ratio: 1;
+  border: 2px solid transparent;
+  border-radius: 14px;
+  background: var(--sunken);
+  cursor: grab;
+  touch-action: none;
+  transition:
+    transform 260ms var(--spring),
+    border-color 160ms ease,
+    opacity 160ms ease;
+}
+
+.picture-tile img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+}
+
+.picture-tile.showing {
+  border-color: var(--accent-soft);
+}
+
+.picture-tile:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.picture-tile.dragging {
+  cursor: grabbing;
+  opacity: 0.55;
+  transform: scale(0.94);
+}
+
+.tile-skeleton {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, #f7e2e7, #fbeef0);
+}
+
+.picture-number {
+  position: absolute;
+  bottom: 5px;
+  left: 5px;
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.92);
+  color: var(--ink);
+  font-size: 11.5px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.picture-remove {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.92);
+  color: var(--ink);
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.picture-tile:hover .picture-remove,
+.picture-tile:focus-within .picture-remove {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .picture-remove {
+    opacity: 1;
+  }
+}
+
 @media (max-width: 1080px) {
   .file-grid {
     grid-template-columns: minmax(0, 1fr);
