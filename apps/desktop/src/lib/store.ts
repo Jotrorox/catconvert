@@ -46,6 +46,11 @@ export type Screen = "convert" | "edit" | "queue" | "recipes" | "history" | "set
 export type Draft = {
   info: MediaInfo;
   options: ConvertOptions;
+  /**
+   * The command as edited by hand, run instead of the one the options make.
+   * `null` while the generated command applies.
+   */
+  command: string | null;
 };
 
 /** Pictures being made into one animation, in the order they play. */
@@ -67,6 +72,8 @@ export type JobEntry = {
   /** Set for an animation made from pictures. */
   sequence: SequenceOptions | null;
   command: string;
+  /** `command` was edited by hand rather than made from `options`. */
+  custom: boolean;
   stage: JobStage;
   progress: number;
   speed: number | null;
@@ -518,14 +525,36 @@ export async function openNext(): Promise<void> {
   try {
     const info = await api.probeFile(path);
     if (info.kind === "unknown") throw new Error("That doesn't look like a photo, video or song.");
+    const recipe = currentRecipe();
+    const options = initialOptions(info, isAvailable, recipe, state.settings);
     setState({
-      draft: { info, options: initialOptions(info, isAvailable, currentRecipe(), state.settings) },
+      draft: { info, options, command: await recipeCommand(recipe, info, options) },
       opening: null,
     });
   } catch (error) {
     setState("opening", null);
     toast(`${baseName(path)}: ${errorText(error)}`, { tone: "error" });
     return openNext();
+  }
+}
+
+/**
+ * A recipe's saved command filled in for `info`, if it has one and its format
+ * fits the file. Left out (with a word why) when the paths can't be filled in.
+ */
+async function recipeCommand(
+  recipe: Recipe | null,
+  info: MediaInfo,
+  options: ConvertOptions,
+): Promise<string | null> {
+  if (!recipe?.command || recipe.options.format !== options.format) return null;
+  try {
+    return await api.fillCommand(info, options, recipe.command);
+  } catch (error) {
+    toast(`${info.fileName}: couldn't use the recipe's command: ${errorText(error)}`, {
+      tone: "error",
+    });
+    return null;
   }
 }
 
@@ -553,6 +582,15 @@ export function closeEditor() {
 export function updateOptions(patch: Partial<ConvertOptions>) {
   if (!state.draft) return;
   setState("draft", "options", (options) => patched(options, patch));
+}
+
+/**
+ * Run `command` instead of the generated command for the current file, or go
+ * back to the generated one with `null`.
+ */
+export function setCustomCommand(command: string | null) {
+  if (!state.draft) return;
+  setState("draft", "command", command);
 }
 
 // ---------------------------------------------------------------------------
@@ -666,9 +704,13 @@ export async function convertDraft() {
   const draft = state.draft;
   if (!draft) return;
   const options = { ...draft.options };
+  const custom = draft.command;
   try {
-    const ticket = await api.startJob(draft.info.path, options);
-    addJob(ticket, options);
+    const ticket =
+      custom === null
+        ? await api.startJob(draft.info.path, options)
+        : await api.startCustomJob(draft.info.path, options, custom);
+    addJob(ticket, options, null, custom !== null);
     if (state.inbox.length > 0) {
       toast(`${draft.info.fileName} is in the queue`, {
         action: { label: "View", run: () => navigate("queue") },
@@ -690,6 +732,8 @@ export async function convertDraft() {
  * Queue the current file, then every waiting file with the same settings
  * (minus the trim, which belongs to one file). Files the settings don't fit,
  * such as a song when making MP4s, go back to the editor afterwards.
+ *
+ * A command edited by hand runs for every file, with each file's paths.
  */
 export async function convertAll() {
   const draft = state.draft;
@@ -700,8 +744,15 @@ export async function convertAll() {
     sound: { ...draft.options.sound },
   };
   const paths = [...state.inbox];
+  const custom = draft.command;
+  let template: string | null = null;
   try {
-    addJob(await api.startJob(draft.info.path, options), options);
+    if (custom === null) {
+      addJob(await api.startJob(draft.info.path, options), options);
+    } else {
+      addJob(await api.startCustomJob(draft.info.path, options, custom), options, null, true);
+      template = await api.commandTemplate(draft.info.path, custom);
+    }
   } catch (error) {
     toast(errorText(error), { tone: "error" });
     return;
@@ -718,8 +769,11 @@ export async function convertAll() {
       if (info.kind === "unknown")
         throw new Error("That doesn't look like a photo, video or song.");
       const fitted = fitOptions(info, options, isAvailable);
-      if (fitted) addJob(await api.startJob(path, fitted), fitted);
-      else leftovers.push(path);
+      // The command only fits files that keep its format.
+      if (!fitted || (template !== null && fitted.format !== options.format)) leftovers.push(path);
+      else if (template !== null)
+        addJob(await api.startCustomJob(path, fitted, template), fitted, null, true);
+      else addJob(await api.startJob(path, fitted), fitted);
     } catch (error) {
       toast(`${baseName(path)}: ${errorText(error)}`, { tone: "error" });
     }
@@ -742,6 +796,7 @@ function addJob(
   ticket: api.JobTicket,
   options: ConvertOptions,
   sequence: SequenceOptions | null = null,
+  custom = false,
 ) {
   const input = ticket.inputs[0];
   if (!input) return;
@@ -754,6 +809,7 @@ function addJob(
     options,
     sequence,
     command: ticket.command,
+    custom,
     stage: "queued",
     progress: 0,
     speed: null,
@@ -887,7 +943,11 @@ export async function tweakJob(id: JobId) {
   }
   batch(() => {
     setState({
-      draft: { info: job.input, options: { ...job.options } },
+      draft: {
+        info: job.input,
+        options: { ...job.options },
+        command: job.custom ? job.command : null,
+      },
       sequence: null,
       opening: null,
     });
@@ -910,12 +970,15 @@ export async function retryJob(id: JobId) {
         options,
         sequence,
       );
+    } else if (job.custom) {
+      // Run as it ran; the output moves to the next free name if need be.
+      ticket = await api.startCustomJob(job.input.path, options, job.command);
     } else {
       ticket = await api.startJob(job.input.path, options);
     }
     batch(() => {
       removeJob(id);
-      addJob(ticket, options, sequence);
+      addJob(ticket, options, sequence, job.custom);
     });
   } catch (error) {
     toast(errorText(error), { tone: "error" });
@@ -1026,13 +1089,27 @@ function setRecipes(recipes: Recipe[]) {
   save(RECIPES_KEY, recipes);
 }
 
-/** Save the editor's current settings as a recipe. */
-export function saveRecipe(title: string) {
+/**
+ * Save the editor's current settings as a recipe, with the edited command if
+ * there is one (its paths become placeholders for the files it's used on).
+ */
+export async function saveRecipe(title: string) {
   const draft = state.draft;
   const name = title.trim();
   if (!draft || !name) return;
+  const { info, command } = draft;
+  const options = { ...draft.options };
+  let template: string | null = null;
+  if (command !== null) {
+    try {
+      template = await api.commandTemplate(info.path, command);
+    } catch (error) {
+      toast(`Couldn't save the command: ${errorText(error)}`, { tone: "error" });
+      return;
+    }
+  }
   const id = `custom-${Date.now().toString(36)}-${state.recipes.length}`;
-  setRecipes([...state.recipes, recipeFrom(id, name, draft.info, { ...draft.options })]);
+  setRecipes([...state.recipes, recipeFrom(id, name, info, options, template)]);
   toast(`Saved “${name}” to your recipes`, {
     action: { label: "View", run: () => navigate("recipes") },
   });

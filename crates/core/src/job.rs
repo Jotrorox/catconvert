@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use crate::convert::{self, ConvertOptions, OutputFormat, Plan};
+use crate::custom;
 use crate::ffmpeg::{Ffmpeg, RunOutcome};
 use crate::sequence::{self, SequenceOptions};
 use crate::{Error, MediaInfo, Result};
@@ -173,6 +174,53 @@ impl Queue {
     /// Probe errors, [`Error::Unsupported`] if the options do not fit the input
     /// or the tools to write the format are missing.
     pub fn submit(&self, input: impl AsRef<Path>, options: &ConvertOptions) -> Result<JobTicket> {
+        self.submit_planned(input, options, |_, plan| Ok(plan))
+    }
+
+    /// The plan [`Queue::submit`] would queue for `info` right now, without
+    /// queueing it: the output skips names that queued jobs will write.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] if the options don't fit the input (see
+    /// [`convert::plan`]).
+    pub fn preview(&self, info: &MediaInfo, options: &ConvertOptions) -> Result<Plan> {
+        let reserved = lock(&self.shared.reserved);
+        let output = convert::output_path(&info.path, options.format, |p| reserved.contains(p));
+        convert::plan(info, options, &output, self.shared.ffmpeg.support())
+    }
+
+    /// Like [`Queue::submit`], but run `command` as edited by the user
+    /// instead of the generated command (see [`crate::custom_plan`]).
+    ///
+    /// `options` still choose the output and the intermediate files: the
+    /// command must write those, as the generated plan for `options` would.
+    /// `command` may also be a [`crate::command_template`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Queue::submit`], and [`Error::Unsupported`] if the command is
+    /// refused.
+    pub fn submit_custom(
+        &self,
+        input: impl AsRef<Path>,
+        options: &ConvertOptions,
+        command: &str,
+    ) -> Result<JobTicket> {
+        let support = self.shared.ffmpeg.support();
+        self.submit_planned(input, options, |info, plan| {
+            custom::custom_plan(info, &plan, command, support)
+        })
+    }
+
+    /// Probe `input`, plan the conversion, let `customize` change the plan and
+    /// queue the result.
+    fn submit_planned(
+        &self,
+        input: impl AsRef<Path>,
+        options: &ConvertOptions,
+        customize: impl FnOnce(&MediaInfo, Plan) -> Result<Plan>,
+    ) -> Result<JobTicket> {
         let ffmpeg = &self.shared.ffmpeg;
         if let Some(message) = ffmpeg.missing_output(options) {
             return Err(Error::Unsupported { message });
@@ -190,7 +238,10 @@ impl Queue {
         let plan = {
             let mut reserved = lock(&self.shared.reserved);
             let output = convert::output_path(&info.path, options.format, |p| reserved.contains(p));
-            let plan = convert::plan(&info, options, &output, ffmpeg.support())?;
+            let plan = customize(
+                &info,
+                convert::plan(&info, options, &output, ffmpeg.support())?,
+            )?;
             reserved.insert(output);
             plan
         };
@@ -774,6 +825,90 @@ mod tests {
                 return event;
             }
         }
+    }
+
+    /// The issue's acceptance test: `-crf 24` edited to `-crf 18` converts
+    /// with progress in the queue, while other programs and writing over the
+    /// input are refused. Skipped (passes) without an ffmpeg that writes MP4.
+    #[test]
+    fn runs_an_edited_command_end_to_end() {
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping end-to-end test");
+            return;
+        };
+        if !ffmpeg.supports(OutputFormat::Mp4) {
+            eprintln!("ffmpeg can't write MP4; skipping end-to-end test");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("edited clip.mov");
+        let status = std::process::Command::new(ffmpeg.ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:d=3:r=25",
+            ])
+            .args(["-c:v", "mjpeg"])
+            .arg(&input)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+
+        let (tx, rx) = mpsc::channel();
+        let queue = Queue::new(ffmpeg.clone(), move |event| {
+            let _ = tx.send(event);
+        });
+        let info = ffmpeg.probe(&input).expect("probe");
+        let options = ConvertOptions {
+            format: OutputFormat::Mp4,
+            ..ConvertOptions::default()
+        };
+        // What the editor shows, then edits.
+        let output = convert::output_path(&input, options.format, |_| false);
+        let shown = convert::plan(&info, &options, &output, ffmpeg.support())
+            .expect("plan")
+            .command_line();
+        assert!(shown.contains("-crf 24"), "{shown}");
+        let edited = shown.replace("-crf 24", "-crf 18");
+
+        let ticket = queue
+            .submit_custom(&input, &options, &edited)
+            .expect("submit");
+        assert_eq!(ticket.output, output);
+        assert!(ticket.command.contains("-crf 18"), "{}", ticket.command);
+        let mut events = Vec::new();
+        let done = loop {
+            let event = rx.recv_timeout(Duration::from_secs(60)).expect("event");
+            events.push(event.clone());
+            if event.job_id == ticket.id && event.stage.is_final() {
+                break event;
+            }
+        };
+        assert_eq!(done.stage, JobStage::Done, "{done:?}");
+        assert!(events.iter().any(|e| e.stage == JobStage::Running));
+        assert!(output.exists());
+
+        for (command, expected) in [
+            (
+                edited.replacen("ffmpeg", "rm", 1),
+                "rm isn't a tool CatConvert runs",
+            ),
+            (
+                edited.replace(&*output.to_string_lossy(), &input.to_string_lossy()),
+                "write over the original",
+            ),
+            (format!("{edited}; rm -rf ~"), "only works in a shell"),
+        ] {
+            let err = queue
+                .submit_custom(&input, &options, &command)
+                .expect_err("refused");
+            assert!(err.to_string().contains(expected), "{command}: {err}");
+        }
+        // Refused commands reserve nothing.
+        assert!(lock(&queue.shared.reserved).is_empty());
     }
 
     /// Real JPEG XL round trips through cjxl/djxl. Skipped (passes) when

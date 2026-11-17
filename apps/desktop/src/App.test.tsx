@@ -15,6 +15,10 @@ vi.mock("./lib/api", () => ({
   previewCommand: vi.fn(async () => "ffmpeg -i clip.mov clip.mp4"),
   previewSequenceCommand: vi.fn(async () => "ffmpeg -f concat -i list.txt cat.gif"),
   saveFrame: vi.fn(),
+  checkCommand: vi.fn(async (_info: unknown, _options: unknown, text: string) => text),
+  fillCommand: vi.fn(),
+  commandTemplate: vi.fn(),
+  startCustomJob: vi.fn(),
   startJob: vi.fn(),
   startSequence: vi.fn(),
   cancelJob: vi.fn(async () => true),
@@ -806,6 +810,172 @@ describe("CatConvert", () => {
       "/clips/b.mov",
       expect.objectContaining({ format: "webm", trimStart: null }),
     );
+  });
+
+  describe("editing the command", () => {
+    const GENERATED = "ffmpeg -i /clips/clip.mov -c:v libx264 -crf 24 /clips/clip.mp4";
+
+    beforeEach(() => {
+      vi.mocked(api.previewCommand).mockResolvedValue(GENERATED);
+      vi.mocked(api.checkCommand).mockImplementation(async (_info, _options, text) => {
+        if (!text.startsWith("ffmpeg ")) {
+          throw `${text.split(" ")[0]} isn't a tool CatConvert runs. Commands can use ffmpeg, cjxl, djxl and catconvert scrub.`;
+        }
+        if (text.includes(VIDEO.path.replace(".mov", ".mp4")) === false) {
+          throw "This command would write over the original, clip.mov. CatConvert never does that.";
+        }
+        return text;
+      });
+      vi.mocked(api.startCustomJob).mockImplementation(async (path, _options, text) => ({
+        id: 11,
+        output: path.replace(/\.\w+$/, ".mp4"),
+        inputs: [VIDEO],
+        command: text,
+      }));
+    });
+
+    async function editCommand() {
+      await openVideo();
+      fireEvent.click(screen.getByText("Show command"));
+      await screen.findByText(GENERATED);
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      const field = screen.getByRole("textbox", { name: "Command" });
+      expect(field).toHaveValue(GENERATED);
+      return field;
+    }
+
+    it("checks an edited command as it's typed and queues it as written", async () => {
+      const field = await editCommand();
+      // The settings stand aside while the edited command applies.
+      expect(screen.getByText(/these settings no longer apply/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "WEBM" })).toBeDisabled();
+      expect(screen.queryByRole("button", { name: "Rotate 90°" })).not.toBeInTheDocument();
+      const changes = within(screen.getByRole("list", { name: "Changes" }));
+      expect(changes.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+        "Custom command",
+      ]);
+
+      fireEvent.input(field, { target: { value: "rm -rf /" } });
+      expect(await screen.findByRole("alert")).toHaveTextContent("rm isn't a tool CatConvert runs");
+      expect(field).toHaveAttribute("aria-invalid", "true");
+      expect(screen.getByRole("button", { name: /Start converting/ })).toBeDisabled();
+
+      fireEvent.input(field, {
+        target: { value: GENERATED.replace("/clips/clip.mp4", VIDEO.path) },
+      });
+      expect(await screen.findByText(/would write over the original/)).toBeInTheDocument();
+
+      const edited = GENERATED.replace("-crf 24", "-crf 18");
+      fireEvent.input(field, { target: { value: edited } });
+      await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+      const start = screen.getByRole("button", { name: /Start converting/ });
+      expect(start).toBeEnabled();
+      fireEvent.click(start);
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startCustomJob).toHaveBeenCalledWith(
+        VIDEO.path,
+        expect.objectContaining({ format: "mp4" }),
+        edited,
+      );
+      expect(api.startJob).not.toHaveBeenCalled();
+
+      // Progress shows in the queue as for any job, and a retry runs the same command.
+      applyProgress({
+        jobId: 11,
+        stage: "running",
+        progress: 0.3,
+        speed: null,
+        outputBytes: null,
+        error: null,
+      });
+      expect(await screen.findByRole("progressbar")).toHaveAttribute("aria-valuenow", "30");
+      applyProgress({
+        jobId: 11,
+        stage: "failed",
+        progress: 0.3,
+        speed: null,
+        outputBytes: null,
+        error: "Unknown encoder",
+      });
+      fireEvent.click(await screen.findByRole("button", { name: /Retry/ }));
+      await waitFor(() => expect(api.startCustomJob).toHaveBeenCalledTimes(2));
+      expect(api.startCustomJob).toHaveBeenLastCalledWith(VIDEO.path, expect.anything(), edited);
+    });
+
+    it("goes back to the generated command", async () => {
+      const field = await editCommand();
+      fireEvent.input(field, { target: { value: `${GENERATED} -tune film` } });
+      fireEvent.click(screen.getAllByRole("button", { name: /Reset to generated/ })[0] as Element);
+      expect(screen.queryByRole("textbox", { name: "Command" })).not.toBeInTheDocument();
+      expect(screen.getByText(GENERATED)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "WEBM" })).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startJob).toHaveBeenCalledTimes(1);
+      expect(api.startCustomJob).not.toHaveBeenCalled();
+    });
+
+    it("saves an edited command in a recipe and fills it in for other files", async () => {
+      const template = "ffmpeg -i '{input}' -c:v libx264 -crf 18 '{output}'";
+      vi.mocked(api.commandTemplate).mockResolvedValue(template);
+      vi.mocked(api.fillCommand).mockImplementation(async (info, _options, saved) =>
+        saved.replace("'{input}'", info.path).replace("'{output}'", "/clips/other.mp4"),
+      );
+      const field = await editCommand();
+      const edited = GENERATED.replace("-crf 24", "-crf 18");
+      fireEvent.input(field, { target: { value: edited } });
+      fireEvent.click(screen.getByRole("button", { name: /Save these settings as a recipe/ }));
+      expect(screen.getByText(/Keeps the edited command as written/)).toBeInTheDocument();
+      fireEvent.input(screen.getByRole("textbox", { name: "Recipe name" }), {
+        target: { value: "Crisp" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await screen.findByText("Saved “Crisp” to your recipes");
+      expect(api.commandTemplate).toHaveBeenCalledWith(VIDEO.path, edited);
+      const [saved] = JSON.parse(localStorage.getItem("catconvert.recipes.v1") ?? "[]");
+      expect(saved).toMatchObject({ title: "Crisp", detail: "Custom command", command: template });
+
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Recipes" }));
+      vi.mocked(api.pickFiles).mockResolvedValue(["/clips/other.mov"]);
+      fireEvent.click(screen.getByRole("button", { name: /^Crisp/ }));
+      await screen.findByRole("heading", { name: "other.mov" });
+      expect(await screen.findByRole("textbox", { name: "Command" })).toHaveValue(
+        "ffmpeg -i /clips/other.mov -c:v libx264 -crf 18 /clips/other.mp4",
+      );
+    });
+
+    it("runs an edited command for every waiting file, with each file's paths", async () => {
+      const template = "ffmpeg -i '{input}' -crf 18 '{output}'";
+      vi.mocked(api.commandTemplate).mockResolvedValue(template);
+      render(() => <App />);
+      await ffmpegFound();
+      openPaths(["/clips/a.mov", "/clips/b.mov", SONG.path]);
+      await screen.findByRole("heading", { name: "a.mov" });
+      fireEvent.click(screen.getByText("Show command"));
+      await screen.findByText(GENERATED);
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      const edited = GENERATED.replace("-crf 24", "-crf 18");
+      fireEvent.input(screen.getByRole("textbox", { name: "Command" }), {
+        target: { value: edited },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Convert all 3 like this/ }));
+      await screen.findByRole("heading", { name: "purr.wav" });
+      expect(api.startCustomJob).toHaveBeenCalledTimes(2);
+      expect(api.startCustomJob).toHaveBeenNthCalledWith(
+        1,
+        "/clips/a.mov",
+        expect.anything(),
+        edited,
+      );
+      expect(api.startCustomJob).toHaveBeenNthCalledWith(
+        2,
+        "/clips/b.mov",
+        expect.anything(),
+        template,
+      );
+      expect(api.startJob).not.toHaveBeenCalled();
+    });
   });
 
   describe("pictures → animation", () => {

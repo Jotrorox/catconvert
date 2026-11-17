@@ -242,6 +242,19 @@ type Commands = {
     result: ArrayBuffer;
   };
   preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
+  check_command: {
+    args: { info: MediaInfo; options: ConvertOptions; command: string };
+    result: string;
+  };
+  fill_command: {
+    args: { info: MediaInfo; options: ConvertOptions; template: string };
+    result: string;
+  };
+  command_template: { args: { path: string; command: string }; result: string };
+  start_custom_job: {
+    args: { path: string; options: ConvertOptions; command: string };
+    result: JobTicket;
+  };
   save_frame: { args: { path: string; options: ConvertOptions; at: number }; result: SavedFrame };
   preview_sequence_command: {
     args: { pictures: MediaInfo[]; options: ConvertOptions; sequence: SequenceOptions };
@@ -363,6 +376,46 @@ export function previewCommand(info: MediaInfo, options: ConvertOptions): Promis
 /** Queue a conversion; progress arrives via {@link onJobProgress}. */
 export function startJob(path: string, options: ConvertOptions): Promise<JobTicket> {
   return command("start_job", { path, options });
+}
+
+/**
+ * Check a hand-edited command without running it. Resolves to the command as
+ * it would run; rejects with why it would be refused (another program, a
+ * shell feature, writing anywhere but the output, …).
+ */
+export function checkCommand(
+  info: MediaInfo,
+  options: ConvertOptions,
+  text: string,
+): Promise<string> {
+  return command("check_command", { info, options, command: text });
+}
+
+/** A recipe's saved command (see {@link commandTemplate}) with this file's paths filled in. */
+export function fillCommand(
+  info: MediaInfo,
+  options: ConvertOptions,
+  template: string,
+): Promise<string> {
+  return command("fill_command", { info, options, template });
+}
+
+/** An edited command with the paths of the file at `path` swapped for placeholders. */
+export function commandTemplate(path: string, text: string): Promise<string> {
+  return command("command_template", { path, command: text });
+}
+
+/**
+ * Queue a conversion running `text`, a command edited by hand (or a template from
+ * {@link commandTemplate}), instead of the generated one. `options` still pick
+ * the output name. Rejects, without queueing, if the command is refused.
+ */
+export function startCustomJob(
+  path: string,
+  options: ConvertOptions,
+  text: string,
+): Promise<JobTicket> {
+  return command("start_custom_job", { path, options, command: text });
 }
 
 /** The command(s) making one animation from `pictures` would run. */
