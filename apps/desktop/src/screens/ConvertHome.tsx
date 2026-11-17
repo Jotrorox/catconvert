@@ -3,9 +3,18 @@ import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
 import { Brand } from "../components/Navigation";
 import { RecipeGrid } from "../components/RecipeGrid";
+import { dragIcon, startDragOnMove } from "../lib/drag";
 import { baseName, formatBytes, formatWhen } from "../lib/format";
-import { label } from "../lib/formats";
-import { checkHistory, chooseFiles, type HistoryItem, navigate, reveal, state } from "../lib/store";
+import { KIND_TONE, label } from "../lib/formats";
+import {
+  checkHistory,
+  chooseFiles,
+  dragOut,
+  type HistoryItem,
+  navigate,
+  reveal,
+  state,
+} from "../lib/store";
 
 type Props = {
   compact: boolean;
@@ -14,12 +23,21 @@ type Props = {
 };
 
 const KIND_ICON = { video: "video", audio: "music", image: "image", unknown: "paw" } as const;
-const KIND_TONE = { video: "pink", audio: "yellow", image: "lavender", unknown: "green" } as const;
 
 export const RecentRow: Component<{ item: HistoryItem }> = (props) => {
   const missing = () => state.missing.includes(props.item.output);
+  const drag = (event: PointerEvent) => {
+    if (missing()) return;
+    const { output, format, kind } = props.item;
+    startDragOnMove(event, () => void dragOut(output, dragIcon(format, kind)));
+  };
   return (
-    <li class="recent-item" classList={{ missing: missing() }}>
+    <li
+      class="recent-item"
+      classList={{ missing: missing(), "drag-out": !missing() }}
+      title={missing() ? undefined : "Drag into another app or folder"}
+      onPointerDown={drag}
+    >
       <span class="tile" data-tone={KIND_TONE[props.item.kind]}>
         <Icon name={KIND_ICON[props.item.kind]} size={18} />
       </span>

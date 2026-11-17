@@ -17,6 +17,11 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 > saved next to the original and never overwrite anything. HDR video, which
 > iPhones record by default, is tone-mapped when it becomes a picture or GIF.
 >
+> You don't have to open the app first: photos, videos and songs offer
+> CatConvert under "Open With" (plus "Send to" on Windows), and on macOS
+> Settings can add a "Convert with CatConvert" Finder Quick Action. Finished
+> files drag straight out of the Queue and History into other apps.
+>
 > JPEG XL is fully supported, still and animated, with libjxl's tools (bundled in
 > releases; otherwise `brew install jpeg-xl`, found like ffmpeg or via
 > `CATCONVERT_LIBJXL`). You get

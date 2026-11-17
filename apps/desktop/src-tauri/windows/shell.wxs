@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSI counterpart of hooks.nsh (bundle.windows.wix in tauri.conf.json): adds
+  CatConvert to Explorer's "Open with" menu for the media files it reads,
+  without making it their default app, and to the "Send to" menu.
+
+  Keep the extensions in sync with hooks.nsh and MediaKind::from_extension in
+  crates/core/src/media.rs.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Fragment>
+        <DirectoryRef Id="INSTALLDIR">
+            <Component Id="CatConvertOpenWith" Guid="*">
+                <RegistryKey Root="HKCR" Key="CatConvert.Media">
+                    <RegistryValue Type="string" Value="Media file" KeyPath="yes" />
+                    <RegistryValue Key="DefaultIcon" Type="string" Value="&quot;[!Path]&quot;,0" />
+                    <RegistryValue Key="shell\open" Name="FriendlyAppName" Type="string" Value="[ProductName]" />
+                    <RegistryValue Key="shell\open\command" Type="string" Value="&quot;[!Path]&quot; &quot;%1&quot;" />
+                </RegistryKey>
+                <!-- Explorer only reads the value names; WiX refuses empty values. -->
+                <RegistryValue Root="HKCR" Key=".jpg\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".jpeg\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".png\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".gif\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".webp\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".avif\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".heic\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".heif\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".tif\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".tiff\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".bmp\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".jxl\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".apng\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".mp4\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".m4v\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".mov\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".mkv\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".webm\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".avi\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".wmv\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".mpg\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".mpeg\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".mp3\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".m4a\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".aac\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".flac\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".wav\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".ogg\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".opus\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".aiff\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+                <RegistryValue Root="HKCR" Key=".wma\OpenWithProgids" Name="CatConvert.Media" Type="string" Value="CatConvert" />
+            </Component>
+        </DirectoryRef>
+
+        <!-- Explorer passes every selected file to one launch. -->
+        <DirectoryRef Id="TARGETDIR">
+            <Directory Id="SendToFolder" Name="SendTo">
+                <Component Id="CatConvertSendTo" Guid="*">
+                    <Shortcut Id="CatConvertSendToShortcut" Name="CatConvert" Description="Convert with CatConvert" Target="[!Path]" WorkingDirectory="INSTALLDIR" />
+                    <RemoveFolder Id="SendToFolder" On="uninstall" />
+                    <RegistryValue Root="HKCU" Key="Software\[Manufacturer]\[ProductName]" Name="Send To Shortcut" Type="integer" Value="1" KeyPath="yes" />
+                </Component>
+            </Directory>
+        </DirectoryRef>
+    </Fragment>
+</Wix>

@@ -6,7 +6,7 @@
  * place. The types mirror the serde output of `catconvert-core` (camelCase).
  */
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -180,6 +180,16 @@ export type FfmpegStatus = {
   jxl: JxlSupport;
 };
 
+/** Whether "Convert with CatConvert" is in Finder's Quick Actions menu. */
+export type QuickActionStatus = {
+  /** Only macOS has Quick Actions. */
+  supported: boolean;
+  installed: boolean;
+};
+
+/** How a drag out of the window ended (tauri-plugin-drag). */
+type DragEnd = { result: "Dropped" | "Cancel" };
+
 export const NO_JXL: JxlSupport = {
   cjxl: false,
   djxl: false,
@@ -212,10 +222,19 @@ type Commands = {
   relaunch: { args: Record<string, never>; result: null };
   missing_files: { args: { paths: string[] }; result: string[] };
   third_party_licenses: { args: Record<string, never>; result: string | null };
+  take_opened_files: { args: Record<string, never>; result: string[] };
+  quick_action_status: { args: Record<string, never>; result: QuickActionStatus };
+  set_quick_action: { args: { installed: boolean }; result: QuickActionStatus };
+  "plugin:drag|start_drag": {
+    args: { item: string[]; image: string; options: { mode: "copy" }; onEvent: Channel<DragEnd> };
+    result: null;
+  };
 };
 
 type Events = {
   "job-progress": JobProgress;
+  /** Absolute paths of files opened from outside the app. */
+  "open-files": string[];
 };
 
 function command<K extends keyof Commands>(
@@ -357,6 +376,73 @@ export function revealInFolder(path: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Files from and to other apps
+// ---------------------------------------------------------------------------
+
+/**
+ * Files opened from outside the app: "Open with", the Finder Quick Action,
+ * "Send to", a drop on the Dock icon or the command line. `handler` first gets
+ * the files that arrived before the window was ready, then each new batch.
+ */
+export async function onOpenedFiles(handler: (paths: string[]) => void): Promise<UnlistenFn> {
+  // Subscribe first: the backend emits events once the backlog is taken.
+  const stop = await subscribe("open-files", handler);
+  try {
+    const backlog = await command("take_opened_files", {});
+    if (backlog.length > 0) handler(backlog);
+  } catch (error) {
+    stop();
+    throw error;
+  }
+  return stop;
+}
+
+export async function quickActionStatus(): Promise<QuickActionStatus> {
+  if (!inTauri) return { supported: false, installed: false };
+  return command("quick_action_status", {});
+}
+
+/** Add or remove the Finder Quick Action. */
+export function setQuickAction(installed: boolean): Promise<QuickActionStatus> {
+  return command("set_quick_action", { installed });
+}
+
+/** A drag out of the window is in progress, so a drop on it is our own file coming back. */
+let draggingOut = false;
+
+/**
+ * Drag files out of the window into another app or folder, as copies. HTML
+ * drag and drop can't hand real files to other apps, so this starts a native
+ * drag; call it while the mouse button is down. `icon` is a PNG data URL shown
+ * under the pointer. Resolves when the drag ends.
+ */
+export function dragFiles(paths: string[], icon: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const end = () => {
+      draggingOut = false;
+      window.removeEventListener("pointerdown", end);
+      resolve();
+    };
+    const onEvent = new Channel<DragEnd>();
+    onEvent.onmessage = end;
+    // The window gets no pointer events during a native drag, so the next
+    // press means it is over, should the plugin never report back.
+    window.addEventListener("pointerdown", end);
+    draggingOut = true;
+    command("plugin:drag|start_drag", {
+      item: paths,
+      image: icon,
+      options: { mode: "copy" },
+      onEvent,
+    }).catch((error: unknown) => {
+      draggingOut = false;
+      window.removeEventListener("pointerdown", end);
+      reject(error);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Updates
 // ---------------------------------------------------------------------------
 
@@ -438,20 +524,24 @@ export type FileDropHandlers = {
   onDrop: (paths: string[]) => void;
 };
 
-/** Subscribe to native drag-and-drop on the current webview (gives real file paths). */
+/**
+ * Subscribe to native drag-and-drop on the current webview (gives real file
+ * paths). Files dragged out with {@link dragFiles} and let go over the window
+ * again are ignored.
+ */
 export function onFileDrop(handlers: FileDropHandlers): Promise<UnlistenFn> {
   return getCurrentWebview().onDragDropEvent(({ payload }) => {
     switch (payload.type) {
       case "enter":
       case "over":
-        handlers.onHover?.(true);
+        if (!draggingOut) handlers.onHover?.(true);
         break;
       case "leave":
         handlers.onHover?.(false);
         break;
       case "drop":
         handlers.onHover?.(false);
-        handlers.onDrop(payload.paths);
+        if (!draggingOut) handlers.onDrop(payload.paths);
         break;
     }
   });

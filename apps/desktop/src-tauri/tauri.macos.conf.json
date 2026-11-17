@@ -1,0 +1,76 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "fileAssociations": [
+      {
+        "name": "Image",
+        "ext": [
+          "jpg",
+          "jpeg",
+          "png",
+          "gif",
+          "webp",
+          "avif",
+          "heic",
+          "heif",
+          "tif",
+          "tiff",
+          "bmp",
+          "jxl"
+        ],
+        "contentTypes": [
+          "public.jpeg",
+          "public.png",
+          "com.compuserve.gif",
+          "org.webmproject.webp",
+          "public.avif",
+          "public.heic",
+          "public.heif",
+          "public.tiff",
+          "com.microsoft.bmp",
+          "public.jpeg-xl"
+        ],
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "name": "Video",
+        "ext": ["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpg", "mpeg"],
+        "contentTypes": [
+          "public.mpeg-4",
+          "com.apple.m4v-video",
+          "com.apple.quicktime-movie",
+          "org.matroska.mkv",
+          "org.webmproject.webm",
+          "public.avi",
+          "com.microsoft.windows-media-wmv",
+          "public.mpeg"
+        ],
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "name": "Audio",
+        "ext": ["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "aiff", "wma"],
+        "contentTypes": [
+          "public.mp3",
+          "com.apple.m4a-audio",
+          "public.aac-audio",
+          "org.xiph.flac",
+          "com.microsoft.waveform-audio",
+          "org.xiph.ogg-audio",
+          "public.aiff-audio",
+          "com.microsoft.windows-media-wma"
+        ],
+        "role": "Viewer",
+        "rank": "Alternate"
+      },
+      {
+        "name": "Animated PNG",
+        "ext": ["apng"],
+        "role": "Viewer",
+        "rank": "Alternate"
+      }
+    ]
+  }
+}

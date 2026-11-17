@@ -1,4 +1,4 @@
-import { type Component, createSignal, For, Match, Show, Switch } from "solid-js";
+import { type Component, createSignal, For, Match, onMount, Show, Switch } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
 import { type OutputFormat, thirdPartyLicenses } from "../lib/api";
@@ -11,15 +11,18 @@ import {
   QUALITY_STEPS,
   qualityStep,
 } from "../lib/formats";
+import { os } from "../lib/platform";
 import {
   activeCount,
   checkForUpdates,
   installUpdate,
   isAvailable,
+  loadQuickAction,
   refreshFfmpeg,
   restartApp,
   state,
   toast,
+  toggleQuickAction,
   type UpdateState,
   updateSettings,
 } from "../lib/store";
@@ -118,6 +121,58 @@ const StartingSettings: Component = () => {
           them.
         </span>
       </fieldset>
+    </section>
+  );
+};
+
+const OPEN_WITH: Record<typeof os, string> = {
+  macos:
+    "Right-click a photo, video or song in Finder and choose Open With › CatConvert, or drop it on CatConvert in the Dock.",
+  windows:
+    "Right-click a photo, video or song in Explorer and choose Open with › CatConvert, or Send to › CatConvert for several at once.",
+  linux:
+    "Right-click a photo, video or song in your file manager and choose Open With › CatConvert.",
+  other: "Open photos, videos and songs with CatConvert from your file manager.",
+};
+
+/** Starting conversions from Finder or Explorer, and dragging results out. */
+const OtherApps: Component = () => {
+  const [busy, setBusy] = createSignal(false);
+  const toggle = async () => {
+    setBusy(true);
+    await toggleQuickAction();
+    setBusy(false);
+  };
+  onMount(() => void loadQuickAction());
+
+  return (
+    <section class="card defaults">
+      <h2 class="section-title">From other apps</h2>
+      <p class="item-meta">{OPEN_WITH[os]}</p>
+      <Show when={state.quickAction?.supported}>
+        <div class="toggle-row">
+          <div>
+            <span class="toggle-title" id="quick-action">
+              Finder Quick Action
+            </span>
+            <span class="item-meta">
+              Adds Convert with CatConvert to Quick Actions when you right-click files
+            </span>
+          </div>
+          <button
+            type="button"
+            class="switch"
+            role="switch"
+            aria-checked={state.quickAction?.installed ?? false}
+            aria-labelledby="quick-action"
+            disabled={busy()}
+            onClick={() => void toggle()}
+          />
+        </div>
+      </Show>
+      <p class="item-meta">
+        Finished files can be dragged from the Queue or History straight into another app or folder.
+      </p>
     </section>
   );
 };
@@ -249,6 +304,8 @@ export const SettingsScreen: Component = () => {
           taken we add a number, so nothing is ever overwritten.
         </p>
       </section>
+
+      <OtherApps />
 
       <UpdatesCard />
 

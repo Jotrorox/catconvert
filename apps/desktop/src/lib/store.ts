@@ -16,6 +16,7 @@ import type {
   JobStage,
   MediaInfo,
   OutputFormat,
+  QuickActionStatus,
   UpdateInfo,
 } from "./api";
 import * as api from "./api";
@@ -108,6 +109,8 @@ type State = {
   recipes: Recipe[];
   /** Waiting files being queued with one set of settings. */
   batch: { done: number; total: number } | null;
+  /** The Finder Quick Action, once Settings has looked. */
+  quickAction: QuickActionStatus | null;
   toasts: Toast[];
 };
 
@@ -186,6 +189,7 @@ const [state, setState] = createStore<State>({
   settings: loadSettings(),
   recipes: loadRecipes(),
   batch: null,
+  quickAction: null,
   toasts: [],
 });
 
@@ -662,6 +666,46 @@ export async function reveal(path: string) {
   }
 }
 
+/** Drag a finished file into another app or folder; `icon` is the drag image. */
+export async function dragOut(path: string, icon: string) {
+  if (state.missing.includes(path)) return;
+  try {
+    await api.dragFiles([path], icon);
+  } catch (error) {
+    toast(`Couldn't drag ${baseName(path)}: ${errorText(error)}`, { tone: "error" });
+    void checkHistory();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Finder Quick Action
+// ---------------------------------------------------------------------------
+
+export async function loadQuickAction() {
+  try {
+    setState("quickAction", await api.quickActionStatus());
+  } catch {
+    // Settings simply doesn't offer it.
+  }
+}
+
+/** Add the Quick Action if it's missing, remove it otherwise. */
+export async function toggleQuickAction() {
+  const current = state.quickAction;
+  if (!current?.supported) return;
+  try {
+    const next = await api.setQuickAction(!current.installed);
+    setState("quickAction", next);
+    toast(
+      next.installed
+        ? "Right-click files in Finder › Quick Actions › Convert with CatConvert"
+        : "Removed from Finder's Quick Actions",
+    );
+  } catch (error) {
+    toast(`Couldn't change the Quick Action: ${errorText(error)}`, { tone: "error" });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Settings and recipes
 // ---------------------------------------------------------------------------
@@ -736,6 +780,7 @@ export function resetStore() {
     settings: loadSettings(),
     recipes: loadRecipes(),
     batch: null,
+    quickAction: null,
     toasts: [],
   });
 }
