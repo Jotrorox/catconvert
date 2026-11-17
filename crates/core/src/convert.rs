@@ -181,9 +181,25 @@ pub struct ConvertOptions {
     pub keep_audio: bool,
     /// JPEG XL settings, ignored for other formats.
     pub jxl: JxlOptions,
-    /// Carry over dates, location, titles and other tags where the output
-    /// format can hold them. Off strips them.
-    pub keep_metadata: bool,
+    /// Which dates, places, titles and other tags to carry over.
+    pub metadata: Metadata,
+}
+
+/// What to carry over from the original besides the picture and sound.
+///
+/// Only where the output can hold it: ffmpeg writes no EXIF into JPEG, WebP or
+/// AVIF, so those come out without photo metadata whatever this says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Metadata {
+    /// Dates, location, camera details, titles and the rest.
+    Keep,
+    /// Everything except where the file was made: the GPS coordinates in
+    /// EXIF and XMP, and location tags in videos.
+    #[default]
+    NoLocation,
+    /// No tags at all. Colour profiles stay, as they are part of the picture.
+    None,
 }
 
 impl Default for ConvertOptions {
@@ -199,7 +215,7 @@ impl Default for ConvertOptions {
             quality: 60,
             keep_audio: true,
             jxl: JxlOptions::default(),
-            keep_metadata: true,
+            metadata: Metadata::default(),
         }
     }
 }
@@ -247,6 +263,10 @@ pub enum Tool {
     Cjxl,
     /// libjxl's decoder.
     Djxl,
+    /// CatConvert itself, taking metadata out of a JPEG or PNG without
+    /// re-encoding it (see [`crate::scrub_file`]). Shown as the CLI command
+    /// that does the same.
+    Scrub,
 }
 
 impl Tool {
@@ -257,6 +277,7 @@ impl Tool {
             Self::Ffmpeg => "ffmpeg",
             Self::Cjxl => "cjxl",
             Self::Djxl => "djxl",
+            Self::Scrub => "catconvert scrub",
         }
     }
 }
@@ -309,14 +330,6 @@ impl Plan {
     #[must_use]
     pub fn duration_secs(&self) -> Option<f64> {
         self.steps.iter().rev().find_map(|step| step.duration_secs)
-    }
-
-    fn single(step: Step, output: &Path) -> Self {
-        Self {
-            steps: vec![step],
-            output: output.to_path_buf(),
-            scratch: Vec::new(),
-        }
     }
 }
 
@@ -373,50 +386,77 @@ pub fn plan(
         ));
     }
     let trim = trim_range(input, options)?;
-    // cjxl and djxl carry metadata over and can't drop it, so stripping
-    // means going through ffmpeg.
-    let untouched = is_untouched(input, options) && options.keep_metadata;
+    let untouched = is_untouched(input, options);
     let jxl_in = is_jxl(input);
     let animated = format.animates(input.kind);
+    // Photo metadata that ffmpeg's -map_metadata can't reach (see
+    // crate::scrub): it has to be cleaned out of a JPEG or PNG on the way.
+    let scrub = photo_scrub(input, options.metadata);
 
-    // Single-tool shortcuts for unedited files. libjxl does these best: they
-    // keep metadata, colour profiles, high bit depth and, for JPEG, the
-    // original bitstream.
+    let mut steps = Vec::new();
+    let mut scratch = Vec::new();
+
+    // Shortcuts for unedited files. libjxl does these best: they keep colour
+    // profiles, high bit depth and, for JPEG, the original bitstream. Its
+    // tools copy metadata as is, so JPEG and PNG get cleaned first or after.
     if untouched && format == OutputFormat::Jxl && jxl.cjxl {
         let ext = input.extension.as_deref().unwrap_or_default();
         let fits = !animated
             || animation_bytes(input, options, None, None, trim)
                 .is_none_or(|b| b <= CJXL_MEMORY_BUDGET);
-        if CJXL_INPUTS.contains(&ext) && fits {
-            let jpeg = matches!(ext, "jpg" | "jpeg");
-            return Ok(Plan::single(
-                cjxl_step(&input.path, output, options, jpeg, 1.0),
-                output,
-            ));
+        let jpeg = matches!(ext, "jpg" | "jpeg");
+        let cleanable = jpeg || matches!(ext, "png" | "apng");
+        // GIFs hold no EXIF; JPEG XL input with metadata to drop is decoded.
+        if CJXL_INPUTS.contains(&ext) && fits && (scrub.is_none() || cleanable || ext == "gif") {
+            let source = match scrub.filter(|_| cleanable) {
+                Some(metadata) => {
+                    let cleaned = scratch_path(output, "clean", ext);
+                    steps.push(scrub_step(&input.path, &cleaned, metadata));
+                    scratch.push(cleaned.clone());
+                    cleaned
+                }
+                None => input.path.clone(),
+            };
+            steps.push(cjxl_step(&source, output, options, jpeg, 1.0));
+            return Ok(Plan {
+                steps,
+                output: output.to_path_buf(),
+                scratch,
+            });
         }
     }
     if untouched && jxl_in && jxl.djxl && input.kind == MediaKind::Image {
         let restore_jpeg = format == OutputFormat::Jpg && input.reconstructs_jpeg;
         if format == OutputFormat::Png || restore_jpeg {
-            let mut args = vec![input.path.clone().into_os_string(), output.into()];
+            let decoded = match scrub {
+                Some(_) => {
+                    let decoded = scratch_path(output, "decoded", format.extension());
+                    scratch.push(decoded.clone());
+                    decoded
+                }
+                None => output.to_path_buf(),
+            };
+            let mut args = vec![input.path.clone().into_os_string(), decoded.clone().into()];
             if restore_jpeg {
                 args.push("--reconstruct_jpeg".into());
             }
             args.push("--quiet".into());
-            return Ok(Plan::single(
-                Step {
-                    tool: Tool::Djxl,
-                    args,
-                    duration_secs: None,
-                    weight: 1.0,
-                },
-                output,
-            ));
+            steps.push(Step {
+                tool: Tool::Djxl,
+                args,
+                duration_secs: None,
+                weight: 1.0,
+            });
+            if let Some(metadata) = scrub {
+                steps.push(scrub_step(&decoded, output, metadata));
+            }
+            return Ok(Plan {
+                steps,
+                output: output.to_path_buf(),
+                scratch,
+            });
         }
     }
-
-    let mut steps = Vec::new();
-    let mut scratch = Vec::new();
 
     // JPEG XL that ffmpeg can't decode: let djxl unpack it to (A)PNG first.
     let mut source = input.clone();
@@ -482,8 +522,55 @@ pub fn plan(
                 Sink::Frames { animated },
                 &frames,
             ));
+            scratch.push(frames.clone());
+            let frames = match scrub.filter(|_| !animated) {
+                Some(metadata) => {
+                    let cleaned = scratch_path(output, "clean", ext);
+                    steps.push(scrub_step(&frames, &cleaned, metadata));
+                    scratch.push(cleaned.clone());
+                    cleaned
+                }
+                None => frames,
+            };
             steps.push(cjxl_step(&frames, output, options, false, 0.6));
-            scratch.push(frames);
+        } else if let (true, Some(metadata)) = (ffmpeg_can && !animated, scrub) {
+            // ffmpeg's libjxl writes the EXIF it decoded: edit into a PNG,
+            // clean that, then encode it as it is.
+            let frames = scratch_path(output, "frames", "png");
+            let cleaned = scratch_path(output, "clean", "png");
+            steps.push(ffmpeg_step(
+                &source,
+                options,
+                trim,
+                Sink::Frames { animated: false },
+                &frames,
+            ));
+            steps.push(scrub_step(&frames, &cleaned, metadata));
+            let (width, height) = output_dims(input, options, None).unzip();
+            let edited = MediaInfo {
+                path: cleaned.clone(),
+                extension: Some("png".into()),
+                width,
+                height,
+                video_codec: Some("png".into()),
+                has_location: false,
+                location_tags: Vec::new(),
+                ..source.clone()
+            };
+            let as_is = ConvertOptions {
+                trim_start: None,
+                trim_end: None,
+                max_size: None,
+                fps: None,
+                rotate: 0,
+                flip: false,
+                metadata: Metadata::Keep,
+                ..options.clone()
+            };
+            let mut encode = ffmpeg_step(&edited, &as_is, (0.0, None), Sink::Output, output);
+            encode.weight = 0.6;
+            steps.push(encode);
+            scratch.extend([frames, cleaned]);
         } else if ffmpeg_can {
             steps.push(ffmpeg_step(&source, options, trim, Sink::Output, output));
         } else if animated {
@@ -495,6 +582,12 @@ pub fn plan(
                 "writing JPEG XL needs cjxl from libjxl or an ffmpeg built with libjxl",
             ));
         }
+    } else if let (OutputFormat::Png, Some(metadata)) = (format, scrub) {
+        // ffmpeg's PNG encoder writes the EXIF it decoded.
+        let encoded = scratch_path(output, "encoded", "png");
+        steps.push(ffmpeg_step(&source, options, trim, Sink::Output, &encoded));
+        steps.push(scrub_step(&encoded, output, metadata));
+        scratch.push(encoded);
     } else {
         steps.push(ffmpeg_step(&source, options, trim, Sink::Output, output));
     }
@@ -711,8 +804,18 @@ fn ffmpeg_step(
         }
     }
 
-    if !options.keep_metadata {
-        args.extend(["-map_metadata", "-1", "-map_chapters", "-1"].map(OsString::from));
+    match options.metadata {
+        Metadata::Keep => {}
+        // Videos keep their place in container tags, e.g. `location` or
+        // `com.apple.quicktime.location.ISO6709`; an empty value deletes one.
+        Metadata::NoLocation => {
+            for tag in &input.location_tags {
+                args.extend(["-metadata".into(), format!("{tag}=").into()]);
+            }
+        }
+        Metadata::None => {
+            args.extend(["-map_metadata", "-1", "-map_chapters", "-1"].map(OsString::from));
+        }
     }
     args.push(out.as_os_str().to_owned());
     let weight = if matches!(sink, Sink::Frames { .. }) {
@@ -725,6 +828,29 @@ fn ffmpeg_step(
         args,
         duration_secs,
         weight,
+    }
+}
+
+/// Whether photo metadata must be cleaned out of JPEG or PNG files on the
+/// way, and how. Only stills carry EXIF; with all but the location kept, only
+/// files known to have a location need it.
+fn photo_scrub(input: &MediaInfo, metadata: Metadata) -> Option<Metadata> {
+    let needed = match metadata {
+        Metadata::Keep => false,
+        Metadata::NoLocation => input.has_location,
+        Metadata::None => true,
+    };
+    (needed && input.kind == MediaKind::Image).then_some(metadata)
+}
+
+/// The built-in step that copies `input` to `output` without the metadata
+/// `metadata` rules out.
+fn scrub_step(input: &Path, output: &Path, metadata: Metadata) -> Step {
+    Step {
+        tool: Tool::Scrub,
+        args: crate::scrub::step_args(input, output, metadata),
+        duration_secs: None,
+        weight: 0.05,
     }
 }
 
@@ -1016,6 +1142,8 @@ mod tests {
             video_codec: Some("h264".into()),
             audio_codec: Some("aac".into()),
             reconstructs_jpeg: false,
+            has_location: false,
+            location_tags: Vec::new(),
         }
     }
 
@@ -1390,39 +1518,210 @@ mod tests {
     }
 
     #[test]
-    fn stripping_metadata_goes_through_ffmpeg() {
-        let strip = ConvertOptions {
-            format: OutputFormat::Mp4,
-            keep_metadata: false,
+    fn video_metadata_is_dropped_by_ffmpeg() {
+        let mut input = video("garden.mov");
+        input.location_tags = vec!["location".into(), "location-eng".into()];
+        input.has_location = true;
+        let with = |metadata| ConvertOptions {
+            metadata,
             ..ConvertOptions::default()
         };
-        let cmd = command(&video("garden.mov"), &strip, "/clips/garden.mp4");
+
+        let cmd = command(&input, &with(Metadata::None), "/clips/garden.mp4");
         assert!(
             cmd.ends_with("-map_metadata -1 -map_chapters -1 /clips/garden.mp4"),
             "{cmd}"
         );
+        let cmd = command(&input, &with(Metadata::NoLocation), "/clips/garden.mp4");
+        assert!(
+            cmd.ends_with(
+                "-movflags +faststart -metadata location= -metadata location-eng= /clips/garden.mp4"
+            ),
+            "{cmd}"
+        );
+        let cmd = command(&input, &with(Metadata::Keep), "/clips/garden.mp4");
+        assert!(cmd.ends_with("+faststart /clips/garden.mp4"), "{cmd}");
+        // Location is the default thing to drop.
+        assert_eq!(ConvertOptions::default().metadata, Metadata::NoLocation);
+    }
 
-        // cjxl would carry the EXIF over, so an unedited JPEG is decoded instead.
+    fn scrub_args(plan: &Plan, index: usize) -> Vec<String> {
+        assert_eq!(plan.steps[index].tool, Tool::Scrub);
+        plan.steps[index]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn jpeg_repack_survives_dropping_metadata() {
+        let lossless = |metadata| {
+            jxl(ConvertOptions {
+                jxl: JxlOptions {
+                    lossless: true,
+                    ..JxlOptions::default()
+                },
+                metadata,
+                ..ConvertOptions::default()
+            })
+        };
+        let mut photo = image("photo.jpg", 4000, 3000);
+        let out = Path::new("/clips/photo.jxl");
+
+        // Nothing to hide: cjxl reads the JPEG itself.
+        let planned = plan(&photo, &lossless(Metadata::NoLocation), out, LIBJXL).expect("plan");
+        assert_eq!(tools(&planned), [Tool::Cjxl]);
+
+        // A located photo is copied without its GPS, then repacked losslessly.
+        photo.has_location = true;
+        for (metadata, what) in [(Metadata::NoLocation, "location"), (Metadata::None, "all")] {
+            let planned = plan(&photo, &lossless(metadata), out, LIBJXL).expect("plan");
+            assert_eq!(tools(&planned), [Tool::Scrub, Tool::Cjxl]);
+            assert_eq!(
+                scrub_args(&planned, 0),
+                [
+                    "/clips/photo.jpg",
+                    "/clips/.photo.jxl.clean.jpg",
+                    "--drop",
+                    what
+                ]
+            );
+            assert_eq!(
+                planned.steps[1].args[..3],
+                [
+                    "/clips/.photo.jxl.clean.jpg",
+                    "/clips/photo.jxl",
+                    "--lossless_jpeg=1"
+                ]
+                .map(OsString::from)
+            );
+            assert_eq!(
+                planned.scratch,
+                [PathBuf::from("/clips/.photo.jxl.clean.jpg")]
+            );
+        }
+        assert!(
+            plan(&photo, &lossless(Metadata::None), out, LIBJXL)
+                .unwrap()
+                .command_line()
+                .starts_with(
+                    "catconvert scrub /clips/photo.jpg /clips/.photo.jxl.clean.jpg --drop all && "
+                ),
+        );
+    }
+
+    #[test]
+    fn png_output_is_cleaned_after_ffmpeg() {
+        let mut photo = image("photo.jpg", 400, 300);
+        let png = ConvertOptions {
+            format: OutputFormat::Png,
+            ..ConvertOptions::default()
+        };
+        let out = Path::new("/clips/photo.png");
+        let plan_for = |photo: &MediaInfo, options: &ConvertOptions| {
+            plan(photo, options, out, JxlSupport::default()).expect("plan")
+        };
+        assert_eq!(tools(&plan_for(&photo, &png)), [Tool::Ffmpeg]);
+
+        photo.has_location = true;
+        let planned = plan_for(&photo, &png);
+        assert_eq!(tools(&planned), [Tool::Ffmpeg, Tool::Scrub]);
+        assert_eq!(
+            planned.steps[0].args.last(),
+            Some(&OsString::from("/clips/.photo.png.encoded.png"))
+        );
+        assert_eq!(
+            scrub_args(&planned, 1),
+            [
+                "/clips/.photo.png.encoded.png",
+                "/clips/photo.png",
+                "--drop",
+                "location"
+            ]
+        );
+
+        // JPG, WebP and AVIF come out of ffmpeg without EXIF anyway.
+        for format in [OutputFormat::Jpg, OutputFormat::Webp, OutputFormat::Avif] {
+            let options = ConvertOptions {
+                format,
+                metadata: Metadata::None,
+                ..png.clone()
+            };
+            let out = format!("/clips/small.{}", format.extension());
+            let planned = plan(&photo, &options, Path::new(&out), JxlSupport::default()).unwrap();
+            assert_eq!(tools(&planned), [Tool::Ffmpeg], "{format:?}");
+        }
+    }
+
+    #[test]
+    fn edited_jxl_is_cleaned_between_ffmpeg_and_the_encoder() {
         let options = jxl(ConvertOptions {
-            jxl: JxlOptions {
-                lossless: true,
-                ..JxlOptions::default()
-            },
-            keep_metadata: false,
+            rotate: 90,
+            metadata: Metadata::None,
             ..ConvertOptions::default()
         });
-        let plan = plan(
-            &image("photo.jpg", 4000, 3000),
-            &options,
-            Path::new("/clips/photo.jxl"),
-            LIBJXL,
-        )
-        .expect("plan");
-        assert_eq!(tools(&plan), [Tool::Ffmpeg, Tool::Cjxl]);
-        assert!(
-            plan.command_line().contains("-map_metadata -1"),
-            "{}",
-            plan.command_line()
+        let photo = image("photo.png", 400, 300);
+        let out = Path::new("/clips/photo.jxl");
+
+        let plan_cjxl = plan(&photo, &options, out, LIBJXL).expect("plan");
+        assert_eq!(tools(&plan_cjxl), [Tool::Ffmpeg, Tool::Scrub, Tool::Cjxl]);
+        assert_eq!(plan_cjxl.steps[2].args[0], "/clips/.photo.jxl.clean.png");
+
+        // Without cjxl, ffmpeg encodes the cleaned picture as it is.
+        let plan_ffmpeg = plan(&photo, &options, out, FFMPEG_JXL).expect("plan");
+        assert_eq!(
+            tools(&plan_ffmpeg),
+            [Tool::Ffmpeg, Tool::Scrub, Tool::Ffmpeg]
+        );
+        let encode = plan_ffmpeg.steps[2]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            encode,
+            "-i /clips/.photo.jxl.clean.png -map 0:v:0 -frames:v 1 -c:v libjxl -distance 1.5 \
+             -effort 7 -update 1 -an -sn -dn /clips/photo.jxl"
+        );
+        assert_eq!(plan_ffmpeg.scratch.len(), 2);
+
+        // Animations carry no EXIF.
+        let short = ConvertOptions {
+            trim_end: Some(2.0),
+            ..options
+        };
+        let clip = plan(&video("clip.mov"), &short, out, LIBJXL).expect("plan");
+        assert_eq!(tools(&clip), [Tool::Ffmpeg, Tool::Cjxl]);
+    }
+
+    #[test]
+    fn restored_jpeg_is_cleaned_after_djxl() {
+        let mut packed = image("photo.jxl", 4000, 3000);
+        packed.reconstructs_jpeg = true;
+        packed.has_location = true;
+        let options = ConvertOptions {
+            format: OutputFormat::Jpg,
+            ..ConvertOptions::default()
+        };
+        let planned = plan(&packed, &options, Path::new("/clips/photo.jpg"), LIBJXL).expect("plan");
+        assert_eq!(
+            planned.command_line(),
+            "djxl /clips/photo.jxl /clips/.photo.jpg.decoded.jpg --reconstruct_jpeg --quiet && \\\n  \
+             catconvert scrub /clips/.photo.jpg.decoded.jpg /clips/photo.jpg --drop location"
+        );
+
+        // JPEG XL with metadata to drop isn't re-encoded by cjxl directly.
+        let options = jxl(ConvertOptions {
+            metadata: Metadata::None,
+            ..ConvertOptions::default()
+        });
+        let planned =
+            plan(&packed, &options, Path::new("/clips/photo 2.jxl"), LIBJXL).expect("plan");
+        assert_eq!(
+            tools(&planned),
+            [Tool::Djxl, Tool::Ffmpeg, Tool::Scrub, Tool::Cjxl]
         );
     }
 

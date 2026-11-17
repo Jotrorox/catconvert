@@ -2,7 +2,7 @@
  * What the UI knows about output formats, edit defaults and recipes. The
  * backend validates everything again; this only decides what to offer.
  */
-import type { ConvertOptions, MediaInfo, MediaKind, OutputFormat } from "./api";
+import type { ConvertOptions, MediaInfo, MediaKind, MetadataMode, OutputFormat } from "./api";
 
 export type Tone = "pink" | "green" | "yellow" | "lavender";
 
@@ -89,15 +89,15 @@ export const JXL_EFFORTS = [
 const LOSSLESS_BY_DEFAULT = new Set(["jpg", "jpeg", "png", "apng", "gif"]);
 
 /**
- * Whether the options leave the file as it is: no trim, turn, mirror, resize or
- * new rate, and metadata kept (libjxl's tools can't drop it, see convert.rs).
+ * Whether the options leave the picture as it is: no trim, turn, mirror,
+ * resize or new rate. Dropping metadata doesn't count; the backend cleans the
+ * JPEG before libjxl repacks it (see scrub.rs).
  */
 export function isUntouched(info: MediaInfo, options: ConvertOptions): boolean {
   const untrimmed =
     info.kind === "image" || (options.trimStart === null && options.trimEnd === null);
   return (
     untrimmed &&
-    options.keepMetadata &&
     options.rotate === 0 &&
     !options.flip &&
     (options.maxSize === null || !sizeChoices(info).includes(options.maxSize)) &&
@@ -148,8 +148,64 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     quality: 60,
     keepAudio: true,
     jxl: { lossless: false, effort: 7, progressive: false },
-    keepMetadata: true,
+    metadata: "noLocation",
   };
+}
+
+export const METADATA_CHOICES: readonly { mode: MetadataMode; label: string }[] = [
+  { mode: "keep", label: "Keep everything" },
+  { mode: "noLocation", label: "Keep all but location" },
+  { mode: "none", label: "Remove everything" },
+];
+
+/**
+ * Whether the output can carry tags over at all. ffmpeg writes no EXIF into
+ * JPG, WebP or AVIF, stills grabbed from a video have none, and animations
+ * keep no tags, so those come out clean whatever the setting.
+ */
+export function keepsMetadata(format: OutputFormat, input: MediaKind): boolean {
+  if (formatKind(format, input) === "image") {
+    return input === "image" && (format === "png" || format === "jxl");
+  }
+  return !isAnimatedImage(format, input);
+}
+
+/** Whether the converted file will still say where the original was made. */
+export function keepsLocation(info: MediaInfo, options: ConvertOptions): boolean {
+  return (
+    info.hasLocation && options.metadata === "keep" && keepsMetadata(options.format, info.kind)
+  );
+}
+
+const PLACE_WORDS = {
+  image: "photo knows where it was taken",
+  video: "video knows where it was filmed",
+  audio: "recording knows where it was made",
+  unknown: "file knows where it was made",
+} as const;
+
+/** "📍 This photo knows where it was taken", for files with a location. */
+export function locationLine(info: MediaInfo): string | null {
+  return info.hasLocation ? `This ${PLACE_WORDS[info.kind]}` : null;
+}
+
+/**
+ * The metadata setting as stored by older versions (`keepMetadata: boolean`)
+ * or now. On only meant "keep", off meant "remove everything".
+ */
+export function metadataFrom(stored: {
+  metadata?: unknown;
+  keepMetadata?: unknown;
+}): MetadataMode | null {
+  if (
+    stored.metadata === "keep" ||
+    stored.metadata === "noLocation" ||
+    stored.metadata === "none"
+  ) {
+    return stored.metadata;
+  }
+  if (typeof stored.keepMetadata === "boolean") return stored.keepMetadata ? "keep" : "none";
+  return null;
 }
 
 export const QUALITY_STEPS = ["Tiny file", "Balanced", "Crisp"] as const;
@@ -163,13 +219,14 @@ export type Defaults = {
   /** Preferred output per input kind; `null` lets CatConvert pick. */
   formats: Record<FormatGroup["kind"], OutputFormat | null>;
   quality: number;
-  keepMetadata: boolean;
+  metadata: MetadataMode;
 };
 
+/** Keeping all but the location suits an app that never sends files anywhere. */
 export const DEFAULTS: Defaults = {
   formats: { video: null, audio: null, image: null },
   quality: 60,
-  keepMetadata: true,
+  metadata: "noLocation",
 };
 
 /** Whether the editor offers `format` for an input of `kind`. */
@@ -301,7 +358,7 @@ export function initialOptions(
   const base = (format: OutputFormat): ConvertOptions => ({
     ...defaultOptions(format),
     quality: defaults.quality,
-    keepMetadata: defaults.keepMetadata,
+    metadata: defaults.metadata,
     jxl: { ...defaultOptions("jxl").jxl, lossless: LOSSLESS_BY_DEFAULT.has(info.extension ?? "") },
   });
   if (recipe?.accepts.includes(info.kind)) {
@@ -331,7 +388,8 @@ export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
   const video = out === "video" && !isAnimatedImage(options.format, info.kind);
   if (video && !options.keepAudio) parts.push("no sound");
   parts.push(isLossless(options) ? "lossless" : qualityStep(options.quality).toLowerCase());
-  if (!options.keepMetadata) parts.push("no metadata");
+  if (options.metadata === "keep") parts.push("all metadata");
+  if (options.metadata === "none") parts.push("no metadata");
   const text = parts.join(" · ");
   return text.charAt(0).toUpperCase() + text.slice(1);
 }

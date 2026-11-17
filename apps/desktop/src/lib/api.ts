@@ -36,6 +36,10 @@ export type MediaInfo = {
   audioCodec: string | null;
   /** JPEG XL only: a losslessly recompressed JPEG whose original can be restored. */
   reconstructsJpeg: boolean;
+  /** GPS in a photo's EXIF or XMP, or a location tag in a video or song. */
+  hasLocation: boolean;
+  /** Container tags holding the location, cleared when everything else is kept. */
+  locationTags: string[];
 };
 
 export type OutputFormat =
@@ -56,6 +60,9 @@ export type OutputFormat =
   | "jxl";
 
 export type Rotation = 0 | 90 | 180 | 270;
+
+/** What to carry over besides the picture and sound. */
+export type MetadataMode = "keep" | "noLocation" | "none";
 
 /** Settings that only matter when writing JPEG XL. */
 export type JxlOptions = {
@@ -90,8 +97,8 @@ export type ConvertOptions = {
   quality: number;
   keepAudio: boolean;
   jxl: JxlOptions;
-  /** Carry over dates, location and other tags where the format can hold them. */
-  keepMetadata: boolean;
+  /** Which dates, places and other tags to carry over, where the format can hold them. */
+  metadata: MetadataMode;
 };
 
 export type JobId = number;

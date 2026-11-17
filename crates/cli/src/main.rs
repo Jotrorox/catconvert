@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use catconvert_core::{ConvertOptions, Ffmpeg, JxlOptions, OutputFormat, RunOutcome};
+use catconvert_core::{ConvertOptions, Ffmpeg, JxlOptions, Metadata, OutputFormat, RunOutcome};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -70,13 +70,58 @@ enum Command {
         /// JPEG XL: progressive decoding.
         #[arg(long)]
         progressive: bool,
-        /// Drop dates, location, titles and other tags.
-        #[arg(long)]
+        /// Which dates, places, titles and other tags to carry over.
+        #[arg(long, value_enum, default_value_t = Tags::NoLocation)]
+        metadata: Tags,
+        /// Same as `--metadata none`.
+        #[arg(long, hide = true, conflicts_with = "metadata")]
         strip_metadata: bool,
         /// Print the command(s) instead of running them.
         #[arg(long)]
         dry_run: bool,
     },
+    /// Copy a JPEG or PNG without its location or all of its metadata. The
+    /// picture itself is copied untouched, so a JPEG stays bit-identical
+    /// apart from the metadata.
+    Scrub {
+        /// JPEG or PNG to read.
+        input: PathBuf,
+        /// Where to write the copy; must not exist yet.
+        output: PathBuf,
+        /// What to take out.
+        #[arg(long, value_enum)]
+        drop: Strip,
+    },
+}
+
+/// CLI mirror of [`Metadata`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Tags {
+    /// Everything, where the format can hold it.
+    Keep,
+    /// Everything except where the file was made (GPS, location tags).
+    NoLocation,
+    /// Nothing; colour profiles stay.
+    None,
+}
+
+impl From<Tags> for Metadata {
+    fn from(tags: Tags) -> Self {
+        match tags {
+            Tags::Keep => Self::Keep,
+            Tags::NoLocation => Self::NoLocation,
+            Tags::None => Self::None,
+        }
+    }
+}
+
+/// What `scrub` takes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Strip {
+    /// GPS coordinates in EXIF and XMP.
+    Location,
+    /// EXIF, XMP, IPTC, comments and text; colour profiles stay.
+    All,
 }
 
 /// CLI mirror of [`OutputFormat`].
@@ -194,6 +239,7 @@ fn main() -> ExitCode {
             lossless,
             effort,
             progressive,
+            metadata,
             strip_metadata,
             dry_run,
         } => {
@@ -212,9 +258,30 @@ fn main() -> ExitCode {
                     effort,
                     progressive,
                 },
-                keep_metadata: !strip_metadata,
+                metadata: if strip_metadata {
+                    Metadata::None
+                } else {
+                    metadata.into()
+                },
             };
             match convert(&file, &options, dry_run) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Scrub {
+            input,
+            output,
+            drop,
+        } => {
+            let metadata = match drop {
+                Strip::Location => Metadata::NoLocation,
+                Strip::All => Metadata::None,
+            };
+            match catconvert_core::scrub_file(&input, &output, metadata) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -266,6 +333,7 @@ mod tests {
             start,
             size,
             quality,
+            metadata,
             ..
         } = cli.command
         else {
@@ -275,6 +343,7 @@ mod tests {
         assert_eq!(start, Some(1.5));
         assert_eq!(size, Some(480));
         assert_eq!(quality, 60);
+        assert_eq!(Metadata::from(metadata), Metadata::NoLocation);
         assert!(
             Cli::try_parse_from([
                 "catconvert",
@@ -287,5 +356,44 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_metadata_choices_and_scrub() {
+        let metadata = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                ["catconvert", "convert", "a.jpg", "--to", "png"]
+                    .iter()
+                    .chain(args),
+            )
+            .expect("parse");
+            let Command::Convert {
+                metadata,
+                strip_metadata,
+                ..
+            } = cli.command
+            else {
+                panic!("expected convert");
+            };
+            (Metadata::from(metadata), strip_metadata)
+        };
+        assert_eq!(metadata(&["--metadata", "keep"]).0, Metadata::Keep);
+        assert_eq!(metadata(&["--metadata", "none"]).0, Metadata::None);
+        assert!(metadata(&["--strip-metadata"]).1);
+
+        // The command line plans show for in-process cleaning steps.
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "scrub",
+            "a.jpg",
+            "b.jpg",
+            "--drop",
+            "location",
+        ])
+        .expect("parse");
+        let Command::Scrub { drop, .. } = cli.command else {
+            panic!("expected scrub");
+        };
+        assert_eq!(drop, Strip::Location);
     }
 }

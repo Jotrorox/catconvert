@@ -67,6 +67,8 @@ const VIDEO: MediaInfo = {
   videoCodec: "h264",
   audioCodec: "aac",
   reconstructsJpeg: false,
+  hasLocation: false,
+  locationTags: [],
 };
 
 const PHOTO: MediaInfo = {
@@ -202,7 +204,7 @@ describe("CatConvert", () => {
       quality: 60,
       keepAudio: false,
       jxl: { lossless: false, effort: 7, progressive: false },
-      keepMetadata: true,
+      metadata: "noLocation",
     });
 
     applyProgress({
@@ -431,37 +433,93 @@ describe("CatConvert", () => {
       target: { value: "mkv" },
     });
     fireEvent.input(screen.getByRole("slider", { name: "Quality" }), { target: { value: "85" } });
-    fireEvent.click(screen.getByRole("switch", { name: "Keep metadata" }));
+    expect(screen.getByRole("button", { name: "Keep all but location" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove everything" }));
     expect(JSON.parse(localStorage.getItem("catconvert.settings.v1") ?? "{}")).toEqual({
       formats: { video: "mkv", audio: null, image: null },
       quality: 85,
-      keepMetadata: false,
+      metadata: "none",
     });
 
     openPaths([VIDEO.path]);
     await screen.findByRole("heading", { name: "clip.mov" });
     expect(screen.getByRole("button", { name: "MKV" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("slider", { name: "Quality" })).toHaveValue("85");
-    expect(screen.getByRole("switch", { name: "Keep metadata" })).toHaveAttribute(
-      "aria-checked",
-      "false",
+    expect(screen.getByRole("button", { name: "Remove everything" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
     );
   });
 
-  it("strips metadata on request, which rules out the JPEG repack", async () => {
+  it("reads the metadata switch of earlier versions", async () => {
+    localStorage.setItem(
+      "catconvert.settings.v1",
+      JSON.stringify({ formats: {}, quality: 60, keepMetadata: true }),
+    );
+    const recipe = {
+      id: "custom-1",
+      title: "Old",
+      options: { format: "mp4", keepMetadata: false },
+    };
+    localStorage.setItem("catconvert.recipes.v1", JSON.stringify([recipe]));
+    resetStore();
+    expect(state.settings).toEqual({
+      formats: { video: null, audio: null, image: null },
+      quality: 60,
+      metadata: "keep",
+    });
+    expect(state.recipes[0]?.options).toEqual({ format: "mp4", metadata: "none" });
+    await openVideo();
+    expect(screen.getByRole("button", { name: "Keep everything" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("tells when a photo knows where it was taken and drops it, repack and all", async () => {
+    vi.mocked(api.probeFile).mockResolvedValue({ ...PHOTO, hasLocation: true });
     render(() => <App />);
     await screen.findByText("ffmpeg 7.1");
     openPaths([PHOTO.path]);
     await screen.findByRole("heading", { name: "cat.jpg" });
+    expect(screen.getByText(/This photo knows where it was taken/)).toHaveTextContent(
+      "This photo knows where it was taken. The copy won't.",
+    );
+    const changes = () =>
+      within(screen.getByRole("list", { name: "Changes" }))
+        .getAllByRole("listitem")
+        .map((li) => li.textContent);
+    expect(changes()).toContain("No location");
+
+    // The lossless JPEG XL repack stays available without the location.
     fireEvent.click(screen.getByRole("button", { name: "JXL" }));
-    expect(screen.getByText(/Repacks the JPEG/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("switch", { name: "Keep metadata" }));
-    expect(screen.getByText(/every pixel and sample stays put/)).toBeInTheDocument();
+    expect(screen.getByText(/Repacks the JPEG/)).toHaveTextContent(
+      "Repacks the JPEG without re-encoding: smaller, and the original can be restored exactly, minus its location.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove everything" }));
+    expect(screen.getByText(/Repacks the JPEG/)).toHaveTextContent(/minus its metadata\.$/);
+    fireEvent.click(screen.getByRole("button", { name: "Keep everything" }));
+    expect(screen.getByText(/The copy will too\./)).toBeInTheDocument();
+    expect(screen.queryByText(/minus its/)).not.toBeInTheDocument();
+
+    // ffmpeg writes no EXIF into JPG, so there is nothing to choose.
+    fireEvent.click(screen.getByRole("button", { name: "JPG" }));
+    expect(screen.queryByRole("button", { name: "Keep everything" })).not.toBeInTheDocument();
+    expect(
+      screen.getByText("JPG files come out without dates, place or camera details."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/The copy won't\./)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "JXL" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep all but location" }));
     fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
     await screen.findByRole("heading", { name: "Queue" });
     expect(api.startJob).toHaveBeenCalledWith(
       PHOTO.path,
-      expect.objectContaining({ format: "jxl", keepMetadata: false }),
+      expect.objectContaining({ format: "jxl", metadata: "noLocation" }),
     );
   });
 

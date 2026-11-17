@@ -1802,6 +1802,38 @@ button.format-chip:not(:disabled):active {
   display: block;
 }
 
+/* Metadata */
+
+.metadata-field {
+  gap: 8px;
+}
+
+.metadata-field .field-label {
+  margin-bottom: 0;
+}
+
+.metadata-field .format-chips {
+  --tone-bg: var(--green-bg);
+  --tone-ink: var(--green-ink);
+}
+
+.location-line {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--yellow-bg);
+  color: var(--yellow-ink);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.location-fate {
+  font-weight: 500;
+}
+
 /* Toggle */
 
 .toggle-row {

@@ -68,6 +68,14 @@ pub struct MediaInfo {
     /// original JPEG can be restored bit for bit.
     #[serde(default)]
     pub reconstructs_jpeg: bool,
+    /// The file records where it was made: GPS coordinates in a photo's EXIF
+    /// or XMP, or a location tag in a video or song.
+    #[serde(default)]
+    pub has_location: bool,
+    /// Container tags that hold a location, e.g. `location`, to clear when
+    /// keeping everything else.
+    #[serde(default)]
+    pub location_tags: Vec<String>,
 }
 
 impl MediaInfo {
@@ -123,6 +131,8 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
         video_codec: None,
         audio_codec: None,
         reconstructs_jpeg: false,
+        has_location: false,
+        location_tags: Vec::new(),
     })
 }
 
@@ -150,6 +160,8 @@ pub(crate) mod tests {
             video_codec: None,
             audio_codec: None,
             reconstructs_jpeg: false,
+            has_location: false,
+            location_tags: Vec::new(),
         }
     }
 
