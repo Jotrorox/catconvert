@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-use catconvert_core::{ConvertOptions, Ffmpeg, JxlOptions, OutputFormat, RunOutcome};
+use catconvert_core::{
+    ConvertOptions, Crop, Direction, Ffmpeg, JxlOptions, OutputFormat, RunOutcome, SoundOptions,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -54,12 +56,24 @@ enum Command {
         /// Mirror horizontally.
         #[arg(long)]
         flip: bool,
+        /// Crop to this width:height, keeping the centre (e.g. 1:1, 9:16).
+        #[arg(long, value_name = "W:H", value_parser = parse_aspect)]
+        crop: Option<[u32; 2]>,
         /// 0 = smallest file, 100 = best quality.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u8).range(0..=100))]
         quality: u8,
         /// Drop the audio track.
         #[arg(long)]
         mute: bool,
+        /// Even out loudness (to -16 LUFS).
+        #[arg(long)]
+        normalize: bool,
+        /// Fade in over this many seconds (video fades from black too).
+        #[arg(long, default_value_t = 0.0)]
+        fade_in: f64,
+        /// Fade out over this many seconds (video fades to black too).
+        #[arg(long, default_value_t = 0.0)]
+        fade_out: f64,
         /// JPEG XL: mathematically lossless (an unedited JPEG is recompressed
         /// losslessly and can be restored bit for bit).
         #[arg(long)]
@@ -73,10 +87,34 @@ enum Command {
         /// Drop dates, location, titles and other tags.
         #[arg(long)]
         strip_metadata: bool,
+        /// GIF and animated JPEG XL: playback speed, 0.25 to 4 (e.g. 2 for 2×).
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// GIF and animated JPEG XL: play forward, reversed, or forward then back.
+        #[arg(long, value_enum, default_value_t = Playback::Forward)]
+        direction: Playback,
         /// Print the command(s) instead of running them.
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// CLI mirror of [`Direction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Playback {
+    Forward,
+    Reverse,
+    Boomerang,
+}
+
+impl From<Playback> for Direction {
+    fn from(playback: Playback) -> Self {
+        match playback {
+            Playback::Forward => Self::Forward,
+            Playback::Reverse => Self::Reverse,
+            Playback::Boomerang => Self::Boomerang,
+        }
+    }
 }
 
 /// CLI mirror of [`OutputFormat`].
@@ -119,6 +157,14 @@ impl From<Format> for OutputFormat {
             Format::Jxl => Self::Jxl,
         }
     }
+}
+
+/// `9:16` → `[9, 16]`.
+fn parse_aspect(text: &str) -> Result<[u32; 2], String> {
+    let parse = |part: &str| part.trim().parse::<u32>().ok().filter(|&n| n > 0);
+    text.split_once(':')
+        .and_then(|(w, h)| Some([parse(w)?, parse(h)?]))
+        .ok_or_else(|| format!("expected a shape like 1:1 or 9:16, got `{text}`"))
 }
 
 fn convert(file: &PathBuf, options: &ConvertOptions, dry_run: bool) -> Result<(), String> {
@@ -189,12 +235,18 @@ fn main() -> ExitCode {
             fps,
             rotate,
             flip,
+            crop,
             quality,
             mute,
+            normalize,
+            fade_in,
+            fade_out,
             lossless,
             effort,
             progressive,
             strip_metadata,
+            speed,
+            direction,
             dry_run,
         } => {
             let options = ConvertOptions {
@@ -205,6 +257,10 @@ fn main() -> ExitCode {
                 fps,
                 rotate,
                 flip,
+                crop: crop.map(|aspect| Crop {
+                    aspect: Some(aspect),
+                    area: None,
+                }),
                 quality,
                 keep_audio: !mute,
                 jxl: JxlOptions {
@@ -212,7 +268,14 @@ fn main() -> ExitCode {
                     effort,
                     progressive,
                 },
+                sound: SoundOptions {
+                    normalize,
+                    fade_in,
+                    fade_out,
+                },
                 keep_metadata: !strip_metadata,
+                speed,
+                direction: direction.into(),
             };
             match convert(&file, &options, dry_run) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -259,6 +322,10 @@ mod tests {
             "1.5",
             "--size",
             "480",
+            "--speed",
+            "2",
+            "--direction",
+            "boomerang",
         ])
         .expect("parse");
         let Command::Convert {
@@ -266,6 +333,8 @@ mod tests {
             start,
             size,
             quality,
+            speed,
+            direction,
             ..
         } = cli.command
         else {
@@ -275,6 +344,29 @@ mod tests {
         assert_eq!(start, Some(1.5));
         assert_eq!(size, Some(480));
         assert_eq!(quality, 60);
+        assert!((speed - 2.0).abs() < f64::EPSILON);
+        assert_eq!(Direction::from(direction), Direction::Boomerang);
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "convert",
+            "a",
+            "--to",
+            "mp4",
+            "--crop",
+            "9:16",
+        ])
+        .expect("parse");
+        let Command::Convert { crop, .. } = cli.command else {
+            panic!("expected convert");
+        };
+        assert_eq!(crop, Some([9, 16]));
+        for bad in ["9x16", "0:1", "1:"] {
+            assert!(
+                Cli::try_parse_from(["catconvert", "convert", "a", "--to", "mp4", "--crop", bad])
+                    .is_err(),
+                "{bad}"
+            );
+        }
         assert!(
             Cli::try_parse_from([
                 "catconvert",

@@ -53,6 +53,10 @@ NAME_PREFIX="catconvert-"
 MACOS_MIN="11.0"
 # Encoders catconvert-core asks for (crates/core/src/convert.rs).
 REQUIRED_ENCODERS="libx264 libvpx-vp9 libopus libmp3lame libwebp libwebp_anim libsvtav1 libjxl libjxl_anim aac flac pcm_s16le gif apng png mjpeg"
+# Decoders and filters it relies on beyond the usual: HEIC photos are HEVC
+# tiles that ffmpeg stitches with xstack and crops and turns upright.
+REQUIRED_DECODERS="hevc"
+REQUIRED_FILTERS="xstack crop transpose"
 
 log() { printf '\n==> %s\n' "$*" >&2; }
 die() {
@@ -565,6 +569,17 @@ smoke_test() {
     printf '%s\n' "$encoders" | awk '{print $2}' | grep -qxF "$enc" || missing="$missing $enc"
   done
   [ -z "$missing" ] || die "ffmpeg lacks encoders the app needs:$missing"
+  local listed name
+  listed=$(${run[@]+"${run[@]}"} "$ffmpeg" -hide_banner -decoders | awk '{print $2}')
+  for name in $REQUIRED_DECODERS; do
+    printf '%s\n' "$listed" | grep -qxF "$name" || missing="$missing $name"
+  done
+  [ -z "$missing" ] || die "ffmpeg lacks decoders the app needs:$missing"
+  listed=$(${run[@]+"${run[@]}"} "$ffmpeg" -hide_banner -filters | awk '{print $2}')
+  for name in $REQUIRED_FILTERS; do
+    printf '%s\n' "$listed" | grep -qxF "$name" || missing="$missing $name"
+  done
+  [ -z "$missing" ] || die "ffmpeg lacks filters the app needs:$missing"
   ${run[@]+"${run[@]}"} "$dir/${NAME_PREFIX}ffprobe-$TARGET$EXE" -hide_banner -version >/dev/null
   ${run[@]+"${run[@]}"} "$dir/${NAME_PREFIX}cjxl-$TARGET$EXE" --version >/dev/null
   ${run[@]+"${run[@]}"} "$dir/${NAME_PREFIX}djxl-$TARGET$EXE" --version >/dev/null

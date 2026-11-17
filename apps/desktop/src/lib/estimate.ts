@@ -8,8 +8,16 @@
  * the UI calls it "about".
  */
 import type { ConvertOptions, MediaInfo } from "./api";
+import { pictureSize } from "./crop";
 import { formatBytes } from "./format";
-import { autoLimits, formatKind, isAnimatedImage, repacksJpeg, restoresJpeg } from "./formats";
+import {
+  autoLimits,
+  formatKind,
+  isAnimatedImage,
+  outputSeconds,
+  repacksJpeg,
+  restoresJpeg,
+} from "./formats";
 
 /** Same as `lerp` in convert.rs: quality 0–100 onto `worst..=best`, rounded. */
 function lerp(quality: number, worst: number, best: number): number {
@@ -54,13 +62,18 @@ function audioRate(info: MediaInfo, options: ConvertOptions, sourceRate: number 
   }
 }
 
-/** Picture size after downscaling, like `output_dims` (rotation doesn't change the area). */
-function outputPixels(info: MediaInfo, maxSize: number | null): number | null {
-  if (!info.width || !info.height) return null;
-  const short = Math.min(info.width, info.height);
-  const long = Math.max(info.width, info.height);
+/** Picture area after the crop and downscaling, like `output_dims`. */
+function outputPixels(
+  info: MediaInfo,
+  options: ConvertOptions,
+  maxSize: number | null,
+): number | null {
+  const size = pictureSize(info, options);
+  if (!size) return null;
+  const short = Math.min(size.width, size.height);
+  const long = Math.max(size.width, size.height);
   const target = maxSize === null ? null : Math.max(2, maxSize) & ~1;
-  if (target === null || target >= short) return info.width * info.height;
+  if (target === null || target >= short) return size.width * size.height;
   return target * Math.round((long * target) / short);
 }
 
@@ -151,7 +164,7 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
 
   if (out === "image") {
     // A picture, or one frame of a video.
-    const pixels = outputPixels(info, options.maxSize);
+    const pixels = outputPixels(info, options, options.maxSize);
     if (pixels === null) return null;
     let bpp = imageBpp(options);
     if (info.kind === "image") {
@@ -164,10 +177,9 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
     return (pixels * bpp) / 8;
   }
 
-  const start = options.trimStart ?? 0;
-  const end = options.trimEnd ?? info.durationSecs;
-  if (end === null) return null;
-  const seconds = Math.max(0, end - start);
+  // Animations play at their own speed, a boomerang twice.
+  const seconds = outputSeconds(info, options);
+  if (seconds === null) return null;
 
   if (out === "audio") {
     if (info.audioCodec === null) return null;
@@ -178,9 +190,11 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
   // Video, GIF or animated JPEG XL.
   const sourceAudio = info.audioCodec === null ? 0 : kbps(128);
   const limits = autoLimits(options.format, info.kind);
-  const pixels = outputPixels(info, options.maxSize ?? limits?.size ?? null);
+  const pixels = outputPixels(info, options, options.maxSize ?? limits?.size ?? null);
   if (pixels === null) return null;
-  const sourceFps = info.fps ?? 30;
+  // Speeding up packs more source frames into each second, until the cap.
+  const speed = isAnimatedImage(options.format, info.kind) ? options.speed : 1;
+  const sourceFps = (info.fps ?? 30) * speed;
   const fps = Math.min(sourceFps, options.fps ?? limits?.fps ?? sourceFps);
   const busy = complexity(info, sourceAudio);
   const frames = pixels * fps * seconds;

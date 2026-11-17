@@ -11,8 +11,8 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 > ship their own (with libjxl's tools), so there is nothing to install. Without
 > them, as in development, CatConvert uses an installed ffmpeg (found on `PATH`,
 > in Homebrew's folders, or via `CATCONVERT_FFMPEG`, which always wins).
-> You can drop files, trim, resize, rotate, mirror, change frame rate, quality and
-> format, drop the sound, and watch a serial queue with live progress. Step through
+> You can drop files, trim, crop (free or 1:1, 9:16, 16:9), resize, rotate, mirror,
+> change frame rate, quality and format, drop the sound, and watch a serial queue with live progress. Step through
 > a video frame by frame and save any frame as a PNG (←/→ and S). Results are
 > saved next to the original and never overwrite anything. HDR video, which
 > iPhones record by default, is tone-mapped when it becomes a picture or GIF.
@@ -95,6 +95,7 @@ mise run cli -- convert clip.mov --to gif --start 1 --end 4 --size 480
 mise run cli -- convert photo.jpg --to jxl --lossless             # repack JPEG, restorable
 mise run cli -- convert clip.mov --to jxl --size 480 --effort 9    # animated JPEG XL
 mise run cli -- convert clip.mov --to mp3            # pull the audio
+mise run cli -- convert clip.mov --to mp4 --crop 9:16 --size 1080  # vertical, centred
 mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print the ffmpeg command
 ```
 

@@ -1447,6 +1447,295 @@ code {
   color: #fff;
 }
 
+/* Crop. While cropping, the preview grows and makes room above and below the
+   picture for the shape bar and the tools, so no handle hides under them. */
+
+.preview.cropping {
+  aspect-ratio: 4 / 3;
+  padding: 60px 16px 66px;
+}
+
+.crop-layer {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  animation: fade-in 200ms ease both;
+}
+
+.crop-layer.settle {
+  animation-delay: 380ms;
+}
+
+.preview.cropping .crop-layer {
+  top: calc(50% - 3px);
+}
+
+.crop-layer.editing {
+  pointer-events: auto;
+  touch-action: none;
+}
+
+/* Darkens what the crop cuts off, clipped to the picture. */
+.crop-shade {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: 6px;
+}
+
+.crop-hole {
+  position: absolute;
+  box-shadow: 0 0 0 100vmax rgb(59 34 38 / 0.62);
+  transition: box-shadow 200ms ease;
+}
+
+.crop-layer.editing .crop-hole {
+  box-shadow: 0 0 0 100vmax rgb(59 34 38 / 0.45);
+}
+
+.crop-frame {
+  position: absolute;
+  display: block;
+  padding: 0;
+  border: 1.5px solid rgb(255 255 255 / 0.85);
+  border-radius: 2px;
+  background: none;
+  cursor: default;
+}
+
+.crop-layer.editing .crop-frame {
+  border-color: #fff;
+  box-shadow: 0 0 0 1px rgb(59 34 38 / 0.25);
+  cursor: move;
+}
+
+.crop-layer.editing .crop-frame:focus-visible {
+  outline: 3px solid var(--accent-soft);
+  outline-offset: 2px;
+}
+
+.crop-grid {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(
+      to right,
+      transparent calc(33.33% - 0.5px),
+      rgb(255 255 255 / 0.5) 0,
+      rgb(255 255 255 / 0.5) calc(33.33% + 0.5px),
+      transparent 0,
+      transparent calc(66.67% - 0.5px),
+      rgb(255 255 255 / 0.5) 0,
+      rgb(255 255 255 / 0.5) calc(66.67% + 0.5px),
+      transparent 0
+    ),
+    linear-gradient(
+      to bottom,
+      transparent calc(33.33% - 0.5px),
+      rgb(255 255 255 / 0.5) 0,
+      rgb(255 255 255 / 0.5) calc(33.33% + 0.5px),
+      transparent 0,
+      transparent calc(66.67% - 0.5px),
+      rgb(255 255 255 / 0.5) 0,
+      rgb(255 255 255 / 0.5) calc(66.67% + 0.5px),
+      transparent 0
+    );
+  opacity: 0;
+  transition: opacity 160ms ease;
+  pointer-events: none;
+}
+
+.crop-layer.dragging .crop-grid {
+  opacity: 1;
+}
+
+/* L-shaped corner grips with a generous invisible hit area. */
+.crop-handle {
+  position: absolute;
+  width: 30px;
+  height: 30px;
+  z-index: 2;
+}
+
+.crop-handle::after {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border: 0 solid #fff;
+  filter: drop-shadow(0 1px 2px rgb(59 34 38 / 0.45));
+}
+
+.crop-handle.nw {
+  top: -12px;
+  left: -12px;
+  cursor: nwse-resize;
+}
+
+.crop-handle.ne {
+  top: -12px;
+  right: -12px;
+  cursor: nesw-resize;
+}
+
+.crop-handle.sw {
+  bottom: -12px;
+  left: -12px;
+  cursor: nesw-resize;
+}
+
+.crop-handle.se {
+  right: -12px;
+  bottom: -12px;
+  cursor: nwse-resize;
+}
+
+.crop-handle.nw::after {
+  top: 9px;
+  left: 9px;
+  border-top-width: 4px;
+  border-left-width: 4px;
+  border-top-left-radius: 4px;
+}
+
+.crop-handle.ne::after {
+  top: 9px;
+  right: 9px;
+  border-top-width: 4px;
+  border-right-width: 4px;
+  border-top-right-radius: 4px;
+}
+
+.crop-handle.sw::after {
+  bottom: 9px;
+  left: 9px;
+  border-bottom-width: 4px;
+  border-left-width: 4px;
+  border-bottom-left-radius: 4px;
+}
+
+.crop-handle.se::after {
+  right: 9px;
+  bottom: 9px;
+  border-right-width: 4px;
+  border-bottom-width: 4px;
+  border-bottom-right-radius: 4px;
+}
+
+.crop-bar {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100% - 24px);
+  margin: 0;
+  padding: 4px;
+  border: 0;
+  border-radius: 16px;
+  background: rgb(255 255 255 / 0.94);
+  box-shadow: var(--shadow-lift);
+  transform: translateX(-50%);
+  animation: crop-bar-in 320ms var(--spring) both;
+  z-index: 3;
+}
+
+@keyframes crop-bar-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -8px);
+  }
+}
+
+.crop-chip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 12px;
+  background: none;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 800;
+  white-space: nowrap;
+  transition:
+    background 160ms ease,
+    color 160ms ease,
+    transform 260ms var(--spring);
+}
+
+.crop-chip:not(:disabled):hover {
+  background: var(--sunken);
+}
+
+.crop-chip:not(:disabled):active {
+  transform: scale(0.94);
+}
+
+.crop-chip[aria-pressed="true"] {
+  background: var(--accent);
+  color: #fff;
+  animation: chip-pop 380ms var(--spring);
+}
+
+.crop-chip.plain {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.crop-chip:disabled {
+  opacity: 0.45;
+}
+
+.crop-chip.done {
+  width: 32px;
+  padding: 0;
+  justify-content: center;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.crop-chip.done:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.crop-bar-gap {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--line);
+}
+
+/* A tiny outline of each shape. */
+.aspect-glyph {
+  height: 13px;
+  max-width: 16px;
+  border: 1.75px solid currentColor;
+  border-radius: 3px;
+}
+
+.aspect-glyph.free {
+  width: 13px;
+  border-style: dashed;
+}
+
+@media (max-width: 420px) {
+  .crop-chip {
+    padding: 0 7px;
+  }
+
+  .aspect-glyph {
+    display: none;
+  }
+}
+
 .audio-art {
   position: relative;
   display: grid;
@@ -1573,6 +1862,26 @@ code {
 
 .trim-shade.right {
   border-radius: 0 12px 12px 0;
+}
+
+.trim-fades {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.fade-shade {
+  fill: rgb(255 246 243 / 0.62);
+}
+
+.fade-line {
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
 }
 
 .trim-range {
@@ -1865,6 +2174,16 @@ button.format-chip:not(:disabled):active {
   font-variant-numeric: tabular-nums;
 }
 
+/* Playback (animations) */
+
+.playback .format-group {
+  grid-template-columns: 82px minmax(0, 1fr);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
 /* JPEG XL */
 
 .jxl-settings {
@@ -1883,6 +2202,33 @@ button.format-chip:not(:disabled):active {
 
 .jxl-settings .item-meta {
   display: block;
+}
+
+/* Sound */
+
+.sound-settings {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+  border-radius: 16px;
+  background: var(--yellow-bg);
+}
+
+.sound-settings .format-chips {
+  --tone-bg: var(--surface);
+  --tone-ink: var(--yellow-ink);
+}
+
+.sound-settings .item-meta {
+  display: block;
+}
+
+.sound-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--yellow-ink);
 }
 
 /* Toggle */

@@ -420,7 +420,11 @@ export async function convertDraft() {
 export async function convertAll() {
   const draft = state.draft;
   if (!draft) return;
-  const options = { ...draft.options, jxl: { ...draft.options.jxl } };
+  const options = {
+    ...draft.options,
+    jxl: { ...draft.options.jxl },
+    sound: { ...draft.options.sound },
+  };
   const paths = [...state.inbox];
   try {
     addJob(await api.startJob(draft.info.path, options), options);
