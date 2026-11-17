@@ -15,6 +15,13 @@
 //! asset protocol. Its scope starts empty: [`playback_source`] adds each file
 //! as it is played, so the webview can't read anything else.
 //!
+//! Results go where the conversion's [`catconvert_core::Destination`] says:
+//! next to the original, into the output folder chosen in Settings, or in
+//! the original's place. The webview never writes files itself (there is no
+//! fs plugin), so the output folder needs no file-system scope: the core
+//! writes there, [`prepare_output_folder`] creates and checks it, and
+//! playback and "Show in folder" work per file as above.
+//!
 //! Files can also come in from outside the window ("Open with", the Finder
 //! Quick Action, "Send to"); see [`incoming`] and [`quick_action`].
 
@@ -28,6 +35,9 @@ use catconvert_core::{
     ConvertOptions, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, OutputFormat,
     QualitySummary, Queue, SavedFrame, SequenceOptions, VideoCodec,
 };
+
+/// Folder in Downloads suggested when "Save to a folder" is first chosen.
+const OUTPUT_FOLDER_NAME: &str = "CatConvert";
 use serde::Serialize;
 use tauri::ipc::Response;
 use tauri::path::BaseDirectory;
@@ -334,8 +344,13 @@ fn preview_plan(
     match state.queue() {
         Ok(queue) => queue.preview(info, options),
         Err(_) => {
-            let output = catconvert_core::output_path(&info.path, options.format, |_| false);
-            catconvert_core::plan(info, options, &output, JxlSupport::default())
+            let target = catconvert_core::output_target(
+                &info.path,
+                options.format,
+                &options.destination,
+                |_| false,
+            )?;
+            catconvert_core::plan(info, options, &target.written, JxlSupport::default())
         }
     }
 }
@@ -399,8 +414,10 @@ fn preview_sequence_command(
     sequence: SequenceOptions,
 ) -> Result<String, String> {
     let support = state.ffmpeg().map(|f| f.support()).unwrap_or_default();
-    let output = catconvert_core::sequence_output_path(&pictures, options.format, |_| false);
-    catconvert_core::plan_sequence(&pictures, &options, &sequence, &output, support)
+    catconvert_core::sequence_target(&pictures, options.format, &options.destination, |_| false)
+        .and_then(|target| {
+            catconvert_core::plan_sequence(&pictures, &options, &sequence, &target.written, support)
+        })
         .map(|plan| plan.command_line())
         .map_err(|err| err.to_string())
 }
@@ -452,6 +469,39 @@ async fn missing_files(paths: Vec<String>) -> Result<Vec<String>, String> {
     })
     .await
     .map_err(|err| err.to_string())
+}
+
+/// Where Settings suggests saving converted files: `CatConvert` in the
+/// Downloads folder (or the home folder, if there is no Downloads).
+#[tauri::command]
+fn default_output_folder(app: AppHandle) -> Result<PathBuf, String> {
+    let path = app.path();
+    path.download_dir()
+        .or_else(|_| path.home_dir())
+        .map(|dir| dir.join(OUTPUT_FOLDER_NAME))
+        .map_err(|err| err.to_string())
+}
+
+/// Create the output folder chosen in Settings if need be and check that
+/// files can be written there. Returns the folder.
+#[tauri::command]
+async fn prepare_output_folder(path: String) -> Result<PathBuf, String> {
+    tauri::async_runtime::spawn_blocking(move || check_output_folder(Path::new(&path)))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn check_output_folder(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("{} isn't a full path", path.display()));
+    }
+    std::fs::create_dir_all(path)
+        .map_err(|err| format!("couldn't create {}: {err}", path.display()))?;
+    let probe = path.join(".catconvert-write-test");
+    std::fs::write(&probe, b"")
+        .map_err(|err| format!("can't save files in {}: {err}", path.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(path.to_path_buf())
 }
 
 /// Files opened from outside the app before the front end was listening.
@@ -543,6 +593,8 @@ pub fn run() {
             cancel_job,
             relaunch,
             missing_files,
+            default_output_folder,
+            prepare_output_folder,
             third_party_licenses,
             take_opened_files,
             quick_action_status,
@@ -561,4 +613,23 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             let _ = (app, event);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_folders_are_created_and_checked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let folder = dir.path().join("Converted").join("Nested");
+        assert_eq!(check_output_folder(&folder), Ok(folder.clone()));
+        assert!(folder.is_dir());
+        assert!(!folder.join(".catconvert-write-test").exists());
+
+        assert!(check_output_folder(Path::new("relative")).is_err());
+        let file = dir.path().join("a file");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(check_output_folder(&file).is_err());
+    }
 }

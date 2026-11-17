@@ -40,7 +40,13 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
   becomes a picture or GIF.
 - **Privacy:** remove location data and keep the rest of the metadata.
 - **Size estimate** before you convert, and a serial queue with live progress.
-  Results are saved next to the original and never overwrite anything.
+- **Your choice of where files go** (Settings, or per conversion in the
+  editor): next to the original under a free name (the default, which never
+  overwrites anything), into one folder (optionally sorted into Videos,
+  Pictures and Audio), or in place of the original. Replacing writes a hidden
+  file first and only moves the original to the Trash once that file is
+  finished; a failed or cancelled conversion leaves the original untouched.
+  Animations made from several pictures are never allowed to replace them.
 - **Works from other apps:** photos, videos and songs offer CatConvert under
   "Open With" (plus "Send to" on Windows), macOS can add a "Convert with
   CatConvert" Finder Quick Action, and finished files drag straight out of the

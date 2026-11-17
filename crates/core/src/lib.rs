@@ -21,9 +21,13 @@
 //!
 //! Several pictures can also become one animation: [`plan_sequence`] plans
 //! it and [`Queue::submit_sequence`] runs it.
+//!
+//! Results go next to the original, into a folder, or in the original's
+//! place ([`Destination`], chosen in [`ConvertOptions::destination`]).
 
 mod convert;
 mod custom;
+mod destination;
 mod error;
 mod ffmpeg;
 mod job;
@@ -40,6 +44,9 @@ pub use convert::{
 };
 pub use custom::{
     INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER, command_template, custom_plan, fill_command,
+};
+pub use destination::{
+    Destination, Replaced, Target, frame_target, output_target, sequence_target,
 };
 pub use error::{Error, Result};
 pub use ffmpeg::{BUNDLED_PREFIX, FFMPEG_ENV, FFPROBE_ENV, Ffmpeg, RunOutcome, RunProgress};

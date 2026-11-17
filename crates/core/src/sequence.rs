@@ -421,7 +421,7 @@ pub fn sequence_output_path(
 /// The shared start of the pictures' names, without trailing numbers and
 /// separators, if at least two letters or digits remain; otherwise the
 /// folder's name, or `animation`.
-fn sequence_name(inputs: &[MediaInfo]) -> String {
+pub(crate) fn sequence_name(inputs: &[MediaInfo]) -> String {
     let stems: Vec<String> = inputs
         .iter()
         .map(|info| {

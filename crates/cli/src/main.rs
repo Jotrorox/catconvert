@@ -510,6 +510,8 @@ fn main() -> ExitCode {
                 },
                 speed,
                 direction: direction.into(),
+                // The command line always writes next to the original.
+                destination: catconvert_core::Destination::NextToInput,
             };
             report(convert(&file, &options, dry_run))
         }

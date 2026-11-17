@@ -14,6 +14,7 @@ import {
 import { CatPeek } from "../components/Cat";
 import { CodecField } from "../components/CodecField";
 import { CropOverlay } from "../components/CropOverlay";
+import { DestinationField } from "../components/DestinationField";
 import { Icon } from "../components/Icon";
 import { QualityField } from "../components/QualityField";
 import { TrimBar } from "../components/TrimBar";
@@ -56,6 +57,7 @@ import {
   describeStreams,
   FADE_CHOICES,
   fadeSpans,
+  folderName,
   formatKind,
   fpsChoices,
   groupsFor,
@@ -70,6 +72,7 @@ import {
   outputHasSound,
   outputSeconds,
   repacksJpeg,
+  replacesOriginal,
   restoresJpeg,
   SPEEDS,
   shortSide,
@@ -100,6 +103,7 @@ import {
   saveFrame,
   saveRecipe,
   setCustomCommand,
+  setDraftDestination,
   skipDraft,
   state,
   updateOptions,
@@ -126,6 +130,19 @@ function outputName(info: MediaInfo, options: ConvertOptions): string {
   const name = info.fileName;
   const dot = name.lastIndexOf(".");
   return `${dot > 0 ? name.slice(0, dot) : name}.${options.format}`;
+}
+
+/** What an edited command must write, for the hint under it. */
+function outputHint(info: MediaInfo, options: ConvertOptions): string {
+  const name = outputName(info, options);
+  const destination = options.destination;
+  if (destination?.kind === "folder") {
+    return `The output stays ${name} in ${folderName(destination.path)}.`;
+  }
+  if (replacesOriginal(options)) {
+    return `The output is written to a hidden file first, then becomes ${name} in place of the original.`;
+  }
+  return `The output stays ${name} next to the original.`;
 }
 
 /** Waiting screen while a file is being probed. */
@@ -1468,7 +1485,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 </For>
               </ul>
             </Show>
-            <p class="item-meta">Saved next to the original.</p>
+            <DestinationField
+              destination={options().destination}
+              allowReplace={true}
+              onChoose={(choice) => void setDraftDestination(choice)}
+            />
           </div>
 
           <Show
@@ -1562,8 +1583,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 )}
               </Show>
               <p id="command-hint" class="item-meta">
-                Runs ffmpeg, cjxl and djxl directly, never through a shell. The output stays{" "}
-                {outputName(info(), options())} next to the original.
+                Runs ffmpeg, cjxl and djxl directly, never through a shell.{" "}
+                {outputHint(info(), options())}
               </p>
               <div class="command-actions">
                 <button type="button" class="link-btn" onClick={resetCommand}>

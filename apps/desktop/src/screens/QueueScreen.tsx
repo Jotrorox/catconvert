@@ -108,6 +108,10 @@ const ActiveJob: Component<{ job: JobEntry; compact: boolean }> = (props) => {
           </Show>
           <span class="hero-out" title={props.job.output}>
             into <b>{baseName(props.job.output)}</b>
+            <Show when={props.job.replaces}>
+              {" "}
+              <span class="replace-badge inline">replacing the original</span>
+            </Show>
           </span>
           <button
             type="button"
@@ -182,7 +186,13 @@ export const QueueScreen: Component<{ compact: boolean }> = (props) => {
                   </span>
                   <div class="item-main">
                     <span class="item-name">{job.name}</span>
-                    <span class="item-meta">{route(job)} · Waiting</span>
+                    <span class="item-meta">
+                      {route(job)} · Waiting
+                      <Show when={job.replaces}>
+                        {" "}
+                        <span class="replace-badge inline">Replaces original</span>
+                      </Show>
+                    </span>
                   </div>
                   <button
                     type="button"
@@ -230,6 +240,10 @@ export const QueueScreen: Component<{ compact: boolean }> = (props) => {
                       <Show when={job.stage === "done"}>
                         {route(job)} · {formatBytes(inputBytes(job))} →{" "}
                         {formatBytes(job.outputBytes ?? 0)}
+                        <Show when={job.replaces}>
+                          {" "}
+                          <span class="replace-badge inline">Replaced original</span>
+                        </Show>
                       </Show>
                       <Show when={job.stage === "failed"}>
                         {job.error ?? "Something went wrong."}

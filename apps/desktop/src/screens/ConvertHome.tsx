@@ -121,6 +121,19 @@ export const RecentRow: Component<{ item: HistoryItem; actions?: boolean }> = (p
             {props.item.recipe ? ` · ${props.item.recipe}` : ""} ·{" "}
             {formatBytes(props.item.inputBytes)} → {formatBytes(props.item.outputBytes)} ·{" "}
             {missing() ? "Moved or deleted" : formatWhen(props.item.finishedAt)}
+            <Show when={props.item.replaced}>
+              {" "}
+              <span
+                class="replace-badge inline"
+                title={
+                  props.item.keptAs
+                    ? `The original was kept as ${baseName(props.item.keptAs)}`
+                    : "The original went to the Trash"
+                }
+              >
+                Replaced original
+              </span>
+            </Show>
           </span>
         </div>
         <Show when={formatKind(props.item.format, props.item.kind) === "audio"}>
