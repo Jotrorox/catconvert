@@ -445,6 +445,11 @@ export type Recipe = {
   options: Partial<ConvertOptions> & { format: OutputFormat };
   /** Input kinds the recipe works for. */
   accepts: readonly MediaKind[];
+  /**
+   * A command edited by hand, with placeholders for the paths, run instead
+   * of the generated one for files that keep the recipe's format.
+   */
+  command?: string;
 };
 
 export const RECIPES: readonly Recipe[] = [
@@ -594,6 +599,7 @@ export function recipeFrom(
   title: string,
   info: MediaInfo,
   options: ConvertOptions,
+  command: string | null = null,
 ): Recipe {
   const out = formatKind(options.format, info.kind);
   const accepts: MediaKind[] = out === "audio" ? ["video", "audio"] : [info.kind];
@@ -603,11 +609,12 @@ export function recipeFrom(
     id,
     title,
     custom: true,
-    detail: recipeDetail(info, { ...options, crop }),
+    detail: command === null ? recipeDetail(info, { ...options, crop }) : "Custom command",
     route: `${accepts.length > 1 ? "ANY" : KIND_WORD[info.kind]} → ${label(options.format)}`,
     tone: KIND_TONE[out],
     options: { ...kept, crop, jxl: { ...kept.jxl }, sound: { ...kept.sound } },
     accepts,
+    ...(command === null ? {} : { command }),
   };
 }
 

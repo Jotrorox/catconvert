@@ -4,6 +4,7 @@ import App from "./App";
 import type { ConvertOptions, FfmpegStatus, MediaInfo, OutputFormat } from "./lib/api";
 import * as api from "./lib/api";
 import { applyProgress, navigate, openPaths, resetStore, state } from "./lib/store";
+import { FakeAudio, installFakeAudio } from "./test/audio";
 
 vi.mock("./lib/api", () => ({
   inTauri: false,
@@ -12,6 +13,8 @@ vi.mock("./lib/api", () => ({
   probeFile: vi.fn(),
   previewFrame: vi.fn(async () => "blob:frame"),
   waveform: vi.fn(async () => "blob:wave"),
+  playbackUrl: vi.fn(async (path: string) => `asset://localhost${path}`),
+  loudness: vi.fn(async () => -22),
   previewCommand: vi.fn(async () => "ffmpeg -i clip.mov clip.mp4"),
   // The core's numbers for H.264 with AAC: CRF 34 → 18, AAC 96/128/192 kbps.
   qualitySummary: vi.fn(async (info: MediaInfo, options: ConvertOptions) => {
@@ -27,6 +30,10 @@ vi.mock("./lib/api", () => ({
   }),
   previewSequenceCommand: vi.fn(async () => "ffmpeg -f concat -i list.txt cat.gif"),
   saveFrame: vi.fn(),
+  checkCommand: vi.fn(async (_info: unknown, _options: unknown, text: string) => text),
+  fillCommand: vi.fn(),
+  commandTemplate: vi.fn(),
+  startCustomJob: vi.fn(),
   startJob: vi.fn(),
   startSequence: vi.fn(),
   cancelJob: vi.fn(async () => true),
@@ -146,6 +153,7 @@ beforeEach(() => {
   localStorage.clear();
   resetStore();
   vi.clearAllMocks();
+  installFakeAudio();
   vi.mocked(api.ffmpegStatus).mockResolvedValue(status());
   vi.mocked(api.quickActionStatus).mockResolvedValue({ supported: false, installed: false });
   vi.mocked(api.probeFile).mockImplementation(async (path) =>
@@ -168,6 +176,16 @@ beforeEach(() => {
 function ffmpegFound() {
   return waitFor(() => expect(state.ffmpeg?.found).toBe(true));
 }
+
+async function openSong() {
+  render(() => <App />);
+  await ffmpegFound();
+  openPaths([SONG.path]);
+  return screen.findByRole("heading", { name: "purr.wav" });
+}
+
+/** Let the player load (microtasks and resolved promises). */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 async function openVideo() {
   render(() => <App />);
@@ -683,6 +701,118 @@ describe("CatConvert", () => {
     expect(screen.getByRole("slider", { name: "Trim end" })).toBeInTheDocument();
   });
 
+  it("plays a song, just the kept part or on a loop, with Space as the shortcut", async () => {
+    await openSong();
+    const play = screen.getByRole("button", { name: "Play" });
+    expect(play).toHaveAttribute("aria-keyshortcuts", "Space");
+    fireEvent.click(play);
+    await settle();
+    expect(api.playbackUrl).toHaveBeenCalledWith(SONG.path, false);
+    expect(FakeAudio.playing()?.src).toBe("asset://localhost/music/purr.wav");
+    expect(screen.getByRole("button", { name: "Pause" })).toBeInTheDocument();
+    expect(screen.getByText("/ 1:00.0")).toBeInTheDocument();
+
+    // Space pauses, unless it is pressing a focused button.
+    fireEvent.keyDown(screen.getByRole("button", { name: "Pause" }), { key: " " });
+    expect(screen.getByRole("button", { name: "Pause" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: " " });
+    expect(screen.getByRole("button", { name: "Play" })).toBeInTheDocument();
+    expect(FakeAudio.playing()).toBeUndefined();
+
+    // Shift+Space plays the selection from where it starts.
+    fireEvent.keyDown(screen.getByRole("slider", { name: "Trim start" }), { key: "End" });
+    fireEvent.click(screen.getByRole("button", { name: "Loop" }));
+    expect(screen.getByRole("button", { name: "Loop" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.keyDown(window, { key: " ", shiftKey: true });
+    await settle();
+    const selection = screen.getByRole("button", { name: "Play selection" });
+    expect(selection).toHaveAttribute("aria-pressed", "true");
+    expect(FakeAudio.playing()?.currentTime).toBeCloseTo(41.9, 1);
+
+    // Seeking with the playhead slider.
+    fireEvent.click(selection);
+    const playhead = screen.getByRole("slider", { name: "Playback position" });
+    fireEvent.keyDown(playhead, { key: "Home" });
+    fireEvent.keyDown(playhead, { key: "ArrowRight", shiftKey: true });
+    expect(playhead).toHaveAttribute("aria-valuenow", "5");
+  });
+
+  it("lets you hear even loudness and fades before converting", async () => {
+    await openSong();
+    expect(screen.queryByText(/as the copy will/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: "Even out loudness" }));
+    expect(screen.getByText("You hear the even loudness as the copy will.")).toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole("group", { name: "Fade in" })).getByRole("button", { name: "1 s" }),
+    );
+    expect(
+      screen.getByText("You hear the fades and even loudness as the copy will."),
+    ).toBeInTheDocument();
+
+    // Loudness is measured once, when first heard.
+    expect(api.loudness).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await settle();
+    expect(api.loudness).toHaveBeenCalledTimes(1);
+    expect(api.loudness).toHaveBeenCalledWith(SONG.path);
+  });
+
+  it("says when a file can't be played and stops playing on leaving the editor", async () => {
+    vi.mocked(api.playbackUrl).mockRejectedValueOnce("ffmpeg was not found");
+    await openSong();
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("ffmpeg was not found");
+
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await settle();
+    expect(FakeAudio.playing()).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(FakeAudio.playing()).toBeUndefined();
+  });
+
+  it("plays the sound of a video, with the picture following when paused", async () => {
+    await openVideo();
+    fireEvent.click(screen.getByRole("button", { name: "Play" }));
+    await settle();
+    // The preview opened at 1 s, so the sound starts there.
+    const audio = FakeAudio.playing() as FakeAudio;
+    expect(audio.src).toBe("asset://localhost/clips/clip.mov");
+    expect(audio.currentTime).toBe(1);
+    audio.currentTime = 7;
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    expect(screen.getByText("0:07.0", { selector: ".frame-time" })).toBeInTheDocument();
+  });
+
+  it("plays finished sound files from the Queue and History", async () => {
+    await openSong();
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    applyProgress({
+      jobId: 7,
+      stage: "done",
+      progress: 1,
+      speed: null,
+      outputBytes: 9,
+      error: null,
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Play purr.mp3" }));
+    await settle();
+    expect(api.playbackUrl).toHaveBeenCalledWith("/music/purr.mp3", false);
+    expect(screen.getByRole("button", { name: "Pause purr.mp3" })).toBeInTheDocument();
+    expect(screen.getByText("0:00 / 1:00")).toBeInTheDocument();
+
+    // Leaving the screen stops it; History has its own button.
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    expect(FakeAudio.playing()).toBeUndefined();
+    fireEvent.click(await screen.findByRole("button", { name: "Play purr.mp3" }));
+    await settle();
+    expect(FakeAudio.playing()?.src).toBe("asset://localhost/music/purr.mp3");
+  });
+
   it("checks for an update, installs it and restarts", async () => {
     vi.mocked(api.checkForUpdate).mockResolvedValue({
       version: "0.2.0",
@@ -895,6 +1025,179 @@ describe("CatConvert", () => {
       "/clips/b.mov",
       expect.objectContaining({ format: "webm", trimStart: null }),
     );
+  });
+
+  describe("editing the command", () => {
+    const GENERATED = "ffmpeg -i /clips/clip.mov -c:v libx264 -crf 24 /clips/clip.mp4";
+
+    beforeEach(() => {
+      vi.mocked(api.previewCommand).mockResolvedValue(GENERATED);
+      vi.mocked(api.checkCommand).mockImplementation(async (_info, _options, text) => {
+        if (!text.startsWith("ffmpeg ")) {
+          throw `${text.split(" ")[0]} isn't a tool CatConvert runs. Commands can use ffmpeg, cjxl, djxl and catconvert scrub.`;
+        }
+        if (text.includes(VIDEO.path.replace(".mov", ".mp4")) === false) {
+          throw "This command would write over the original, clip.mov. CatConvert never does that.";
+        }
+        return text;
+      });
+      vi.mocked(api.startCustomJob).mockImplementation(async (path, _options, text) => ({
+        id: 11,
+        output: path.replace(/\.\w+$/, ".mp4"),
+        inputs: [VIDEO],
+        command: text,
+      }));
+    });
+
+    async function editCommand() {
+      await openVideo();
+      fireEvent.click(screen.getByText("Show command"));
+      await screen.findByText(GENERATED);
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      const field = screen.getByRole("textbox", { name: "Command" });
+      expect(field).toHaveValue(GENERATED);
+      return field;
+    }
+
+    it("checks an edited command as it's typed and queues it as written", async () => {
+      const field = await editCommand();
+      // The settings stand aside while the edited command applies.
+      expect(screen.getByText(/these settings no longer apply/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "WEBM" })).toBeDisabled();
+      expect(screen.queryByRole("button", { name: "Rotate 90°" })).not.toBeInTheDocument();
+      // The trim is the command's now, but the sound can still be played.
+      fireEvent.keyDown(screen.getByRole("slider", { name: "Trim start" }), {
+        key: "ArrowRight",
+        shiftKey: true,
+      });
+      expect(state.draft?.options.trimStart).toBeNull();
+      expect(screen.getByRole("button", { name: "Play" })).toBeEnabled();
+      const changes = within(screen.getByRole("list", { name: "Changes" }));
+      expect(changes.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+        "Custom command",
+      ]);
+
+      fireEvent.input(field, { target: { value: "rm -rf /" } });
+      expect(await screen.findByRole("alert")).toHaveTextContent("rm isn't a tool CatConvert runs");
+      expect(field).toHaveAttribute("aria-invalid", "true");
+      expect(screen.getByRole("button", { name: /Start converting/ })).toBeDisabled();
+
+      fireEvent.input(field, {
+        target: { value: GENERATED.replace("/clips/clip.mp4", VIDEO.path) },
+      });
+      expect(await screen.findByText(/would write over the original/)).toBeInTheDocument();
+
+      const edited = GENERATED.replace("-crf 24", "-crf 18");
+      fireEvent.input(field, { target: { value: edited } });
+      await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+      const start = screen.getByRole("button", { name: /Start converting/ });
+      expect(start).toBeEnabled();
+      fireEvent.click(start);
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startCustomJob).toHaveBeenCalledWith(
+        VIDEO.path,
+        expect.objectContaining({ format: "mp4" }),
+        edited,
+      );
+      expect(api.startJob).not.toHaveBeenCalled();
+
+      // Progress shows in the queue as for any job, and a retry runs the same command.
+      applyProgress({
+        jobId: 11,
+        stage: "running",
+        progress: 0.3,
+        speed: null,
+        outputBytes: null,
+        error: null,
+      });
+      expect(await screen.findByRole("progressbar")).toHaveAttribute("aria-valuenow", "30");
+      applyProgress({
+        jobId: 11,
+        stage: "failed",
+        progress: 0.3,
+        speed: null,
+        outputBytes: null,
+        error: "Unknown encoder",
+      });
+      fireEvent.click(await screen.findByRole("button", { name: /Retry/ }));
+      await waitFor(() => expect(api.startCustomJob).toHaveBeenCalledTimes(2));
+      expect(api.startCustomJob).toHaveBeenLastCalledWith(VIDEO.path, expect.anything(), edited);
+    });
+
+    it("goes back to the generated command", async () => {
+      const field = await editCommand();
+      fireEvent.input(field, { target: { value: `${GENERATED} -tune film` } });
+      fireEvent.click(screen.getAllByRole("button", { name: /Reset to generated/ })[0] as Element);
+      expect(screen.queryByRole("textbox", { name: "Command" })).not.toBeInTheDocument();
+      expect(screen.getByText(GENERATED)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "WEBM" })).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startJob).toHaveBeenCalledTimes(1);
+      expect(api.startCustomJob).not.toHaveBeenCalled();
+    });
+
+    it("saves an edited command in a recipe and fills it in for other files", async () => {
+      const template = "ffmpeg -i '{input}' -c:v libx264 -crf 18 '{output}'";
+      vi.mocked(api.commandTemplate).mockResolvedValue(template);
+      vi.mocked(api.fillCommand).mockImplementation(async (info, _options, saved) =>
+        saved.replace("'{input}'", info.path).replace("'{output}'", "/clips/other.mp4"),
+      );
+      const field = await editCommand();
+      const edited = GENERATED.replace("-crf 24", "-crf 18");
+      fireEvent.input(field, { target: { value: edited } });
+      fireEvent.click(screen.getByRole("button", { name: /Save these settings as a recipe/ }));
+      expect(screen.getByText(/Keeps the edited command as written/)).toBeInTheDocument();
+      fireEvent.input(screen.getByRole("textbox", { name: "Recipe name" }), {
+        target: { value: "Crisp" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await screen.findByText("Saved “Crisp” to your recipes");
+      expect(api.commandTemplate).toHaveBeenCalledWith(VIDEO.path, edited);
+      const [saved] = JSON.parse(localStorage.getItem("catconvert.recipes.v1") ?? "[]");
+      expect(saved).toMatchObject({ title: "Crisp", detail: "Custom command", command: template });
+
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Recipes" }));
+      vi.mocked(api.pickFiles).mockResolvedValue(["/clips/other.mov"]);
+      fireEvent.click(screen.getByRole("button", { name: /^Crisp/ }));
+      await screen.findByRole("heading", { name: "other.mov" });
+      expect(await screen.findByRole("textbox", { name: "Command" })).toHaveValue(
+        "ffmpeg -i /clips/other.mov -c:v libx264 -crf 18 /clips/other.mp4",
+      );
+    });
+
+    it("runs an edited command for every waiting file, with each file's paths", async () => {
+      const template = "ffmpeg -i '{input}' -crf 18 '{output}'";
+      vi.mocked(api.commandTemplate).mockResolvedValue(template);
+      render(() => <App />);
+      await ffmpegFound();
+      openPaths(["/clips/a.mov", "/clips/b.mov", SONG.path]);
+      await screen.findByRole("heading", { name: "a.mov" });
+      fireEvent.click(screen.getByText("Show command"));
+      await screen.findByText(GENERATED);
+      fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+      const edited = GENERATED.replace("-crf 24", "-crf 18");
+      fireEvent.input(screen.getByRole("textbox", { name: "Command" }), {
+        target: { value: edited },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Convert all 3 like this/ }));
+      await screen.findByRole("heading", { name: "purr.wav" });
+      expect(api.startCustomJob).toHaveBeenCalledTimes(2);
+      expect(api.startCustomJob).toHaveBeenNthCalledWith(
+        1,
+        "/clips/a.mov",
+        expect.anything(),
+        edited,
+      );
+      expect(api.startCustomJob).toHaveBeenNthCalledWith(
+        2,
+        "/clips/b.mov",
+        expect.anything(),
+        template,
+      );
+      expect(api.startJob).not.toHaveBeenCalled();
+    });
   });
 
   describe("pictures → animation", () => {

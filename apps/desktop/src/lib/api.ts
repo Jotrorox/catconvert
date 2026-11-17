@@ -6,7 +6,7 @@
  * place. The types mirror the serde output of `catconvert-core` (camelCase).
  */
 import { getVersion } from "@tauri-apps/api/app";
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -284,8 +284,23 @@ type Commands = {
     args: { path: string; width: number; height: number; color: string };
     result: ArrayBuffer;
   };
+  playback_source: { args: { path: string; decode: boolean }; result: string };
+  loudness: { args: { path: string }; result: number | null };
   preview_command: { args: { info: MediaInfo; options: ConvertOptions }; result: string };
   quality_summary: { args: { info: MediaInfo; options: ConvertOptions }; result: QualitySummary };
+  check_command: {
+    args: { info: MediaInfo; options: ConvertOptions; command: string };
+    result: string;
+  };
+  fill_command: {
+    args: { info: MediaInfo; options: ConvertOptions; template: string };
+    result: string;
+  };
+  command_template: { args: { path: string; command: string }; result: string };
+  start_custom_job: {
+    args: { path: string; options: ConvertOptions; command: string };
+    result: JobTicket;
+  };
   save_frame: { args: { path: string; options: ConvertOptions; at: number }; result: SavedFrame };
   preview_sequence_command: {
     args: { pictures: MediaInfo[]; options: ConvertOptions; sequence: SequenceOptions };
@@ -399,6 +414,21 @@ export async function waveform(
   return blobUrl(await command("waveform", { path, width, height, color }), "image/png");
 }
 
+/**
+ * A URL an `<audio>` element can play `path` from (Tauri's asset protocol).
+ * With `decode`, the sound is first decoded to a temporary WAV file, for
+ * formats the webview can't play itself.
+ */
+export async function playbackUrl(path: string, decode = false): Promise<string> {
+  if (!inTauri) throw new Error("Open CatConvert as an app to play files.");
+  return convertFileSrc(await command("playback_source", { path, decode }));
+}
+
+/** Integrated loudness of the sound in LUFS, or `null` when it is silent. */
+export function loudness(path: string): Promise<number | null> {
+  return command("loudness", { path });
+}
+
 /** The command(s) a conversion would run. */
 export function previewCommand(info: MediaInfo, options: ConvertOptions): Promise<string> {
   return command("preview_command", { info, options });
@@ -412,6 +442,46 @@ export function qualitySummary(info: MediaInfo, options: ConvertOptions): Promis
 /** Queue a conversion; progress arrives via {@link onJobProgress}. */
 export function startJob(path: string, options: ConvertOptions): Promise<JobTicket> {
   return command("start_job", { path, options });
+}
+
+/**
+ * Check a hand-edited command without running it. Resolves to the command as
+ * it would run; rejects with why it would be refused (another program, a
+ * shell feature, writing anywhere but the output, …).
+ */
+export function checkCommand(
+  info: MediaInfo,
+  options: ConvertOptions,
+  text: string,
+): Promise<string> {
+  return command("check_command", { info, options, command: text });
+}
+
+/** A recipe's saved command (see {@link commandTemplate}) with this file's paths filled in. */
+export function fillCommand(
+  info: MediaInfo,
+  options: ConvertOptions,
+  template: string,
+): Promise<string> {
+  return command("fill_command", { info, options, template });
+}
+
+/** An edited command with the paths of the file at `path` swapped for placeholders. */
+export function commandTemplate(path: string, text: string): Promise<string> {
+  return command("command_template", { path, command: text });
+}
+
+/**
+ * Queue a conversion running `text`, a command edited by hand (or a template from
+ * {@link commandTemplate}), instead of the generated one. `options` still pick
+ * the output name. Rejects, without queueing, if the command is refused.
+ */
+export function startCustomJob(
+  path: string,
+  options: ConvertOptions,
+  text: string,
+): Promise<JobTicket> {
+  return command("start_custom_job", { path, options, command: text });
 }
 
 /** The command(s) making one animation from `pictures` would run. */

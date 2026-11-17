@@ -11,6 +11,10 @@
 //! (see `tauri.media-tools.conf.json`); without them the app falls back to an
 //! installed ffmpeg.
 //!
+//! The editor, Queue and History play sound straight from disk through the
+//! asset protocol. Its scope starts empty: [`playback_source`] adds each file
+//! as it is played, so the webview can't read anything else.
+//!
 //! Files can also come in from outside the window ("Open with", the Finder
 //! Quick Action, "Send to"); see [`incoming`] and [`quick_action`].
 
@@ -248,6 +252,40 @@ async fn waveform(
     Ok(Response::new(bytes))
 }
 
+/// Let the webview play `path` through the asset protocol and return the file
+/// to load: `path` itself, or with `decode` a WAV copy of its sound for
+/// formats the webview can't play (see [`Ffmpeg::listenable`]).
+#[tauri::command]
+async fn playback_source(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    decode: bool,
+) -> Result<PathBuf, String> {
+    let source = if decode {
+        let ffmpeg = state.queue()?.ffmpeg().clone();
+        blocking(move || ffmpeg.listenable(path.as_ref())).await?
+    } else {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(format!("{} is no longer there", path.display()));
+        }
+        path
+    };
+    app.asset_protocol_scope()
+        .allow_file(&source)
+        .map_err(|err| err.to_string())?;
+    Ok(source)
+}
+
+/// Integrated loudness of the sound in LUFS (`None` if silent), so the
+/// editor can preview loudness normalisation.
+#[tauri::command]
+async fn loudness(state: State<'_, AppState>, path: String) -> Result<Option<f64>, String> {
+    let ffmpeg = state.queue()?.ffmpeg().clone();
+    blocking(move || ffmpeg.loudness(path.as_ref())).await
+}
+
 /// The command(s) a conversion would run, for the "show command" panel.
 #[tauri::command]
 fn preview_command(
@@ -255,9 +293,7 @@ fn preview_command(
     info: MediaInfo,
     options: ConvertOptions,
 ) -> Result<String, String> {
-    let support = state.ffmpeg().map(|f| f.support()).unwrap_or_default();
-    let output = catconvert_core::output_path(&info.path, options.format, |_| false);
-    catconvert_core::plan(&info, &options, &output, support)
+    preview_plan(&state, &info, &options)
         .map(|plan| plan.command_line())
         .map_err(|err| err.to_string())
 }
@@ -267,6 +303,72 @@ fn preview_command(
 #[tauri::command]
 fn quality_summary(info: MediaInfo, options: ConvertOptions) -> QualitySummary {
     catconvert_core::quality_summary(&info, &options)
+}
+
+/// The plan a conversion of `info` with `options` would run, for previews.
+/// The output name skips names queued jobs will write, as submitting does.
+fn preview_plan(
+    state: &AppState,
+    info: &MediaInfo,
+    options: &ConvertOptions,
+) -> Result<catconvert_core::Plan, Error> {
+    match state.queue() {
+        Ok(queue) => queue.preview(info, options),
+        Err(_) => {
+            let output = catconvert_core::output_path(&info.path, options.format, |_| false);
+            catconvert_core::plan(info, options, &output, JxlSupport::default())
+        }
+    }
+}
+
+/// Check a command edited in the editor without running it. Returns the
+/// command as it would run (with a recipe's placeholders filled in), or why
+/// it would be refused.
+#[tauri::command]
+fn check_command(
+    state: State<'_, AppState>,
+    info: MediaInfo,
+    options: ConvertOptions,
+    command: String,
+) -> Result<String, String> {
+    let support = state.ffmpeg().map(|f| f.support()).unwrap_or_default();
+    preview_plan(&state, &info, &options)
+        .and_then(|plan| catconvert_core::custom_plan(&info, &plan, &command, support))
+        .map(|plan| plan.command_line())
+        .map_err(|err| err.to_string())
+}
+
+/// A recipe's saved command with this file's paths filled in, for the editor.
+#[tauri::command]
+fn fill_command(
+    state: State<'_, AppState>,
+    info: MediaInfo,
+    options: ConvertOptions,
+    template: String,
+) -> Result<String, String> {
+    preview_plan(&state, &info, &options)
+        .and_then(|plan| catconvert_core::fill_command(&template, &info.path, &plan.output))
+        .map_err(|err| err.to_string())
+}
+
+/// An edited command with the file's paths swapped for placeholders, to save
+/// in a recipe or run for other files.
+#[tauri::command]
+fn command_template(path: String, command: String) -> Result<String, String> {
+    catconvert_core::command_template(Path::new(&path), &command).map_err(|err| err.to_string())
+}
+
+/// Queue a conversion running `command`, edited by hand, instead of the
+/// generated one. Refused commands come back as an error, unqueued.
+#[tauri::command]
+async fn start_custom_job(
+    state: State<'_, AppState>,
+    path: String,
+    options: ConvertOptions,
+    command: String,
+) -> Result<JobTicket, String> {
+    let queue = state.queue()?;
+    blocking(move || queue.submit_custom(&path, &options, &command)).await
 }
 
 /// The command(s) making one animation from `pictures` would run.
@@ -407,8 +509,14 @@ pub fn run() {
             probe_file,
             preview_frame,
             waveform,
+            playback_source,
+            loudness,
             preview_command,
             quality_summary,
+            check_command,
+            fill_command,
+            command_template,
+            start_custom_job,
             save_frame,
             preview_sequence_command,
             start_job,

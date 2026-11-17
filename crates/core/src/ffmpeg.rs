@@ -47,6 +47,8 @@ pub struct Ffmpeg {
     jxl: Arc<JxlTools>,
     /// JPEG XL files djxl decoded for previews, when ffmpeg can't read them.
     decoded: Arc<Mutex<DecodeCache>>,
+    /// Sound decoded to WAV for playback, when the webview can't play a file.
+    listenable: Arc<Mutex<DecodeCache>>,
 }
 
 /// One progress sample while a conversion runs.
@@ -174,7 +176,9 @@ impl Ffmpeg {
             decoders: Arc::new(decoders),
             tone_map,
             jxl: Arc::new(jxl),
-            decoded: Arc::default(),
+            decoded: Arc::new(Mutex::new(DecodeCache::new(4))),
+            // WAV files are large; keep just the current file and the last one.
+            listenable: Arc::new(Mutex::new(DecodeCache::new(2))),
         })
     }
 
@@ -541,6 +545,70 @@ impl Ffmpeg {
         capture(&mut cmd, &self.ffmpeg)
     }
 
+    /// The first audio track of `input` as a 16-bit WAV file that every
+    /// webview can play, for previewing sound it can't decode itself (WMA,
+    /// AIFF and Opus in some webviews, a video's AC-3 track, …). Surround
+    /// sound is mixed down to stereo.
+    ///
+    /// The file lives in a private temp folder that disappears with the last
+    /// clone of [`Ffmpeg`]. The last two are kept, so playing a file again
+    /// doesn't decode it again unless it changed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Ffmpeg`] if the file has no sound or cannot be decoded,
+    /// [`Error::Io`] if the temp folder cannot be created.
+    pub fn listenable(&self, input: &Path) -> Result<PathBuf> {
+        let stamp = FileStamp::of(input)?;
+        let mut cache = self
+            .listenable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = cache.get(input, &stamp).filter(|hit| hit.is_file()) {
+            return Ok(hit);
+        }
+        let wav = cache.dir()?.join(format!("{}.wav", cache.next_id()));
+        let mut cmd = base_command(&self.ffmpeg);
+        cmd.args(["-hide_banner", "-nostdin", "-v", "error", "-i"])
+            .arg(input)
+            .args(["-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "-1"])
+            .args(["-af", "aformat=channel_layouts=mono|stereo"])
+            // RF64 past 4 GiB, which plain WAV can't address (hours of sound).
+            .args(["-c:a", "pcm_s16le", "-rf64", "auto", "-f", "wav", "-y"])
+            .arg(&wav);
+        if let Err(err) = capture(&mut cmd, &self.ffmpeg) {
+            let _ = std::fs::remove_file(&wav);
+            return Err(err);
+        }
+        cache.insert(input.to_path_buf(), stamp, wav.clone());
+        Ok(wav)
+    }
+
+    /// Integrated loudness of the first audio track in LUFS (EBU R 128), or
+    /// `None` when it is silent. The editor uses it to let you hear what
+    /// [`crate::SoundOptions::normalize`] will do before converting.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Ffmpeg`] if the file has no sound or cannot be decoded.
+    pub fn loudness(&self, input: &Path) -> Result<Option<f64>> {
+        let mut cmd = base_command(&self.ffmpeg);
+        // The summary is logged at the info level.
+        cmd.args(["-hide_banner", "-nostdin", "-nostats", "-v", "info", "-i"])
+            .arg(input)
+            .args(["-map", "0:a:0", "-vn", "-sn", "-dn"])
+            .args(["-af", "ebur128=framelog=quiet", "-f", "null", "-"]);
+        let output = cmd.output().map_err(|source| Error::Spawn {
+            program: self.ffmpeg.clone(),
+            source,
+        })?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        check_status(Tool::Ffmpeg, output.status, &stderr)?;
+        parse_integrated_loudness(&stderr).ok_or_else(|| Error::Ffmpeg {
+            message: "ffmpeg reported no loudness".into(),
+        })
+    }
+
     /// Run a planned conversion to completion, reporting progress.
     ///
     /// Raising `cancel` stops the running step within a fraction of a second.
@@ -779,15 +847,24 @@ impl FileStamp {
 
 /// The last few JPEG XL files djxl decoded for previews, in a private temp
 /// folder that disappears with the last clone of [`Ffmpeg`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DecodeCache {
     dir: Option<tempfile::TempDir>,
     entries: Vec<(PathBuf, FileStamp, PathBuf)>,
     counter: u64,
+    /// How many decoded files to keep.
+    capacity: usize,
 }
 
 impl DecodeCache {
-    const CAPACITY: usize = 4;
+    fn new(capacity: usize) -> Self {
+        Self {
+            dir: None,
+            entries: Vec::new(),
+            counter: 0,
+            capacity: capacity.max(1),
+        }
+    }
 
     fn get(&self, source: &Path, stamp: &FileStamp) -> Option<PathBuf> {
         self.entries
@@ -827,7 +904,7 @@ impl DecodeCache {
             }
             keep
         });
-        if self.entries.len() >= Self::CAPACITY {
+        if self.entries.len() >= self.capacity {
             let (_, _, old) = self.entries.remove(0);
             let _ = std::fs::remove_file(old);
         }
@@ -1281,6 +1358,27 @@ impl ProgressParser {
     }
 }
 
+/// The integrated loudness from the summary `ebur128` logs at the end:
+///
+/// ```text
+///   Integrated loudness:
+///     I:         -31.8 LUFS
+/// ```
+///
+/// `Some(None)` for silence, which ebur128 reports as -70 LUFS (its floor).
+fn parse_integrated_loudness(log: &str) -> Option<Option<f64>> {
+    let summary = &log[log.rfind("Integrated loudness:")?..];
+    let value: f64 = summary
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("I:"))?
+        .trim()
+        .strip_suffix("LUFS")?
+        .trim()
+        .parse()
+        .ok()?;
+    Some((value.is_finite() && value > -69.5).then_some(value))
+}
+
 fn even(n: u32) -> u32 {
     (n.max(2)) & !1
 }
@@ -1648,6 +1746,74 @@ mod tests {
         assert_eq!(format_secs(0.0), "0");
         assert_eq!(format_secs(1.23456), "1.235");
         assert_eq!(format_secs(-4.0), "0");
+    }
+
+    #[test]
+    fn reads_integrated_loudness_from_the_ebur128_summary() {
+        let log = "[Parsed_ebur128_0 @ 0x1] t: 2.9   M: -31.8 S: -31.8     I: -31.8 LUFS\n\
+                   [Parsed_ebur128_0 @ 0x1] Summary:\n\n  Integrated loudness:\n    \
+                   I:         -18.4 LUFS\n    Threshold: -28.4 LUFS\n";
+        assert_eq!(parse_integrated_loudness(log), Some(Some(-18.4)));
+        let silent = "  Integrated loudness:\n    I:         -70.0 LUFS\n";
+        assert_eq!(parse_integrated_loudness(silent), Some(None));
+        assert_eq!(parse_integrated_loudness("no summary"), None);
+    }
+
+    /// Real ffmpeg: decoding for playback and measuring loudness. Skipped
+    /// (passes) when ffmpeg is not installed.
+    #[test]
+    fn decodes_sound_for_playback_and_measures_it() {
+        let Ok(ffmpeg) = Ffmpeg::locate() else {
+            eprintln!("ffmpeg not found; skipping playback test");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let input = dir.path().join("tone.aiff");
+        let status = base_command(ffmpeg.ffmpeg_path())
+            .args(["-v", "error", "-f", "lavfi", "-i", "sine=f=440:d=2"])
+            .args(["-af", "volume=-10dB,pan=5.1|FL=c0|FR=c0"])
+            .arg(&input)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+
+        let wav = ffmpeg.listenable(&input).expect("decode");
+        let bytes = std::fs::read(&wav).expect("read wav");
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        let info = ffmpeg.probe(&wav).expect("probe wav");
+        assert_eq!(info.audio_codec.as_deref(), Some("pcm_s16le"));
+        assert!((info.duration_secs.unwrap_or(0.0) - 2.0).abs() < 0.1);
+        assert_eq!(
+            ffmpeg.listenable(&input).expect("cached"),
+            wav,
+            "decoded once"
+        );
+
+        let lufs = ffmpeg
+            .loudness(&input)
+            .expect("measure")
+            .expect("not silent");
+        assert!((-40.0..-10.0).contains(&lufs), "{lufs} LUFS");
+
+        let silence = dir.path().join("silence.wav");
+        let status = base_command(ffmpeg.ffmpeg_path())
+            .args(["-v", "error", "-f", "lavfi", "-i", "anullsrc=d=1"])
+            .arg(&silence)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+        assert_eq!(ffmpeg.loudness(&silence).expect("measure"), None);
+
+        let picture = dir.path().join("still.png");
+        let status = base_command(ffmpeg.ffmpeg_path())
+            .args(["-v", "error", "-f", "lavfi", "-i", "color=s=16x16:d=1"])
+            .args(["-frames:v", "1"])
+            .arg(&picture)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+        assert!(ffmpeg.listenable(&picture).is_err(), "no sound to play");
     }
 
     #[test]

@@ -2,10 +2,11 @@ import { type Component, For, onMount, Show } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
 import { Brand } from "../components/Navigation";
+import { PlayButton } from "../components/PlayButton";
 import { RecipeGrid } from "../components/RecipeGrid";
 import { dragIcon, startDragOnMove } from "../lib/drag";
 import { baseName, formatBytes, formatWhen } from "../lib/format";
-import { KIND_TONE, label } from "../lib/formats";
+import { formatKind, KIND_TONE, label } from "../lib/formats";
 import {
   checkHistory,
   chooseFiles,
@@ -53,6 +54,14 @@ export const RecentRow: Component<{ item: HistoryItem }> = (props) => {
           {missing() ? "Moved or deleted" : formatWhen(props.item.finishedAt)}
         </span>
       </div>
+      <Show when={formatKind(props.item.format, props.item.kind) === "audio"}>
+        <PlayButton
+          path={props.item.output}
+          name={baseName(props.item.output)}
+          format={props.item.format}
+          disabled={missing()}
+        />
+      </Show>
       <button
         type="button"
         class="icon-btn plain"

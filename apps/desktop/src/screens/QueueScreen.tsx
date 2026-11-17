@@ -1,9 +1,10 @@
 import { type Component, createMemo, For, Show } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
+import { PlayButton } from "../components/PlayButton";
 import { dragIcon, startDragOnMove } from "../lib/drag";
 import { baseName, formatBytes, formatClock } from "../lib/format";
-import { label, playbackOrder } from "../lib/formats";
+import { formatKind, label, playbackOrder } from "../lib/formats";
 import {
   cancelJob,
   chooseFiles,
@@ -237,6 +238,18 @@ export const QueueScreen: Component<{ compact: boolean }> = (props) => {
                     </span>
                   </div>
                   <div class="row-actions">
+                    <Show
+                      when={
+                        job.stage === "done" &&
+                        formatKind(job.options.format, job.input.kind) === "audio"
+                      }
+                    >
+                      <PlayButton
+                        path={job.output}
+                        name={baseName(job.output)}
+                        format={job.options.format}
+                      />
+                    </Show>
                     <Show when={job.stage === "done"}>
                       <button
                         type="button"

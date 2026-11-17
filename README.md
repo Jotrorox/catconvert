@@ -25,6 +25,10 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 - **JPEG XL**, still and animated: lossless or lossy, an effort setting and
   progressive files. Unedited JPEGs are repacked losslessly and can be restored
   bit for bit.
+- **Listen first:** play a song or a video's sound in the editor (Space), seek
+  on the waveform, play just the part you keep (Shift+Space) or loop it, and hear
+  the fades and even loudness before converting. Finished songs play from the
+  Queue and History.
 - **Frame by frame:** step through a video and save any frame as a PNG
   (←/→ and S). HDR video, which iPhones record by default, is tone-mapped when it
   becomes a picture or GIF.
@@ -36,6 +40,9 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
   CatConvert" Finder Quick Action, and finished files drag straight out of the
   Queue and History.
 - **Batch and recipes:** convert many files at once with saved settings.
+- **Edit the command:** tweak the ffmpeg (or libjxl) arguments by hand before
+  converting, and keep the edit in a recipe. It runs without a shell, only
+  with CatConvert's tools, and still writes only the chosen output.
 - **Auto-updates** from GitHub Releases, signed with the updater key.
 
 Conversion runs through `ffmpeg`/`ffprobe` and libjxl's tools. Release builds
