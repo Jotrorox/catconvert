@@ -395,8 +395,13 @@ let nextToast = 1;
 // Navigation and toasts
 // ---------------------------------------------------------------------------
 
+/**
+ * Show `screen`. The Convert tab leads back to the editor while it holds
+ * something: the home screen would hide the open file, and files dropped
+ * there would quietly wait behind it.
+ */
 export function navigate(screen: Screen) {
-  setState("screen", screen);
+  setState("screen", screen === "convert" && editorHolds() ? "edit" : screen);
 }
 
 export function toast(message: string, options: Partial<Omit<Toast, "id" | "message">> = {}) {
@@ -712,13 +717,24 @@ export function openPaths(paths: string[]) {
     return;
   }
   setState("inbox", (inbox) => [...inbox, ...fresh]);
-  if (busyEditing() || state.choice) toast(`${fresh.length} more waiting their turn`);
-  else void openNext();
+  if (editorHolds()) {
+    toast(
+      `${fresh.length} more waiting their turn`,
+      state.screen === "edit"
+        ? {}
+        : { action: { label: "Open editor", run: () => navigate("edit") } },
+    );
+  } else void openNext();
 }
 
 /** Whether the editor already holds something. */
 function busyEditing(): boolean {
   return state.draft !== null || state.sequence !== null || state.opening !== null;
+}
+
+/** Whether the editor holds something or is asking what to do with dropped pictures. */
+function editorHolds(): boolean {
+  return busyEditing() || state.choice !== null;
 }
 
 /** "Convert each": the dropped pictures wait their turn like any other files. */
@@ -1658,7 +1674,7 @@ export async function convertAgain(id: string, recipeId: RecipeId | null = null)
   const item = state.history.find((i) => i.id === id);
   const stored = item?.options;
   if (!item?.inputs?.length || !stored) return;
-  if (busyEditing() || state.choice) {
+  if (editorHolds()) {
     toast("Finish what's open in the editor first", {
       tone: "error",
       action: { label: "Open editor", run: () => navigate("edit") },
