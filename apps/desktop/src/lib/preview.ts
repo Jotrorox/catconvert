@@ -111,10 +111,13 @@ export function createFilmstrip(
   return frames;
 }
 
-/** The waveform of `path`'s audio, drawn in `color`. */
+/**
+ * The waveform of `path`'s audio, drawn in `color()` (`#rrggbb`). A new colour
+ * (the theme changed) redraws it, keeping the old picture until the new one is in.
+ */
 export function createWaveform(
   path: Accessor<string | null>,
-  color: string,
+  color: Accessor<string>,
   width = 1200,
   height = 160,
 ): Accessor<string | null> {
@@ -124,11 +127,11 @@ export function createWaveform(
     generation++;
   });
   createEffect(
-    on(path, (p) => {
+    on([path, color], ([p, c], previous) => {
       const mine = ++generation;
-      setUrl(null);
+      if (p !== previous?.[0]) setUrl(null);
       if (!p) return;
-      api.waveform(p, width, height, color).then(
+      api.waveform(p, width, height, c).then(
         (next) => {
           if (mine === generation) setUrl(next);
           else URL.revokeObjectURL(next);

@@ -1,5 +1,7 @@
 :root {
-  color-scheme: light;
+  /* Every colour lives in this block and the dark one below; the rest of the
+     file only uses the tokens (styles.test.ts checks). */
+  color-scheme: light dark;
 
   --bg: #fff6f3;
   --sidebar: #fbebe7;
@@ -13,6 +15,8 @@
   --accent-hover: #b53157;
   --accent-strong: #a62a50;
   --accent-soft: #fbd3dd;
+  /* Text and icons on the accent, and on a tag's ink (picked chips). */
+  --on-accent: #ffffff;
   --track: #e7e1e2;
 
   --pink-bg: #fde4e8;
@@ -25,8 +29,73 @@
   --lavender-ink: #3f46a3;
   --status: #3fa266;
 
+  --cat-fur: #ffffff;
+  --cat-line: var(--ink);
   --cat-pink: #f7b8c5;
   --cat-shadow: #fbdde3;
+  --logo-ink: #1d1a1b;
+  --logo-orange: #f9a24f;
+
+  /* See-through surfaces floating over content (tab bar, tool buttons, crop bar). */
+  --glass: rgb(255 255 255 / 0.92);
+  --hover-wash: rgb(255 255 255 / 0.55);
+  /* Veils over content: the drop overlay, trimmed-away and faded parts of a clip. */
+  --drop-veil: rgb(255 240 243 / 0.72);
+  --trim-veil: rgb(255 246 243 / 0.78);
+  --fade-veil: rgb(255 246 243 / 0.62);
+  --dropzone-glow: rgb(253 228 232 / 0.7);
+
+  /* Placeholders while pictures load, and the transparency checkerboard. */
+  --skeleton-from: #f7e2e7;
+  --skeleton-to: #fbeef0;
+  --sheen: rgb(255 255 255 / 0.6);
+  --checker-a: #f7eef0;
+  --checker-b: #fdf8f9;
+  --film-divider: rgb(255 255 255 / 0.5);
+
+  /* Toasts are dark in both themes. */
+  --toast-bg: #3b2226;
+  --toast-ink: #ffffff;
+  --toast-faint: rgb(255 255 255 / 0.6);
+  --toast-wash: rgb(255 255 255 / 0.14);
+  --toast-wash-strong: rgb(255 255 255 / 0.24);
+  --toast-warn: #ffc56b;
+
+  /* Pills over a picture or video, and the shade outside a crop. These sit on
+     media, so they stay dark with white marks in both themes. */
+  --scrim: rgb(59 34 38 / 0.72);
+  --scrim-strong: rgb(59 34 38 / 0.86);
+  --scrim-wash: rgb(255 255 255 / 0.2);
+  --on-scrim: #ffffff;
+  --crop-shade: rgb(59 34 38 / 0.62);
+  --crop-shade-editing: rgb(59 34 38 / 0.45);
+  --media-line: #ffffff;
+  --media-line-soft: rgb(255 255 255 / 0.85);
+  --media-grid: rgb(255 255 255 / 0.5);
+  --media-outline: rgb(59 34 38 / 0.25);
+  --media-shadow: rgb(59 34 38 / 0.45);
+  --stage: #000000;
+
+  /* Switch and slider knobs, and marks drawn on the accent. */
+  --knob: #ffffff;
+  --knob-shadow: rgb(0 0 0 / 0.15);
+  --grip: rgb(255 255 255 / 0.85);
+  --stripe: rgb(255 255 255 / 0.18);
+  /* Under the format tile shown while dragging a file out. */
+  --tile-shadow: rgb(90 30 45 / 0.3);
+
+  /* Glows and focus rings in the accent colour. */
+  --accent-glow: rgb(201 59 99 / 0.35);
+  --accent-glow-strong: rgb(201 59 99 / 0.55);
+  --accent-ring: rgb(201 59 99 / 0.12);
+  --accent-ring-strong: rgb(201 59 99 / 0.18);
+
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%233b2226' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+  --shadow-soft: 0 1px 3px rgb(150 60 80 / 0.08);
+  --shadow-lift: 0 6px 18px -6px rgb(150 60 80 / 0.25);
+  --shadow-float: 0 12px 32px -10px rgb(90 30 45 / 0.35);
+  --shadow-media: 0 4px 20px -8px rgb(59 34 38 / 0.35);
 
   --font-display: "Grandstander Variable", "Grandstander", ui-rounded, system-ui, sans-serif;
   --font-body: "Mali", ui-rounded, system-ui, sans-serif;
@@ -36,9 +105,6 @@
   --titlebar-inset: 0px;
 
   --radius-card: 22px;
-  --shadow-soft: 0 1px 3px rgb(150 60 80 / 0.08);
-  --shadow-lift: 0 6px 18px -6px rgb(150 60 80 / 0.25);
-  --shadow-float: 0 12px 32px -10px rgb(90 30 45 / 0.35);
 
   /* Motion: a gentle overshoot for things that pop, a soft settle for things that move. */
   --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
@@ -51,6 +117,195 @@
   background: var(--bg);
   -webkit-font-smoothing: antialiased;
 }
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+/* The dark theme: picked in Settings, or following the system unless Light is
+   picked there. Both blocks must stay identical (styles.test.ts checks).
+   Plum surfaces keep the warm pink look; the accent is softened so it doesn't
+   glow, and text on it turns dark. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #1c1216;
+  --sidebar: #170e12;
+  --surface: #2a1b21;
+  --sunken: #21151a;
+  --ink: #f7e8eb;
+  --muted: #b99ca3;
+  --line: #3d2a31;
+  --dash: #7d4a5c;
+  --accent: #ee7a9b;
+  --accent-hover: #f390ab;
+  --accent-strong: #f8a7be;
+  --accent-soft: #4f2433;
+  --on-accent: #2a0f19;
+  --track: #42303a;
+
+  --pink-bg: #4a2130;
+  --pink-ink: #ffa6c0;
+  --green-bg: #1b3624;
+  --green-ink: #8edba6;
+  --yellow-bg: #3c2d12;
+  --yellow-ink: #f2c979;
+  --lavender-bg: #272a4f;
+  --lavender-ink: #b8bcff;
+  --status: #5cc488;
+
+  --cat-fur: #f6e4e8;
+  --cat-line: #1c1216;
+  --cat-pink: #e88ea5;
+  --cat-shadow: #3a2129;
+  --logo-ink: #f7e8eb;
+  --logo-orange: #f9a24f;
+
+  --glass: rgb(42 27 33 / 0.92);
+  --hover-wash: rgb(255 255 255 / 0.06);
+  --drop-veil: rgb(28 18 22 / 0.72);
+  --trim-veil: rgb(28 18 22 / 0.78);
+  --fade-veil: rgb(28 18 22 / 0.62);
+  --dropzone-glow: rgb(79 36 51 / 0.55);
+
+  --skeleton-from: #33232a;
+  --skeleton-to: #3d2a32;
+  --sheen: rgb(255 255 255 / 0.07);
+  --checker-a: #2c1e24;
+  --checker-b: #34252b;
+  --film-divider: rgb(0 0 0 / 0.35);
+
+  --toast-bg: #3d2932;
+  --toast-ink: #fbeef1;
+  --toast-faint: rgb(251 238 241 / 0.6);
+  --toast-wash: rgb(255 255 255 / 0.1);
+  --toast-wash-strong: rgb(255 255 255 / 0.18);
+  --toast-warn: #ffc56b;
+
+  --scrim: rgb(18 10 13 / 0.72);
+  --scrim-strong: rgb(18 10 13 / 0.86);
+  --scrim-wash: rgb(255 255 255 / 0.16);
+  --on-scrim: #ffffff;
+  --crop-shade: rgb(12 6 9 / 0.7);
+  --crop-shade-editing: rgb(12 6 9 / 0.55);
+  --media-line: #ffffff;
+  --media-line-soft: rgb(255 255 255 / 0.85);
+  --media-grid: rgb(255 255 255 / 0.5);
+  --media-outline: rgb(0 0 0 / 0.35);
+  --media-shadow: rgb(0 0 0 / 0.55);
+  --stage: #000000;
+
+  --knob: #f6e4e8;
+  --knob-shadow: rgb(0 0 0 / 0.4);
+  --grip: rgb(42 15 25 / 0.7);
+  --stripe: rgb(0 0 0 / 0.12);
+  --tile-shadow: rgb(0 0 0 / 0.5);
+
+  --accent-glow: rgb(238 122 155 / 0.22);
+  --accent-glow-strong: rgb(238 122 155 / 0.3);
+  --accent-ring: rgb(238 122 155 / 0.2);
+  --accent-ring-strong: rgb(238 122 155 / 0.28);
+
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23f7e8eb' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+  /* Shadows barely show on dark, so cards also get a faint edge. */
+  --shadow-soft: 0 0 0 1px rgb(255 255 255 / 0.04), 0 1px 3px rgb(0 0 0 / 0.4);
+  --shadow-lift: 0 0 0 1px rgb(255 255 255 / 0.05), 0 6px 18px -6px rgb(0 0 0 / 0.6);
+  --shadow-float: 0 0 0 1px rgb(255 255 255 / 0.06), 0 12px 32px -10px rgb(0 0 0 / 0.7);
+  --shadow-media: 0 4px 20px -8px rgb(0 0 0 / 0.6);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --bg: #1c1216;
+    --sidebar: #170e12;
+    --surface: #2a1b21;
+    --sunken: #21151a;
+    --ink: #f7e8eb;
+    --muted: #b99ca3;
+    --line: #3d2a31;
+    --dash: #7d4a5c;
+    --accent: #ee7a9b;
+    --accent-hover: #f390ab;
+    --accent-strong: #f8a7be;
+    --accent-soft: #4f2433;
+    --on-accent: #2a0f19;
+    --track: #42303a;
+
+    --pink-bg: #4a2130;
+    --pink-ink: #ffa6c0;
+    --green-bg: #1b3624;
+    --green-ink: #8edba6;
+    --yellow-bg: #3c2d12;
+    --yellow-ink: #f2c979;
+    --lavender-bg: #272a4f;
+    --lavender-ink: #b8bcff;
+    --status: #5cc488;
+
+    --cat-fur: #f6e4e8;
+    --cat-line: #1c1216;
+    --cat-pink: #e88ea5;
+    --cat-shadow: #3a2129;
+    --logo-ink: #f7e8eb;
+    --logo-orange: #f9a24f;
+
+    --glass: rgb(42 27 33 / 0.92);
+    --hover-wash: rgb(255 255 255 / 0.06);
+    --drop-veil: rgb(28 18 22 / 0.72);
+    --trim-veil: rgb(28 18 22 / 0.78);
+    --fade-veil: rgb(28 18 22 / 0.62);
+    --dropzone-glow: rgb(79 36 51 / 0.55);
+
+    --skeleton-from: #33232a;
+    --skeleton-to: #3d2a32;
+    --sheen: rgb(255 255 255 / 0.07);
+    --checker-a: #2c1e24;
+    --checker-b: #34252b;
+    --film-divider: rgb(0 0 0 / 0.35);
+
+    --toast-bg: #3d2932;
+    --toast-ink: #fbeef1;
+    --toast-faint: rgb(251 238 241 / 0.6);
+    --toast-wash: rgb(255 255 255 / 0.1);
+    --toast-wash-strong: rgb(255 255 255 / 0.18);
+    --toast-warn: #ffc56b;
+
+    --scrim: rgb(18 10 13 / 0.72);
+    --scrim-strong: rgb(18 10 13 / 0.86);
+    --scrim-wash: rgb(255 255 255 / 0.16);
+    --on-scrim: #ffffff;
+    --crop-shade: rgb(12 6 9 / 0.7);
+    --crop-shade-editing: rgb(12 6 9 / 0.55);
+    --media-line: #ffffff;
+    --media-line-soft: rgb(255 255 255 / 0.85);
+    --media-grid: rgb(255 255 255 / 0.5);
+    --media-outline: rgb(0 0 0 / 0.35);
+    --media-shadow: rgb(0 0 0 / 0.55);
+    --stage: #000000;
+
+    --knob: #f6e4e8;
+    --knob-shadow: rgb(0 0 0 / 0.4);
+    --grip: rgb(42 15 25 / 0.7);
+    --stripe: rgb(0 0 0 / 0.12);
+    --tile-shadow: rgb(0 0 0 / 0.5);
+
+    --accent-glow: rgb(238 122 155 / 0.22);
+    --accent-glow-strong: rgb(238 122 155 / 0.3);
+    --accent-ring: rgb(238 122 155 / 0.2);
+    --accent-ring-strong: rgb(238 122 155 / 0.28);
+
+    --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23f7e8eb' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+
+    /* Shadows barely show on dark, so cards also get a faint edge. */
+    --shadow-soft: 0 0 0 1px rgb(255 255 255 / 0.04), 0 1px 3px rgb(0 0 0 / 0.4);
+    --shadow-lift: 0 0 0 1px rgb(255 255 255 / 0.05), 0 6px 18px -6px rgb(0 0 0 / 0.6);
+    --shadow-float: 0 0 0 1px rgb(255 255 255 / 0.06), 0 12px 32px -10px rgb(0 0 0 / 0.7);
+    --shadow-media: 0 4px 20px -8px rgb(0 0 0 / 0.6);
+  }
+}
+/* End of the colour tokens. */
 
 * {
   box-sizing: border-box;
@@ -118,7 +373,7 @@ code {
 .cat {
   display: block;
   overflow: visible;
-  color: var(--ink);
+  color: var(--cat-line);
 }
 
 .cat-eyes {
@@ -307,7 +562,7 @@ code {
 }
 
 .nav-item:hover {
-  background: rgb(255 255 255 / 0.55);
+  background: var(--hover-wash);
 }
 
 .nav-item:active {
@@ -337,7 +592,7 @@ code {
   padding: 0 6px;
   border-radius: 11px;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 12px;
   font-weight: 700;
   animation: pop-in 360ms var(--spring) both;
@@ -359,7 +614,7 @@ code {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   padding: 10px 8px calc(10px + env(safe-area-inset-bottom));
-  background: rgb(255 255 255 / 0.92);
+  background: var(--glass);
   border-top: 1px solid var(--line);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -402,7 +657,7 @@ code {
   padding: 0 5px;
   border-radius: 9px;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 11px;
   font-weight: 700;
 }
@@ -578,13 +833,13 @@ code {
 
 .btn-primary {
   background: var(--accent);
-  color: #fff;
-  box-shadow: 0 4px 12px -4px rgb(201 59 99 / 0.55);
+  color: var(--on-accent);
+  box-shadow: 0 4px 12px -4px var(--accent-glow-strong);
 }
 
 .btn-primary:not(:disabled):hover {
   background: var(--accent-hover);
-  box-shadow: 0 8px 18px -6px rgb(201 59 99 / 0.6);
+  box-shadow: 0 8px 18px -6px var(--accent-glow-strong);
 }
 
 .btn-primary svg {
@@ -762,8 +1017,8 @@ code {
   width: 100%;
   padding: 10px 10px 10px 16px;
   border-radius: 16px;
-  background: var(--ink);
-  color: #fff;
+  background: var(--toast-bg);
+  color: var(--toast-ink);
   font-size: 14px;
   box-shadow: var(--shadow-float);
   pointer-events: auto;
@@ -776,7 +1031,7 @@ code {
 }
 
 .toast[data-tone="error"] .toast-icon {
-  color: #ffc56b;
+  color: var(--toast-warn);
 }
 
 .toast-text {
@@ -788,25 +1043,25 @@ code {
   padding: 6px 12px;
   border: 0;
   border-radius: 10px;
-  background: rgb(255 255 255 / 0.14);
-  color: #fff;
+  background: var(--toast-wash);
+  color: var(--toast-ink);
   font-size: 13px;
   font-weight: 700;
 }
 
 .toast-action:hover {
-  background: rgb(255 255 255 / 0.24);
+  background: var(--toast-wash-strong);
 }
 
 .toast-close {
   width: 26px;
   height: 26px;
-  color: rgb(255 255 255 / 0.6);
+  color: var(--toast-faint);
 }
 
 .toast-close:hover {
-  background: rgb(255 255 255 / 0.12);
-  color: #fff;
+  background: var(--toast-wash);
+  color: var(--toast-ink);
 }
 
 @keyframes toast-in {
@@ -824,7 +1079,7 @@ code {
   z-index: 80;
   display: grid;
   place-items: center;
-  background: rgb(255 240 243 / 0.72);
+  background: var(--drop-veil);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   animation: fade-in 160ms ease both;
@@ -881,7 +1136,7 @@ code {
   border: 2.5px dashed var(--dash);
   border-radius: 28px;
   background:
-    radial-gradient(circle at 50% 0%, rgb(253 228 232 / 0.7), transparent 60%), var(--surface);
+    radial-gradient(circle at 50% 0%, var(--dropzone-glow), transparent 60%), var(--surface);
   text-align: center;
   transition:
     border-color 200ms ease,
@@ -904,7 +1159,7 @@ code {
   border-color: var(--accent);
   background-color: var(--pink-bg);
   transform: scale(1.015);
-  box-shadow: 0 16px 40px -18px rgb(201 59 99 / 0.45);
+  box-shadow: 0 16px 40px -18px var(--accent-glow-strong);
 }
 
 .dropzone.hover .dropzone-cat {
@@ -960,7 +1215,7 @@ code {
   padding: 0;
   border: 0;
   border-radius: 50%;
-  background: rgb(255 255 255 / 0.7);
+  background: var(--glass);
   color: var(--muted);
   opacity: 0;
   transition: opacity 160ms ease;
@@ -1274,7 +1529,7 @@ code {
   aspect-ratio: 16 / 10;
   border-radius: 24px;
   background:
-    repeating-conic-gradient(#f7eef0 0% 25%, #fdf8f9 0% 50%) 50% / 22px 22px,
+    repeating-conic-gradient(var(--checker-a) 0% 25%, var(--checker-b) 0% 50%) 50% / 22px 22px,
     var(--sunken);
   container-type: size;
 }
@@ -1283,7 +1538,7 @@ code {
   max-width: 100cqw;
   max-height: 100cqh;
   border-radius: 6px;
-  box-shadow: 0 4px 20px -8px rgb(59 34 38 / 0.35);
+  box-shadow: var(--shadow-media);
   transition: transform 520ms var(--spring);
   animation: fade-in 260ms ease both;
 }
@@ -1298,8 +1553,7 @@ code {
   position: absolute;
   inset: 0;
   background:
-    linear-gradient(100deg, transparent 30%, rgb(255 255 255 / 0.6) 50%, transparent 70%) 0 0 / 200%
-    100%;
+    linear-gradient(100deg, transparent 30%, var(--sheen) 50%, transparent 70%) 0 0 / 200% 100%;
   animation: shimmer 1.3s linear infinite;
 }
 
@@ -1321,8 +1575,8 @@ code {
   gap: 6px;
   padding: 5px 11px;
   border-radius: 999px;
-  background: rgb(59 34 38 / 0.72);
-  color: #fff;
+  background: var(--scrim);
+  color: var(--on-scrim);
   font-size: 12.5px;
   font-weight: 700;
   backdrop-filter: blur(6px);
@@ -1347,8 +1601,8 @@ code {
   padding: 0 4px;
   border: 0;
   border-radius: 999px;
-  background: rgb(59 34 38 / 0.72);
-  color: #fff;
+  background: var(--scrim);
+  color: var(--on-scrim);
   font-size: 12.5px;
   font-weight: 700;
   backdrop-filter: blur(6px);
@@ -1375,7 +1629,7 @@ code {
 }
 
 .frame-step:hover {
-  background: rgb(255 255 255 / 0.2);
+  background: var(--scrim-wash);
 }
 
 .frame-save {
@@ -1388,7 +1642,7 @@ code {
 
 .frame-save:not(:disabled):hover {
   transform: translateY(-2px);
-  background: rgb(59 34 38 / 0.86);
+  background: var(--scrim-strong);
 }
 
 .frame-save:not(:disabled):active {
@@ -1440,7 +1694,7 @@ code {
   padding: 0;
   border: 0;
   border-radius: 14px;
-  background: rgb(255 255 255 / 0.92);
+  background: var(--glass);
   box-shadow: var(--shadow-soft);
   transition:
     transform 260ms var(--spring),
@@ -1463,7 +1717,7 @@ code {
 
 .tool-btn[aria-pressed="true"] {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* Crop. While cropping, the preview grows and makes room above and below the
@@ -1506,27 +1760,27 @@ code {
 
 .crop-hole {
   position: absolute;
-  box-shadow: 0 0 0 100vmax rgb(59 34 38 / 0.62);
+  box-shadow: 0 0 0 100vmax var(--crop-shade);
   transition: box-shadow 200ms ease;
 }
 
 .crop-layer.editing .crop-hole {
-  box-shadow: 0 0 0 100vmax rgb(59 34 38 / 0.45);
+  box-shadow: 0 0 0 100vmax var(--crop-shade-editing);
 }
 
 .crop-frame {
   position: absolute;
   display: block;
   padding: 0;
-  border: 1.5px solid rgb(255 255 255 / 0.85);
+  border: 1.5px solid var(--media-line-soft);
   border-radius: 2px;
   background: none;
   cursor: default;
 }
 
 .crop-layer.editing .crop-frame {
-  border-color: #fff;
-  box-shadow: 0 0 0 1px rgb(59 34 38 / 0.25);
+  border-color: var(--media-line);
+  box-shadow: 0 0 0 1px var(--media-outline);
   cursor: move;
 }
 
@@ -1542,23 +1796,23 @@ code {
     linear-gradient(
       to right,
       transparent calc(33.33% - 0.5px),
-      rgb(255 255 255 / 0.5) 0,
-      rgb(255 255 255 / 0.5) calc(33.33% + 0.5px),
+      var(--media-grid) 0,
+      var(--media-grid) calc(33.33% + 0.5px),
       transparent 0,
       transparent calc(66.67% - 0.5px),
-      rgb(255 255 255 / 0.5) 0,
-      rgb(255 255 255 / 0.5) calc(66.67% + 0.5px),
+      var(--media-grid) 0,
+      var(--media-grid) calc(66.67% + 0.5px),
       transparent 0
     ),
     linear-gradient(
       to bottom,
       transparent calc(33.33% - 0.5px),
-      rgb(255 255 255 / 0.5) 0,
-      rgb(255 255 255 / 0.5) calc(33.33% + 0.5px),
+      var(--media-grid) 0,
+      var(--media-grid) calc(33.33% + 0.5px),
       transparent 0,
       transparent calc(66.67% - 0.5px),
-      rgb(255 255 255 / 0.5) 0,
-      rgb(255 255 255 / 0.5) calc(66.67% + 0.5px),
+      var(--media-grid) 0,
+      var(--media-grid) calc(66.67% + 0.5px),
       transparent 0
     );
   opacity: 0;
@@ -1583,8 +1837,8 @@ code {
   position: absolute;
   width: 16px;
   height: 16px;
-  border: 0 solid #fff;
-  filter: drop-shadow(0 1px 2px rgb(59 34 38 / 0.45));
+  border: 0 solid var(--media-line);
+  filter: drop-shadow(0 1px 2px var(--media-shadow));
 }
 
 .crop-handle.nw {
@@ -1655,7 +1909,7 @@ code {
   padding: 4px;
   border: 0;
   border-radius: 16px;
-  background: rgb(255 255 255 / 0.94);
+  background: var(--glass);
   box-shadow: var(--shadow-lift);
   transform: translateX(-50%);
   animation: crop-bar-in 320ms var(--spring) both;
@@ -1699,7 +1953,7 @@ code {
 
 .crop-chip[aria-pressed="true"] {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   animation: chip-pop 380ms var(--spring);
 }
 
@@ -1722,7 +1976,7 @@ code {
 
 .crop-chip.done:hover {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .crop-bar-gap {
@@ -1845,11 +2099,11 @@ code {
 .film-frame {
   flex: 1;
   min-width: 0;
-  background: linear-gradient(90deg, #f7e2e7, #fbeef0);
+  background: linear-gradient(90deg, var(--skeleton-from), var(--skeleton-to));
 }
 
 .film-frame + .film-frame {
-  border-left: 1px solid rgb(255 255 255 / 0.5);
+  border-left: 1px solid var(--film-divider);
 }
 
 .film-frame img {
@@ -1871,7 +2125,7 @@ code {
   position: absolute;
   top: 0;
   bottom: 0;
-  background: rgb(255 246 243 / 0.78);
+  background: var(--trim-veil);
   pointer-events: none;
 }
 
@@ -1892,7 +2146,7 @@ code {
 }
 
 .fade-shade {
-  fill: rgb(255 246 243 / 0.62);
+  fill: var(--fade-veil);
 }
 
 .fade-line {
@@ -1915,7 +2169,7 @@ code {
 
 .trim-track.dragging .trim-range {
   cursor: grabbing;
-  box-shadow: 0 0 0 4px rgb(201 59 99 / 0.18);
+  box-shadow: 0 0 0 4px var(--accent-ring-strong);
 }
 
 .trim-handle {
@@ -1929,7 +2183,7 @@ code {
   margin-left: -9px;
   border-radius: 8px;
   background: var(--accent);
-  box-shadow: 0 2px 6px rgb(201 59 99 / 0.35);
+  box-shadow: 0 2px 6px var(--accent-glow);
   transform: translateY(-50%);
   cursor: ew-resize;
   transition:
@@ -1951,7 +2205,7 @@ code {
 .trim-grip {
   width: 4px;
   height: 16px;
-  border-inline: 1.5px solid rgb(255 255 255 / 0.85);
+  border-inline: 1.5px solid var(--grip);
 }
 
 /* A line with a knob on top; the wider box is what you grab. */
@@ -2034,8 +2288,8 @@ code {
   border: 0;
   border-radius: 50%;
   background: var(--accent);
-  color: #fff;
-  box-shadow: 0 2px 6px rgb(201 59 99 / 0.35);
+  color: var(--on-accent);
+  box-shadow: 0 2px 6px var(--accent-glow);
   transition:
     background 160ms ease,
     transform 260ms var(--spring);
@@ -2176,14 +2430,14 @@ code {
 .select:focus {
   border-color: var(--accent);
   outline: none;
-  box-shadow: 0 0 0 4px rgb(201 59 99 / 0.12);
+  box-shadow: 0 0 0 4px var(--accent-ring);
 }
 
 .select {
   height: 46px;
   padding-right: 40px;
   border-radius: 14px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%233b2226' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-image: var(--chevron);
   background-position: right 14px center;
   background-repeat: no-repeat;
   appearance: none;
@@ -2255,7 +2509,7 @@ button.format-chip:not(:disabled):active {
 
 .format-chip[aria-pressed="true"] {
   background: var(--tone-ink);
-  color: #fff;
+  color: var(--on-accent);
   box-shadow: 0 4px 10px -4px var(--tone-ink);
   animation: chip-pop 380ms var(--spring);
 }
@@ -2291,12 +2545,12 @@ button.format-chip:not(:disabled):active {
 .range::-webkit-slider-thumb {
   width: 24px;
   height: 24px;
-  border: 3px solid #fff;
+  border: 3px solid var(--surface);
   border-radius: 50%;
   background: var(--accent);
   box-shadow:
     0 0 0 1px var(--accent),
-    0 2px 6px rgb(201 59 99 / 0.35);
+    0 2px 6px var(--accent-glow);
   appearance: none;
   -webkit-appearance: none;
   transition: transform 200ms var(--spring);
@@ -2309,7 +2563,7 @@ button.format-chip:not(:disabled):active {
 .range::-moz-range-thumb {
   width: 18px;
   height: 18px;
-  border: 3px solid #fff;
+  border: 3px solid var(--surface);
   border-radius: 50%;
   background: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
@@ -2484,6 +2738,19 @@ button.format-chip:not(:disabled):active {
   background: var(--yellow-bg);
 }
 
+.theme-field {
+  gap: 8px;
+}
+
+.theme-field .field-label {
+  margin-bottom: 0;
+}
+
+.theme-field .format-chips {
+  --tone-bg: var(--lavender-bg);
+  --tone-ink: var(--lavender-ink);
+}
+
 .sound-settings .format-chips {
   --tone-bg: var(--surface);
   --tone-ink: var(--yellow-ink);
@@ -2535,8 +2802,8 @@ button.format-chip:not(:disabled):active {
   width: 26px;
   height: 26px;
   border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 1px 2px rgb(0 0 0 / 0.15);
+  background: var(--knob);
+  box-shadow: 0 1px 2px var(--knob-shadow);
   content: "";
   transition: transform 320ms var(--spring);
 }
@@ -2634,7 +2901,7 @@ button.format-chip:not(:disabled):active {
 
 .output-name:focus-within {
   border-color: var(--accent);
-  box-shadow: 0 0 0 4px rgb(201 59 99 / 0.12);
+  box-shadow: 0 0 0 4px var(--accent-ring);
 }
 
 .output-name.invalid {
@@ -3062,8 +3329,7 @@ button.format-chip:not(:disabled):active {
   height: 100%;
   border-radius: 9px;
   background:
-    repeating-linear-gradient(-45deg, rgb(255 255 255 / 0.18) 0 10px, transparent 10px 20px),
-    var(--accent);
+    repeating-linear-gradient(-45deg, var(--stripe) 0 10px, transparent 10px 20px), var(--accent);
   background-size:
     28px 28px,
     auto;
@@ -3090,7 +3356,7 @@ button.format-chip:not(:disabled):active {
   border-radius: 50%;
   background: var(--surface);
   color: var(--accent);
-  box-shadow: 0 1px 4px rgb(0 0 0 / 0.18);
+  box-shadow: 0 1px 4px var(--knob-shadow);
   transform: translateY(-50%);
   animation: knead 1.1s ease-in-out infinite;
 }
@@ -3414,8 +3680,8 @@ button.format-chip:not(:disabled):active {
   width: min(100cqw, calc(100cqh * var(--ratio)));
   aspect-ratio: var(--ratio);
   border-radius: 6px;
-  background: #000;
-  box-shadow: 0 4px 20px -8px rgb(59 34 38 / 0.35);
+  background: var(--stage);
+  box-shadow: var(--shadow-media);
   transition: transform 520ms var(--spring);
 }
 
@@ -3491,7 +3757,7 @@ button.format-chip:not(:disabled):active {
   display: block;
   width: 100%;
   height: 100%;
-  background: linear-gradient(90deg, #f7e2e7, #fbeef0);
+  background: linear-gradient(90deg, var(--skeleton-from), var(--skeleton-to));
 }
 
 .picture-number {
@@ -3501,7 +3767,7 @@ button.format-chip:not(:disabled):active {
   min-width: 20px;
   padding: 1px 6px;
   border-radius: 999px;
-  background: rgb(255 255 255 / 0.92);
+  background: var(--glass);
   color: var(--ink);
   font-size: 11.5px;
   font-weight: 800;
@@ -3519,7 +3785,7 @@ button.format-chip:not(:disabled):active {
   padding: 0;
   border: 0;
   border-radius: 999px;
-  background: rgb(255 255 255 / 0.92);
+  background: var(--glass);
   color: var(--ink);
   opacity: 0;
   transition: opacity 160ms ease;

@@ -6,5 +6,8 @@ import { afterEach } from "vitest";
 afterEach(cleanup);
 
 // jsdom has no canvas and logs "Not implemented" for every getContext call.
-HTMLCanvasElement.prototype.getContext = (() =>
-  null) as typeof HTMLCanvasElement.prototype.getContext;
+// (Tests in the node environment have no DOM at all.)
+if (typeof HTMLCanvasElement !== "undefined") {
+  HTMLCanvasElement.prototype.getContext = (() =>
+    null) as typeof HTMLCanvasElement.prototype.getContext;
+}

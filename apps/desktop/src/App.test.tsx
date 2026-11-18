@@ -4,7 +4,15 @@ import App from "./App";
 import type { ConvertOptions, FfmpegStatus, MediaInfo, OutputFormat } from "./lib/api";
 import * as api from "./lib/api";
 import { DEFAULTS } from "./lib/formats";
-import { applyProgress, navigate, openPaths, resetStore, state, updateSettings } from "./lib/store";
+import {
+  applyProgress,
+  navigate,
+  openPaths,
+  resetStore,
+  setTheme,
+  state,
+  updateSettings,
+} from "./lib/store";
 import { FakeAudio, installFakeAudio } from "./test/audio";
 
 vi.mock("./lib/api", () => ({
@@ -58,6 +66,7 @@ vi.mock("./lib/api", () => ({
   pickFolder: vi.fn(async () => null),
   defaultOutputFolder: vi.fn(async () => "/Users/cat/Downloads/CatConvert"),
   prepareOutputFolder: vi.fn(async (path: string) => path),
+  setWindowTheme: vi.fn(async () => {}),
   thirdPartyLicenses: vi.fn(async () => "ffmpeg 9.0.2 (GPL-2.0-or-later)"),
   revealInFolder: vi.fn(async () => {}),
   missingFiles: vi.fn(async () => []),
@@ -180,6 +189,7 @@ const SONG: MediaInfo = {
 
 beforeEach(() => {
   localStorage.clear();
+  document.documentElement.removeAttribute("data-theme");
   resetStore();
   vi.clearAllMocks();
   installFakeAudio();
@@ -1882,6 +1892,53 @@ describe("CatConvert", () => {
     fireEvent.click(screen.getByRole("button", { name: "Forget moved (1)" }));
     expect(screen.getByText("A clean slate")).toBeInTheDocument();
     expect(state.history).toHaveLength(0);
+  });
+
+  describe("theme", () => {
+    it("follows the system until Light or Dark is picked, and remembers the pick", async () => {
+      render(() => <App />);
+      await ffmpegFound();
+      fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+      const root = document.documentElement;
+      expect(screen.getByRole("button", { name: "Same as system" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      expect(root).not.toHaveAttribute("data-theme");
+
+      fireEvent.click(screen.getByRole("button", { name: "Dark" }));
+      expect(root).toHaveAttribute("data-theme", "dark");
+      expect(screen.getByRole("button", { name: "Dark" })).toHaveAttribute("aria-pressed", "true");
+      expect(api.setWindowTheme).toHaveBeenLastCalledWith("dark");
+      expect(JSON.parse(localStorage.getItem("catconvert.theme.v1") ?? "null")).toBe("dark");
+
+      fireEvent.click(screen.getByRole("button", { name: "Light" }));
+      expect(root).toHaveAttribute("data-theme", "light");
+      expect(api.setWindowTheme).toHaveBeenLastCalledWith("light");
+
+      // Read back at the next launch.
+      resetStore();
+      expect(state.theme).toBe("light");
+      navigate("settings");
+
+      fireEvent.click(screen.getByRole("button", { name: "Same as system" }));
+      expect(root).not.toHaveAttribute("data-theme");
+      expect(api.setWindowTheme).toHaveBeenLastCalledWith("system");
+      expect(JSON.parse(localStorage.getItem("catconvert.theme.v1") ?? "null")).toBe("system");
+    });
+
+    it("redraws the waveform in the dark accent", async () => {
+      await openSong();
+      await waitFor(() =>
+        expect(api.waveform).toHaveBeenLastCalledWith(SONG.path, 1200, 160, "#c93b63"),
+      );
+      setTheme("dark");
+      await waitFor(() =>
+        expect(api.waveform).toHaveBeenLastCalledWith(SONG.path, 1200, 160, "#ee7a9b"),
+      );
+      // The old picture stays up while the new one is drawn.
+      expect(document.querySelector(".trim-wave")).toBeInTheDocument();
+    });
   });
 
   describe("where files go", () => {

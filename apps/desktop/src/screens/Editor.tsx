@@ -112,6 +112,7 @@ import {
   state,
   updateOptions,
 } from "../lib/store";
+import { hexToken, isDark } from "../lib/theme";
 import { SequenceEditor } from "./SequenceEditor";
 
 const FILMSTRIP_FRAMES = 10;
@@ -300,7 +301,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     90,
     info().hdr,
   );
-  const wave = createWaveform(() => (info().kind === "audio" ? info().path : null), "#c93b63");
+  const wave = createWaveform(
+    () => (info().kind === "audio" ? info().path : null),
+    // Read again when the theme changes, so the waveform is redrawn in its accent.
+    () => hexToken("--accent", isDark() ? "#ee7a9b" : "#c93b63"),
+  );
 
   const quarterTurn = () => options().rotate % 180 === 90;
 

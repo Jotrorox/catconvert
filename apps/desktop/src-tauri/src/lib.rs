@@ -26,9 +26,13 @@
 //!
 //! Files can also come in from outside the window ("Open with", the Finder
 //! Quick Action, "Send to"); see [`incoming`] and [`quick_action`].
+//!
+//! The window starts hidden and opens in the light or dark theme chosen in
+//! Settings; see [`theme`].
 
 mod incoming;
 mod quick_action;
+mod theme;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -632,7 +636,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .on_window_event(theme::on_window_event)
         .setup(|app| {
+            theme::setup(app.handle());
             let backend = start_backend(app.handle());
             app.manage(AppState {
                 backend: RwLock::new(backend),
@@ -674,6 +680,7 @@ pub fn run() {
             take_opened_files,
             quick_action_status,
             set_quick_action,
+            theme::set_window_theme,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

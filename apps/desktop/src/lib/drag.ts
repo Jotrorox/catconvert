@@ -5,6 +5,7 @@
  */
 import type { MediaKind, OutputFormat } from "./api";
 import { KIND_TONE, label, type Tone } from "./formats";
+import { cssToken } from "./theme";
 
 /** How far the pointer moves with the button down before a press becomes a drag. */
 const DRAG_DISTANCE = 6;
@@ -50,15 +51,14 @@ export function dragIcon(format: OutputFormat, kind: MediaKind): string {
   if (!ctx) return "";
 
   const tone: Tone = KIND_TONE[kind];
-  const css = getComputedStyle(document.documentElement);
-  const token = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
   const inset = 6;
   const side = ICON_SIZE - inset * 2;
 
-  ctx.shadowColor = "rgb(90 30 45 / 0.3)";
+  // The current theme's colours; the fallbacks are the light theme's.
+  ctx.shadowColor = cssToken("--tile-shadow", "rgb(90 30 45 / 0.3)");
   ctx.shadowBlur = 4;
   ctx.shadowOffsetY = 1;
-  ctx.fillStyle = token(`--${tone}-bg`, "#fde4e8");
+  ctx.fillStyle = cssToken(`--${tone}-bg`, "#fde4e8");
   ctx.beginPath();
   // roundRect is missing from older WebKit; a square tile still works.
   if (typeof ctx.roundRect === "function") ctx.roundRect(inset, inset, side, side, 14);
@@ -67,8 +67,8 @@ export function dragIcon(format: OutputFormat, kind: MediaKind): string {
 
   const text = label(format);
   ctx.shadowColor = "transparent";
-  ctx.fillStyle = token(`--${tone}-ink`, "#b3325a");
-  ctx.font = `700 ${text.length > 3 ? 13 : 16}px ${token("--font-display", "sans-serif")}`;
+  ctx.fillStyle = cssToken(`--${tone}-ink`, "#b3325a");
+  ctx.font = `700 ${text.length > 3 ? 13 : 16}px ${cssToken("--font-display", "sans-serif")}`;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(text, ICON_SIZE / 2, ICON_SIZE / 2 + 1, side - 8);
