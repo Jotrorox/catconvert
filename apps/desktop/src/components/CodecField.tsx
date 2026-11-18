@@ -17,9 +17,9 @@ export const CodecField: Component<Props> = (props) => {
   const current = () => codecOf({ format: props.format, videoCodec: props.codec });
   return (
     <Show when={codecs().length > 1}>
-      <fieldset class="field">
+      <fieldset class="field codec-field">
         <legend class="field-label">Video codec</legend>
-        <div class="format-chips">
+        <div class="format-chips" data-tone="pink">
           <For each={codecs()}>
             {(codec, index) => (
               <button

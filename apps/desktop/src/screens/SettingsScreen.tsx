@@ -209,7 +209,7 @@ const OutputSettings: Component = () => {
       <h2 class="section-title">Where files go</h2>
       <fieldset class="field">
         <legend class="field-label">Save converted files</legend>
-        <div class="format-chips">
+        <div class="format-chips" data-tone="pink">
           <For each={OUTPUT_CHOICES}>
             {(item) => (
               <button
