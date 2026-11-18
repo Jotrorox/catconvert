@@ -1,0 +1,126 @@
+Small fixes to realesrgan-ncnn-vulkan; the command line and its messages stay
+as upstream has them.
+
+- Windows: format the model paths with %ls/%d. Upstream passes a std::string
+  through swprintf's "...", which is undefined and only happened to work.
+- Other systems: snprintf instead of sprintf into the 256-byte model path
+  buffers, which a long -m path overflowed.
+- Stop with exit status -1 when the .param or .bin file can't be opened or
+  parsed (ncnn or the Windows branch has already said why on stderr), instead
+  of running an empty network. On Windows, upstream went on to read from a
+  null FILE*.
+- Windows: check and create the output folder as a wide path; path::string()
+  throws for characters outside the ANSI code page.
+
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -376,10 +376,12 @@
+         path_t ext = get_file_extension(v.outpath);
+ 
+         /* ----------- Create folder if not exists -------------------*/
++        // catconvert: keep the path wide on Windows; string() throws for
++        // characters outside the ANSI code page
+         fs::path fs_path = fs::absolute(v.outpath);
+-        std::string parent_path = fs_path.parent_path().string();
++        fs::path parent_path = fs_path.parent_path();
+         if (fs::exists(parent_path) != 1){
+-            std::cout << "Create folder: [" << parent_path << "]." << std::endl;
++            std::cout << "Create folder: [" << parent_path.string() << "]." << std::endl;
+             fs::create_directories(parent_path);
+         }
+ 
+@@ -700,12 +702,13 @@
+ 
+     if (modelname == PATHSTR("realesr-animevideov3"))
+     {
+-        swprintf(parampath, 256, L"%s/%s-x%s.param", model.c_str(), modelname.c_str(), std::to_string(scale));
+-        swprintf(modelpath, 256, L"%s/%s-x%s.bin", model.c_str(), modelname.c_str(), std::to_string(scale));
++        // catconvert: %d for the scale; a std::string through ... is undefined
++        swprintf(parampath, 256, L"%ls/%ls-x%d.param", model.c_str(), modelname.c_str(), scale);
++        swprintf(modelpath, 256, L"%ls/%ls-x%d.bin", model.c_str(), modelname.c_str(), scale);
+     }
+     else{
+-        swprintf(parampath, 256, L"%s/%s.param", model.c_str(), modelname.c_str());
+-        swprintf(modelpath, 256, L"%s/%s.bin", model.c_str(), modelname.c_str());
++        swprintf(parampath, 256, L"%ls/%ls.param", model.c_str(), modelname.c_str());
++        swprintf(modelpath, 256, L"%ls/%ls.bin", model.c_str(), modelname.c_str());
+     }
+ 
+ #else
+@@ -714,12 +717,13 @@
+ 
+     if (modelname == PATHSTR("realesr-animevideov3"))
+     {
+-        sprintf(parampath, "%s/%s-x%s.param", model.c_str(), modelname.c_str(), std::to_string(scale).c_str());
+-        sprintf(modelpath, "%s/%s-x%s.bin", model.c_str(), modelname.c_str(), std::to_string(scale).c_str());
++        // catconvert: snprintf, a long model path overflowed the buffer
++        snprintf(parampath, 256, "%s/%s-x%s.param", model.c_str(), modelname.c_str(), std::to_string(scale).c_str());
++        snprintf(modelpath, 256, "%s/%s-x%s.bin", model.c_str(), modelname.c_str(), std::to_string(scale).c_str());
+     }
+     else{
+-        sprintf(parampath, "%s/%s.param", model.c_str(), modelname.c_str());
+-        sprintf(modelpath, "%s/%s.bin", model.c_str(), modelname.c_str());
++        snprintf(parampath, 256, "%s/%s.param", model.c_str(), modelname.c_str());
++        snprintf(modelpath, 256, "%s/%s.bin", model.c_str(), modelname.c_str());
+     }
+ #endif
+ 
+@@ -801,7 +805,13 @@
+         {
+             realesrgan[i] = new RealESRGAN(gpuid[i], tta_mode);
+ 
+-            realesrgan[i]->load(paramfullpath, modelfullpath);
++            // catconvert: stop on missing or broken model files (the reason
++            // is already on stderr) instead of running an empty network
++            if (realesrgan[i]->load(paramfullpath, modelfullpath) != 0)
++            {
++                ncnn::destroy_gpu_instance();
++                return -1;
++            }
+ 
+             realesrgan[i]->scale = scale;
+             realesrgan[i]->tilesize = tilesize[i];
+--- a/src/realesrgan.cpp
++++ b/src/realesrgan.cpp
+@@ -92,26 +92,37 @@
+         if (!fp)
+         {
+             fwprintf(stderr, L"_wfopen %ls failed\n", parampath.c_str());
++            return -1; // catconvert: don't read from a null FILE*
+         }
+ 
+-        net.load_param(fp);
++        int ret = net.load_param(fp);
+ 
+         fclose(fp);
++
++        if (ret != 0)
++            return -1;
+     }
+     {
+         FILE* fp = _wfopen(modelpath.c_str(), L"rb");
+         if (!fp)
+         {
+             fwprintf(stderr, L"_wfopen %ls failed\n", modelpath.c_str());
++            return -1;
+         }
+ 
+-        net.load_model(fp);
++        int ret = net.load_model(fp);
+ 
+         fclose(fp);
++
++        if (ret != 0)
++            return -1;
+     }
+ #else
+-    net.load_param(parampath.c_str());
+-    net.load_model(modelpath.c_str());
++    // catconvert: report failures (ncnn prints "fopen <path> failed")
++    if (net.load_param(parampath.c_str()) != 0)
++        return -1;
++    if (net.load_model(modelpath.c_str()) != 0)
++        return -1;
+ #endif
+ 
+     // initialize preprocess and postprocess pipeline

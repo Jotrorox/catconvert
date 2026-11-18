@@ -68,6 +68,14 @@ export function formatSpan(secs: number): string {
   return `${m} min ${String(s).padStart(2, "0")} s`;
 }
 
+/** A rough length for estimates: `5 s`, `40 s`, `3 min`, `2 h`. */
+export function formatDuration(secs: number): string {
+  if (!Number.isFinite(secs) || secs < 0) return "–";
+  if (secs < 90) return `${Math.max(1, Math.round(secs))} s`;
+  if (secs < 90 * 60) return `${Math.round(secs / 60)} min`;
+  return `${Math.round(secs / 3600)} h`;
+}
+
 /** Last path segment, handling both `/` and `\` separators. */
 export function baseName(path: string): string {
   return path.split(/[\\/]/).pop() || path;

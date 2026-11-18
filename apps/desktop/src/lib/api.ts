@@ -154,6 +154,13 @@ export type Upscale = { factor: number } | { size: number };
  */
 export type Scaler = "auto" | "lanczos" | "spline" | "bicubic";
 
+/**
+ * A Real-ESRGAN model for AI upscaling (Settings → Upscaling installs them):
+ * `general` for photos, `photo` for photos with the most detail (slow),
+ * `anime` for drawings, `anime-fast` for quick anime.
+ */
+export type AiModel = "general" | "photo" | "anime" | "anime-fast";
+
 /** What became of an original a conversion replaced. */
 export type Replaced = { to: "trash" } | { to: "renamed"; path: string };
 
@@ -167,6 +174,11 @@ export type ConvertOptions = {
   upscale: Upscale | null;
   /** Resampling filter for any resize. */
   scaler: Scaler;
+  /**
+   * Enlarge still pictures with this AI model instead of `scaler` (which then
+   * only makes up the last bit of the size). Videos and animations ignore it.
+   */
+  ai?: AiModel | null;
   fps: number | null;
   rotate: Rotation;
   flip: boolean;
@@ -353,7 +365,46 @@ export type FfmpegStatus = {
   /** Version of libjxl's cjxl/djxl, if installed. */
   libjxl: string | null;
   jxl: JxlSupport;
+  /** The AI upscaling models that are installed. */
+  aiModels?: AiModel[];
 };
+
+/** One of the files an AI upscaling install fetches. */
+export type UpscalerPart = "upscaler" | "models" | "generalModel";
+
+/** How AI upscaling went on a test picture. */
+export type GpuCheck =
+  | { status: "ready"; gpu: string | null }
+  | { status: "noGpu" }
+  | { status: "blackOutput"; gpu: string | null }
+  | { status: "failed"; message: string };
+
+/** The state of AI upscaling (Settings → Upscaling). */
+export type UpscalerInfo = {
+  /** The install folder. */
+  dir: string;
+  /** The upscaler conversions use, if any. */
+  binary: string | null;
+  /** Where it was found: installed here, `CATCONVERT_UPSCALER`, or on `PATH`. */
+  origin: "installed" | "env" | "path" | null;
+  /** The models it can use. */
+  models: AiModel[];
+  /** What the install folder still lacks. */
+  missing: UpscalerPart[];
+  /** The installed upscaler isn't the one this version comes with. */
+  outdated: boolean;
+  /** Release builds can download the upscaler; local ones install it from a file. */
+  canDownload: boolean;
+  /** Bytes still to download, as far as known. */
+  downloadBytes: number;
+  /** The last test on the graphics card, if any. */
+  gpu: GpuCheck | null;
+  /** A download or install is running. */
+  busy: boolean;
+};
+
+/** How far the AI upscaling download has got. */
+export type UpscalerDownload = { received: number; total: number | null };
 
 /** Whether "Convert with CatConvert" is in Finder's Quick Actions menu. */
 export type QuickActionStatus = {
@@ -468,6 +519,16 @@ type Commands = {
   quick_action_status: { args: Record<string, never>; result: QuickActionStatus };
   set_quick_action: { args: { installed: boolean }; result: QuickActionStatus };
   set_window_theme: { args: { theme: ThemeChoice }; result: null };
+  upscaler_status: { args: Record<string, never>; result: UpscalerInfo };
+  check_upscaler_gpu: { args: Record<string, never>; result: UpscalerInfo };
+  download_upscaler: { args: Record<string, never>; result: UpscalerInfo };
+  cancel_upscaler_download: { args: Record<string, never>; result: null };
+  install_upscaler_files: { args: { paths: string[] }; result: UpscalerInfo };
+  remove_upscaler: { args: Record<string, never>; result: UpscalerInfo };
+  ai_estimate: {
+    args: { info: MediaInfo; options: ConvertOptions };
+    result: [number, number] | null;
+  };
   "plugin:drag|start_drag": {
     args: { item: string[]; image: string; options: { mode: "copy" }; onEvent: Channel<DragEnd> };
     result: null;
@@ -478,6 +539,7 @@ type Events = {
   "job-progress": JobProgress;
   /** Absolute paths of files opened from outside the app. */
   "open-files": string[];
+  "upscaler-download": UpscalerDownload;
 };
 
 function command<K extends keyof Commands>(
@@ -519,6 +581,7 @@ export async function ffmpegStatus(): Promise<FfmpegStatus> {
       readsAv1: false,
       libjxl: null,
       jxl: NO_JXL,
+      aiModels: [],
     };
   }
   return command("ffmpeg_status", {});
@@ -855,6 +918,72 @@ export async function quickActionStatus(): Promise<QuickActionStatus> {
 /** Add or remove the Finder Quick Action. */
 export function setQuickAction(installed: boolean): Promise<QuickActionStatus> {
   return command("set_quick_action", { installed });
+}
+
+// ---------------------------------------------------------------------------
+// AI upscaling (optional download)
+// ---------------------------------------------------------------------------
+
+/** What is installed for AI upscaling; `null` outside the app. */
+export async function upscalerStatus(): Promise<UpscalerInfo | null> {
+  if (!inTauri) return null;
+  return command("upscaler_status", {});
+}
+
+/** Try AI upscaling on a test picture to see whether the graphics card can run it. */
+export function checkUpscalerGpu(): Promise<UpscalerInfo> {
+  return command("check_upscaler_gpu", {});
+}
+
+/**
+ * Download what AI upscaling still needs (from this version's release and the
+ * official Real-ESRGAN release), install it and try it out. `onProgress` gets
+ * the bytes received so far.
+ */
+export async function downloadUpscaler(
+  onProgress: (progress: UpscalerDownload) => void,
+): Promise<UpscalerInfo> {
+  const stop = await subscribe("upscaler-download", onProgress);
+  try {
+    return await command("download_upscaler", {});
+  } finally {
+    stop();
+  }
+}
+
+/** Stop a running {@link downloadUpscaler}. */
+export function cancelUpscalerDownload(): Promise<null> {
+  return command("cancel_upscaler_download", {});
+}
+
+/** Pick downloaded AI upscaling files (zips and `.pth`); empty if cancelled. */
+export async function pickUpscalerFiles(): Promise<string[]> {
+  const picked = await open({
+    multiple: true,
+    directory: false,
+    filters: [{ name: "AI upscaling files", extensions: ["zip", "pth"] }],
+  });
+  if (picked === null) return [];
+  return Array.isArray(picked) ? picked : [picked];
+}
+
+/** Install AI upscaling from downloaded files, then try it out. */
+export function installUpscalerFiles(paths: string[]): Promise<UpscalerInfo> {
+  return command("install_upscaler_files", { paths });
+}
+
+/** Remove the AI upscaler and its models. */
+export function removeUpscaler(): Promise<UpscalerInfo> {
+  return command("remove_upscaler", {});
+}
+
+/** Seconds the AI pass of a conversion roughly takes, fast to slow GPU; `null` without one. */
+export async function aiEstimate(
+  info: MediaInfo,
+  options: ConvertOptions,
+): Promise<[number, number] | null> {
+  if (!inTauri) return null;
+  return command("ai_estimate", { info, options });
 }
 
 /** The app's look: follow the system, or always light or dark. */

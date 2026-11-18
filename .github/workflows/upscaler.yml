@@ -1,0 +1,179 @@
+name: Upscaler
+
+# Builds catconvert-upscaler, the optional AI upscaler the app downloads on
+# request (realesrgan-ncnn-vulkan on ncnn), from the pinned sources and
+# patches in scripts/upscaler, plus the archive of its corresponding source.
+# The release workflow calls this, then signs the macOS binary and zips the
+# packs; it also runs when the script, lock file or patches change. Builds are
+# cached by the hash of everything in scripts/upscaler, so a release without
+# changes there reuses the previous binaries.
+
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - scripts/upscaler/**
+      - .github/workflows/upscaler.yml
+  push:
+    branches: [main]
+    paths:
+      - scripts/upscaler/**
+      - .github/workflows/upscaler.yml
+
+permissions:
+  contents: read
+
+env:
+  # The official Real-ESRGAN ncnn release, only for its models and test image:
+  # the end-to-end test below upscales with them. Nothing from it is packed.
+  MODELS_URL: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+  MODELS_SHA256: e5aa6eb131234b87c0c51f82b89390f5e3e642b7b70f2b9bbe95b6a285a40c96
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: universal-apple-darwin
+            os: macos-latest
+          # The oldest supported runner, so the binary also runs on older glibc.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Built natively with MSVC and the static CRT, as upstream does.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # Git Bash on Windows.
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore built upscaler
+        id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist-upscaler
+          key: upscaler-${{ matrix.target }}-${{ hashFiles('scripts/upscaler/**') }}
+
+      - name: Install build tools (macOS)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install build tools (Linux)
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+
+      # A short scratch path keeps MSBuild's deepest object paths under
+      # Windows' 260-character limit.
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+          UPSCALER_WORK: ${{ runner.temp }}/upscaler
+        run: scripts/upscaler/build.sh "$TARGET" dist-upscaler
+
+      # Also on a cache hit: -h needs no GPU and must print the usage. Like
+      # upstream, it exits with -1.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          bin=dist-upscaler/catconvert-upscaler
+          if [ "$RUNNER_OS" = Windows ]; then bin="$bin.exe"; fi
+          status=0
+          "$bin" -h 2> "$RUNNER_TEMP/usage.txt" || status=$?
+          cat "$RUNNER_TEMP/usage.txt"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::catconvert-upscaler -h exited with 0, expected -1"
+            exit 1
+          fi
+          grep -q '^Usage: realesrgan-ncnn-vulkan ' "$RUNNER_TEMP/usage.txt"
+
+      # A real upscale on the GPU: on Linux with Mesa's software Vulkan driver
+      # (lavapipe), on macOS with MoltenVK on the runner's virtual GPU, which
+      # may not be up to it, so that one only reports. Windows runners have no
+      # Vulkan driver.
+      - name: Upscale a test image
+        if: runner.os != 'Windows'
+        continue-on-error: ${{ runner.os == 'macOS' }}
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers
+          fi
+          dir="$RUNNER_TEMP/e2e"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/official.zip" "$MODELS_URL"
+          echo "$MODELS_SHA256  $dir/official.zip" | shasum -a 256 -c -
+          unzip -q "$dir/official.zip" 'models/realesr-animevideov3-x2.*' input.jpg -d "$dir"
+
+          # input.jpg is 220x220; animevideov3 at 2x must give 440x440.
+          dist-upscaler/catconvert-upscaler -i "$dir/input.jpg" -o "$dir/out.png" \
+            -n realesr-animevideov3 -s 2 -m "$dir/models"
+
+          python3 -I - "$dir/out.png" 440 440 <<'EOF'
+          import struct, sys, zlib
+
+          path, want_w, want_h = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+          data = open(path, "rb").read()
+          if data[:8] != b"\x89PNG\r\n\x1a\n":
+              sys.exit(f"{path} is not a PNG")
+          pos, ihdr, idat = 8, None, b""
+          while pos < len(data):
+              size, kind = struct.unpack(">I4s", data[pos : pos + 8])
+              body = data[pos + 8 : pos + 8 + size]
+              if kind == b"IHDR":
+                  ihdr = struct.unpack(">IIBBBBB", body)
+              elif kind == b"IDAT":
+                  idat += body
+              pos += 12 + size
+          width, height, depth, color = ihdr[:4]
+          if (width, height) != (want_w, want_h):
+              sys.exit(f"{path} is {width}x{height}, expected {want_w}x{want_h}")
+          channels = {0: 1, 2: 3, 4: 2, 6: 4}[color]
+          stride = 1 + width * channels * depth // 8
+          raw = zlib.decompress(idat)
+          # Filtered rows are all zero exactly when every pixel is zero (black).
+          pixels = b"".join(raw[y * stride + 1 : (y + 1) * stride] for y in range(height))
+          share = sum(1 for b in pixels if b) / len(pixels)
+          print(f"{path}: {width}x{height}, {channels} channels, {share:.1%} non-zero bytes")
+          if share < 0.05:
+              sys.exit(f"{path} is (almost) all black")
+          EOF
+
+      # Artifacts drop the executable bit; the release job restores it.
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upscaler-${{ matrix.target }}
+          path: dist-upscaler/
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    name: Corresponding source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pack sources
+        run: scripts/upscaler/build.sh sources dist-upscaler-source/catconvert-upscaler-source.tar.xz
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upscaler-source
+          path: dist-upscaler-source/
+          if-no-files-found: error
+          retention-days: 7

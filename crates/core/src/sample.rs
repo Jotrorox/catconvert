@@ -189,9 +189,12 @@ pub fn sample_plan(
                 let options = ConvertOptions { max_size, ..base };
                 convert::frames_plan(input, &options, &output, last, support)?
             } else {
+                // AI upscaling is what the comparison shows off: the
+                // original side is enlarged the classic way.
                 let options = ConvertOptions {
                     format: OutputFormat::Png,
                     max_size: limit,
+                    ai: None,
                     metadata: Metadata::Keep,
                     video_codec: None,
                     video_bitrate: None,
@@ -430,6 +433,7 @@ mod tests {
     use crate::convert::{Crop, JxlSupport, Tool, VideoCodec};
 
     const TONE_MAP: Support = Support {
+        ai: crate::AiModels::NONE,
         jxl: JxlSupport {
             cjxl: false,
             djxl: false,

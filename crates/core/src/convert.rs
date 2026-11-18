@@ -15,6 +15,7 @@ use crate::ffmpeg::format_secs;
 use crate::jxl::is_jxl;
 pub(crate) use crate::output::file_stem;
 use crate::output::{frame_stamp, free_in};
+use crate::upscale::{self, AiModel, AiModels};
 use crate::{Error, MediaInfo, MediaKind, Result};
 
 /// A file type CatConvert can write.
@@ -422,6 +423,12 @@ pub struct ConvertOptions {
     pub upscale: Option<Upscale>,
     /// Filter that resizes the picture, when it is resized at all.
     pub scaler: Scaler,
+    /// Enlarge with this AI model instead of `scaler` when `upscale` enlarges
+    /// a still picture (see [`crate::AiModel`]); `scaler` then only makes up
+    /// the difference to the exact size. Needs the optional upscaler (see
+    /// [`crate::Upscaler`]). Videos and animations keep the classic scaler.
+    /// AI-enlarged pictures come out without photo metadata.
+    pub ai: Option<AiModel>,
     /// Output frame rate (video and GIF). Never raises the source rate.
     pub fps: Option<f64>,
     /// Clockwise rotation in degrees: 0, 90, 180 or 270.
@@ -492,6 +499,7 @@ impl Default for ConvertOptions {
             max_size: None,
             upscale: None,
             scaler: Scaler::Auto,
+            ai: None,
             fps: None,
             rotate: 0,
             flip: false,
@@ -586,6 +594,8 @@ pub struct Support {
     pub tone_map: bool,
     /// H.265 can be encoded in hardware (see [`ConvertOptions::hardware`]).
     pub hevc_hardware: bool,
+    /// The AI models the installed upscaler can use (see [`ConvertOptions::ai`]).
+    pub ai: AiModels,
 }
 
 impl From<JxlSupport> for Support {
@@ -614,6 +624,9 @@ pub enum Tool {
     /// re-encoding it (see [`crate::scrub_file`]). Shown as the CLI command
     /// that does the same.
     Scrub,
+    /// The AI upscaler (see [`crate::Upscaler`]), shown under upstream's
+    /// name. The runner adds `-m` with the folder of the installed models.
+    Upscale,
 }
 
 impl Tool {
@@ -625,6 +638,7 @@ impl Tool {
             Self::Cjxl => "cjxl",
             Self::Djxl => "djxl",
             Self::Scrub => "catconvert scrub",
+            Self::Upscale => "realesrgan-ncnn-vulkan",
         }
     }
 }
@@ -766,6 +780,9 @@ pub fn plan(
         ));
     }
     let trim = trim_range(input, options)?;
+    if let Some(pass) = ai_pass(input, options)? {
+        return ai_plan(input, options, output, support, trim, pass);
+    }
     let jxl_in = is_jxl(input);
     let animated = format.animates(input.kind);
     if animated && !(options.speed.is_finite() && SPEEDS.contains(&options.speed)) {
@@ -1032,6 +1049,246 @@ pub fn plan(
     })
 }
 
+/// How AI upscaling enlarges a still picture: the model's pass and the sizes
+/// around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AiPass {
+    pub model: AiModel,
+    /// What the model enlarges by.
+    pub scale: u32,
+    /// The size the picture is shrunk to before the pass, when enlarging it
+    /// whole would make more than [`upscale::MAX_AI_PIXELS`].
+    pub shrink: Option<(u32, u32)>,
+    /// The size of the picture going into the pass.
+    pub input: (u32, u32),
+    /// The size the upscaler writes.
+    pub enlarged: (u32, u32),
+    /// The size asked for, which Lanczos takes `enlarged` to.
+    pub target: (u32, u32),
+}
+
+/// Whether [`ConvertOptions::ai`] can apply to this output: still pictures,
+/// including a frame of a video, but no videos or animations.
+fn ai_applies(input: &MediaInfo, options: &ConvertOptions) -> bool {
+    options.format.kind() == MediaKind::Image && !options.format.animates(input.kind)
+}
+
+/// The AI pass for `options`, or `None` when it asks for no AI upscaling, the
+/// output isn't a still picture, the picture's size is unknown or it isn't
+/// enlarged at all.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] if the result would be too big for the upscaler.
+pub(crate) fn ai_pass(input: &MediaInfo, options: &ConvertOptions) -> Result<Option<AiPass>> {
+    let Some(model) = options.ai else {
+        return Ok(None);
+    };
+    if !ai_applies(input, options) {
+        return Ok(None);
+    }
+    let Some(cropped) = cropped_dims(input, options) else {
+        return Ok(None);
+    };
+    let Some(target) = enlarged_dims(cropped, options, options.format == OutputFormat::Avif) else {
+        return Ok(None);
+    };
+    let area = |(w, h): (u32, u32)| u64::from(w) * u64::from(h);
+    if area(target) > upscale::MAX_AI_PIXELS {
+        #[allow(clippy::cast_precision_loss)]
+        let limit = upscale::MAX_AI_PIXELS as f64 / 1e6;
+        return Err(Error::unsupported(format!(
+            "AI upscaling makes pictures of up to {limit:.0} megapixels, and this one would be \
+             {}×{}: pick a smaller upscale, or classic upscaling",
+            target.0, target.1
+        )));
+    }
+    let scale = upscale::MAX_AI_SCALE;
+    let whole = (cropped.0 * scale, cropped.1 * scale);
+    let (shrink, pass_input) = if area(whole) > upscale::MAX_AI_PIXELS {
+        let small = (target.0.div_ceil(scale), target.1.div_ceil(scale));
+        (Some(small), small)
+    } else {
+        (None, cropped)
+    };
+    Ok(Some(AiPass {
+        model,
+        scale,
+        shrink,
+        input: pass_input,
+        enlarged: (pass_input.0 * scale, pass_input.1 * scale),
+        target,
+    }))
+}
+
+/// How long the AI pass of a conversion roughly takes, in seconds, from a
+/// fast to a slow graphics card. `None` when it doesn't use AI upscaling.
+#[must_use]
+pub fn ai_estimate(input: &MediaInfo, options: &ConvertOptions) -> Option<(f64, f64)> {
+    let pass = ai_pass(input, options).ok().flatten()?;
+    #[allow(clippy::cast_precision_loss)]
+    let megapixels = (u64::from(pass.input.0) * u64::from(pass.input.1)) as f64 / 1e6;
+    Some(upscale::estimate_secs(pass.model, megapixels))
+}
+
+/// Plan an AI upscale of a still picture: ffmpeg turns, crops (and if need
+/// be shrinks) it into a PNG, the upscaler enlarges that, and ffmpeg takes
+/// the result to the exact size and encodes it (or cjxl, for JPEG XL).
+fn ai_plan(
+    input: &MediaInfo,
+    options: &ConvertOptions,
+    output: &Path,
+    support: Support,
+    trim: (f64, Option<f64>),
+    pass: AiPass,
+) -> Result<Plan> {
+    if !support.ai.contains(pass.model) {
+        return Err(Error::unsupported(if support.ai.is_empty() {
+            upscale::NOT_INSTALLED.to_owned()
+        } else {
+            format!(
+                "the AI model \"{}\" is not installed: reinstall AI upscaling",
+                pass.model.id()
+            )
+        }));
+    }
+    let format = options.format;
+    let jxl = support.jxl;
+    if format == OutputFormat::Jxl && !jxl.cjxl && !jxl.ffmpeg_encoder {
+        return Err(Error::unsupported(
+            "writing JPEG XL needs cjxl from libjxl or an ffmpeg built with libjxl",
+        ));
+    }
+    let mut steps = Vec::new();
+    let mut scratch = Vec::new();
+    let source = readable_source(input, jxl, output, &mut steps, &mut scratch)?;
+
+    // 1. The turned and cropped picture as 8-bit RGB(A), the way the upscaler reads it.
+    let picture = scratch_path(output, "ai-in", "png");
+    let prepare = ConvertOptions {
+        format: OutputFormat::Png,
+        max_size: None,
+        upscale: None,
+        ai: None,
+        fps: None,
+        metadata: Metadata::None,
+        ..options.clone()
+    };
+    let alpha = input.kind == MediaKind::Image
+        && !matches!(input.extension.as_deref(), Some("jpg" | "jpeg"));
+    steps.push(ffmpeg_step(
+        &source,
+        &prepare,
+        trim,
+        Sink::AiInput {
+            shrink: pass.shrink,
+            alpha,
+        },
+        &picture,
+        support,
+    ));
+    scratch.push(picture.clone());
+
+    // 2. The AI pass.
+    let enlarged = scratch_path(output, "ai-out", "png");
+    steps.push(Step {
+        tool: Tool::Upscale,
+        args: vec![
+            "-i".into(),
+            picture.into_os_string(),
+            "-o".into(),
+            enlarged.clone().into_os_string(),
+            "-n".into(),
+            pass.model.upstream_name().into(),
+            "-s".into(),
+            pass.scale.to_string().into(),
+            "-f".into(),
+            "png".into(),
+        ],
+        duration_secs: None,
+        weight: 0.85,
+    });
+    scratch.push(enlarged.clone());
+
+    // 3. Lanczos to the exact size, and the encoder.
+    let edited = MediaInfo {
+        path: enlarged,
+        file_name: "ai-out.png".into(),
+        extension: Some("png".into()),
+        kind: MediaKind::Image,
+        duration_secs: None,
+        width: Some(pass.enlarged.0),
+        height: Some(pass.enlarged.1),
+        fps: None,
+        video_codec: Some("png".into()),
+        audio_codec: None,
+        sample_rate: None,
+        audio_channels: None,
+        bitrate: None,
+        video_bitrate: None,
+        audio_bitrate: None,
+        reconstructs_jpeg: false,
+        hdr: false,
+        has_location: false,
+        location_tags: Vec::new(),
+        tile_grid: None,
+        orientation: None,
+        ..source.clone()
+    };
+    let as_is = ConvertOptions {
+        trim_start: None,
+        trim_end: None,
+        max_size: None,
+        upscale: None,
+        ai: None,
+        fps: None,
+        rotate: 0,
+        flip: false,
+        crop: None,
+        metadata: Metadata::None,
+        ..options.clone()
+    };
+    let no_tone_map = Support {
+        tone_map: false,
+        ..support
+    };
+    let sink = if pass.enlarged == pass.target {
+        Sink::Output
+    } else {
+        Sink::Scaled {
+            width: pass.target.0,
+            height: pass.target.1,
+        }
+    };
+    if format == OutputFormat::Jxl && jxl.cjxl {
+        let scaled = scratch_path(output, "ai-scaled", "png");
+        let png = ConvertOptions {
+            format: OutputFormat::Png,
+            ..as_is
+        };
+        let mut encode = ffmpeg_step(&edited, &png, (0.0, None), sink, &scaled, no_tone_map);
+        encode.weight = 0.05;
+        steps.push(encode);
+        steps.push(cjxl_step(&scaled, output, options, false, 0.1));
+        scratch.push(scaled);
+    } else {
+        steps.push(ffmpeg_step(
+            &edited,
+            &as_is,
+            (0.0, None),
+            sink,
+            output,
+            no_tone_map,
+        ));
+    }
+    Ok(Plan {
+        steps,
+        output: output.to_path_buf(),
+        scratch,
+        writes: Vec::new(),
+    })
+}
+
 /// The input as ffmpeg can read it: `input` itself, or for JPEG XL that
 /// ffmpeg can't decode, a (A)PNG that a djxl step added to `steps` unpacks
 /// next to `output` first.
@@ -1133,6 +1390,15 @@ enum Sink<'a> {
     /// The frames the encoder would get, as a lossless PNG of the last one
     /// (or the first unless `last`), to compare the encoded result with.
     Sample { last: bool },
+    /// The still picture for the AI upscaler: turned and cropped, shrunk to
+    /// `shrink` if given, as an 8-bit RGB PNG (RGBA when `alpha`).
+    AiInput {
+        shrink: Option<(u32, u32)>,
+        alpha: bool,
+    },
+    /// The final picture, scaled to exactly `width`×`height` with the
+    /// enlarging filter and no other edits. Still pictures only.
+    Scaled { width: u32, height: u32 },
 }
 
 /// The ffmpeg call that applies the edits in `options` to `input` and writes `out`.
@@ -1246,6 +1512,20 @@ fn ffmpeg_step(
             push(&["-c:v", "png", "-compression_level", "1", "-update", "1"]);
             push(&["-an", "-sn", "-dn"]);
         }
+        (_, Sink::AiInput { shrink, alpha }) => {
+            let mut filters = tone_mapped(video_filters(input, options, None, false));
+            if let Some((w, h)) = shrink {
+                filters.push(format!(
+                    "scale={w}:{h}:flags={}",
+                    options.scaler.sharp_flags()
+                ));
+            }
+            filters.push(format!("format={}", if alpha { "rgba" } else { "rgb24" }));
+            push_video(&mut push, input, &["-frames:v", "1"], &filters);
+            // Fast zlib: this file only lives until the upscaler has read it.
+            push(&["-c:v", "png", "-compression_level", "1"]);
+            push(&["-update", "1", "-an", "-sn", "-dn"]);
+        }
         (OutputFormat::Jxl, Sink::Frames { animated }) => {
             let filters = tone_mapped(animation_filters(input, options, lead_trim));
             if animated {
@@ -1354,10 +1634,16 @@ fn ffmpeg_step(
             | OutputFormat::Webp
             | OutputFormat::Avif
             | OutputFormat::Jxl,
-            Sink::Output,
+            Sink::Output | Sink::Scaled { .. },
         ) => {
             let needs_even = format == OutputFormat::Avif;
-            let filters = tone_mapped(video_filters(input, options, None, needs_even));
+            let filters = match sink {
+                Sink::Scaled { width, height } => vec![format!(
+                    "scale={width}:{height}:flags={}",
+                    options.scaler.sharp_flags()
+                )],
+                _ => tone_mapped(video_filters(input, options, None, needs_even)),
+            };
             push_video(&mut push, input, &["-frames:v", "1"], &filters);
             match format {
                 OutputFormat::Png => push(&["-c:v", "png"]),
@@ -1403,6 +1689,8 @@ fn ffmpeg_step(
     }
     args.push(out.as_os_str().to_owned());
     let weight = match sink {
+        Sink::AiInput { .. } => 0.05,
+        Sink::Scaled { .. } => 0.1,
         Sink::Frames { .. } => 0.4,
         // x264 and libvpx analyse quickly on the first pass.
         Sink::FirstPass { .. } => 0.5,
@@ -2116,6 +2404,12 @@ pub fn upscale_warning(input: &MediaInfo, options: &ConvertOptions) -> Option<St
     }
     let video = is_video_file(input, options);
     let (w, h) = enlarged_dims(cropped_dims(input, options)?, options, video)?;
+    if options.ai.is_some() && !ai_applies(input, options) {
+        return Some(
+            "AI upscaling only works on still pictures, so this is enlarged the classic way"
+                .to_owned(),
+        );
+    }
     huge_warning((w, h), options.format.animates(input.kind), video)
 }
 
@@ -2774,6 +3068,7 @@ mod tests {
 
     /// Software and hardware H.265.
     const HEVC_HARDWARE: Support = Support {
+        ai: crate::AiModels::NONE,
         jxl: JxlSupport {
             cjxl: false,
             djxl: false,
@@ -4327,6 +4622,7 @@ mod tests {
     }
 
     const TONE_MAP: Support = Support {
+        ai: crate::AiModels::NONE,
         hevc_hardware: false,
         jxl: JxlSupport {
             cjxl: false,
@@ -4461,6 +4757,7 @@ mod tests {
             ..image("sunset.avif", 4000, 3000)
         };
         let ffmpeg_jxl = Support {
+            ai: crate::AiModels::NONE,
             hevc_hardware: false,
             jxl: JxlSupport {
                 ffmpeg_encoder: true,
@@ -5147,5 +5444,216 @@ mod tests {
             serde_json::to_value(Upscale::Factor(1.5)).expect("json"),
             serde_json::json!({"factor": 1.5})
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // AI upscaling
+    // -----------------------------------------------------------------------
+
+    fn ai_support(models: &[AiModel]) -> Support {
+        Support {
+            ai: models.iter().copied().collect(),
+            ..Support::from(LIBJXL)
+        }
+    }
+
+    fn ai_upscaled(format: OutputFormat, upscale: Upscale, model: AiModel) -> ConvertOptions {
+        ConvertOptions {
+            ai: Some(model),
+            ..upscaled(format, upscale)
+        }
+    }
+
+    #[test]
+    fn ai_upscale_runs_the_upscaler_between_two_ffmpeg_steps() {
+        let photo = image("cat.jpg", 640, 480);
+        let options = ConvertOptions {
+            rotate: 90,
+            ..ai_upscaled(OutputFormat::Png, Upscale::Factor(2.0), AiModel::General)
+        };
+        let out = Path::new("/pics/cat.png");
+        let planned = plan(&photo, &options, out, ai_support(&[AiModel::General])).expect("plan");
+        assert_eq!(tools(&planned), [Tool::Ffmpeg, Tool::Upscale, Tool::Ffmpeg]);
+        let cmd = planned.command_line();
+        // Turned and flattened to RGB (a JPEG has no alpha), enlarged 4×,
+        // then Lanczos down to 2× of the turned picture.
+        assert!(
+            cmd.contains("-vf transpose=clock,format=rgb24 -c:v png"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains(
+                "realesrgan-ncnn-vulkan -i /pics/.cat.png.ai-in.png -o /pics/.cat.png.ai-out.png \
+                 -n realesr-general-x4v3 -s 4 -f png"
+            ),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("-i /pics/.cat.png.ai-out.png -map 0:v:0 -frames:v 1 -vf scale=960:1280:flags=lanczos -c:v png"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.ends_with("-map_metadata -1 -map_chapters -1 /pics/cat.png"),
+            "{cmd}"
+        );
+        assert_eq!(
+            planned.scratch,
+            [
+                PathBuf::from("/pics/.cat.png.ai-in.png"),
+                PathBuf::from("/pics/.cat.png.ai-out.png")
+            ]
+        );
+        let weights: Vec<f32> = planned.steps.iter().map(|s| s.weight).collect();
+        assert_eq!(weights, [0.05, 0.85, 0.1]);
+    }
+
+    #[test]
+    fn ai_upscale_skips_the_final_resize_when_the_model_hits_the_size() {
+        let art = image("art.png", 300, 200);
+        let options = ai_upscaled(OutputFormat::Webp, Upscale::Factor(4.0), AiModel::AnimeFast);
+        let planned = plan(
+            &art,
+            &options,
+            Path::new("/pics/art.webp"),
+            ai_support(&[AiModel::AnimeFast]),
+        )
+        .expect("plan");
+        let cmd = planned.command_line();
+        // PNGs may be transparent; 4× is what the model makes.
+        assert!(cmd.contains("-vf format=rgba"), "{cmd}");
+        assert!(cmd.contains("-n realesr-animevideov3 -s 4 -f png"), "{cmd}");
+        let last = planned.steps.last().expect("encode");
+        let last: Vec<_> = last.args.iter().map(|a| a.to_string_lossy()).collect();
+        assert!(!last.iter().any(|a| a == "-vf"), "{last:?}");
+        assert!(last.iter().any(|a| a == "libwebp"), "{last:?}");
+    }
+
+    #[test]
+    fn ai_upscale_to_jpeg_xl_goes_through_cjxl() {
+        let photo = image("cat.jpg", 640, 480);
+        let options = ai_upscaled(OutputFormat::Jxl, Upscale::Size(1440), AiModel::Photo);
+        let planned = plan(
+            &photo,
+            &options,
+            Path::new("/pics/cat.jxl"),
+            ai_support(&[AiModel::Photo]),
+        )
+        .expect("plan");
+        assert_eq!(
+            tools(&planned),
+            [Tool::Ffmpeg, Tool::Upscale, Tool::Ffmpeg, Tool::Cjxl]
+        );
+        let cmd = planned.command_line();
+        assert!(cmd.contains("scale=1920:1440:flags=lanczos"), "{cmd}");
+        assert!(cmd.contains("-n realesrgan-x4plus -s 4"), "{cmd}");
+        assert_eq!(planned.scratch.len(), 3);
+    }
+
+    #[test]
+    fn ai_upscale_needs_the_model_installed() {
+        let photo = image("cat.jpg", 640, 480);
+        let options = ai_upscaled(OutputFormat::Png, Upscale::Factor(2.0), AiModel::Anime);
+        let out = Path::new("/pics/cat.png");
+        let err = plan(&photo, &options, out, ai_support(&[])).expect_err("not installed");
+        assert_eq!(err.to_string(), "AI upscaling is not installed");
+        let err = plan(&photo, &options, out, ai_support(&[AiModel::General])).expect_err("model");
+        assert!(
+            err.to_string().contains("\"anime\" is not installed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ai_upscale_leaves_videos_and_unenlarged_pictures_alone() {
+        let mut clip = video("small.mov");
+        (clip.width, clip.height) = (Some(320), Some(240));
+        let options = ai_upscaled(OutputFormat::Mp4, Upscale::Factor(2.0), AiModel::General);
+        let planned = plan(
+            &clip,
+            &options,
+            Path::new("/clips/small.mp4"),
+            ai_support(&[]),
+        )
+        .expect("classic upscaling");
+        assert_eq!(tools(&planned), [Tool::Ffmpeg]);
+        assert!(
+            planned
+                .command_line()
+                .contains("scale=640:480:flags=lanczos")
+        );
+        assert!(
+            upscale_warning(&clip, &options).is_some_and(|w| w.contains("still pictures")),
+            "the user is told"
+        );
+        assert_eq!(ai_estimate(&clip, &options), None);
+
+        // A frame of the video is a still picture, though.
+        let frame = ai_upscaled(OutputFormat::Png, Upscale::Factor(2.0), AiModel::General);
+        let planned = plan(
+            &clip,
+            &ConvertOptions {
+                trim_start: Some(1.0),
+                ..frame
+            },
+            Path::new("/clips/frame.png"),
+            ai_support(&[AiModel::General]),
+        )
+        .expect("frame");
+        assert_eq!(tools(&planned), [Tool::Ffmpeg, Tool::Upscale, Tool::Ffmpeg]);
+        assert!(planned.command_line().starts_with("ffmpeg -ss 1 -i"));
+
+        // Nothing to enlarge: no AI either.
+        let photo = image("big.jpg", 4000, 3000);
+        let options = ai_upscaled(OutputFormat::Png, Upscale::Size(1080), AiModel::General);
+        let planned = plan(
+            &photo,
+            &options,
+            Path::new("/pics/big.png"),
+            ai_support(&[]),
+        )
+        .expect("plan");
+        assert_eq!(tools(&planned), [Tool::Ffmpeg]);
+    }
+
+    #[test]
+    fn ai_upscale_of_a_big_picture_starts_from_a_smaller_copy() {
+        let photo = image("big.jpg", 4000, 3000);
+        let options = ai_upscaled(OutputFormat::Jpg, Upscale::Factor(2.0), AiModel::General);
+        let planned = plan(
+            &photo,
+            &options,
+            Path::new("/pics/big 2.jpg"),
+            ai_support(&[AiModel::General]),
+        )
+        .expect("plan");
+        let cmd = planned.command_line();
+        // 4× of the whole photo would be 192 megapixels: shrink to a quarter
+        // of the 8000×6000 asked for, then enlarge 4×, with no resize after.
+        assert!(
+            cmd.contains("scale=2000:1500:flags=lanczos,format=rgb24"),
+            "{cmd}"
+        );
+        assert!(!cmd.contains("scale=8000:6000"), "{cmd}");
+        let (fast, slow) = ai_estimate(&photo, &options).expect("estimate");
+        assert!(fast > 1.0 && slow > fast);
+
+        let options = ai_upscaled(OutputFormat::Jpg, Upscale::Factor(4.0), AiModel::General);
+        let err = plan(
+            &photo,
+            &options,
+            Path::new("/pics/big 2.jpg"),
+            ai_support(&[AiModel::General]),
+        )
+        .expect_err("too big");
+        assert!(err.to_string().contains("67 megapixels"), "{err}");
+    }
+
+    #[test]
+    fn ai_option_parses_from_json() {
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"ai": "anime-fast"})).expect("parse");
+        assert_eq!(options.ai, Some(AiModel::AnimeFast));
+        let options: ConvertOptions = serde_json::from_value(serde_json::json!({})).expect("parse");
+        assert_eq!(options.ai, None);
     }
 }

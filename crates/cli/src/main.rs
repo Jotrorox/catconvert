@@ -5,9 +5,9 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use catconvert_core::{
-    AudioRate, ConvertOptions, Crop, Direction, Ffmpeg, Fit, JxlOptions, Metadata, Naming,
-    OutputFormat, OutputTarget, Plan, QualitySummary, RunOutcome, Scaler, SequenceOptions,
-    SoundOptions, Upscale, VIDEO_KBPS, VideoCodec,
+    AiModel, AudioRate, ConvertOptions, Crop, Direction, DownloadKind, Ffmpeg, Fit, GpuCheck,
+    JxlOptions, Metadata, Naming, OutputFormat, OutputTarget, Plan, QualitySummary, RunOutcome,
+    Scaler, SequenceOptions, SoundOptions, Upscale, VIDEO_KBPS, VideoCodec,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -187,6 +187,30 @@ enum Command {
         #[arg(long, value_enum)]
         drop: Strip,
     },
+    /// Install, check or remove the optional AI upscaler (Real-ESRGAN) that
+    /// `--ai` uses. It is shared with the desktop app.
+    Upscaler {
+        #[command(subcommand)]
+        action: UpscalerAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum UpscalerAction {
+    /// Show what is installed and where.
+    Status,
+    /// Install from downloaded files: CatConvert's upscaler zip, the official
+    /// Real-ESRGAN ncnn zip and realesr-general-x4v3.pth, in any order. They
+    /// are recognised by their SHA-256. Without files, lists what to download.
+    Install {
+        /// Downloaded files.
+        files: Vec<PathBuf>,
+    },
+    /// Enlarge a small test picture to see whether this computer's graphics
+    /// card can run the upscaler.
+    Check,
+    /// Remove the upscaler and its models.
+    Remove,
 }
 
 /// Making the picture bigger than the original.
@@ -203,6 +227,26 @@ struct ResizeArgs {
     /// pictures, GIFs and anything enlarged.
     #[arg(long, value_enum, default_value_t = Resampler::Auto)]
     scaler: Resampler,
+    /// Enlarge still pictures with AI (Real-ESRGAN) instead: general (photos,
+    /// the default), photo (most detail, slow), anime (drawings) or
+    /// anime-fast. Needs a graphics card and `catconvert upscaler install`.
+    #[arg(
+        long,
+        value_name = "MODEL",
+        num_args = 0..=1,
+        default_missing_value = "general",
+        value_parser = parse_ai_model,
+        requires = "upscale"
+    )]
+    ai: Option<AiModel>,
+}
+
+/// `general`, `photo`, `anime` or `anime-fast`.
+fn parse_ai_model(text: &str) -> Result<AiModel, String> {
+    AiModel::from_id(text.trim()).ok_or_else(|| {
+        let names: Vec<_> = AiModel::ALL.iter().map(|m| m.id()).collect();
+        format!("expected one of {}, got `{text}`", names.join(", "))
+    })
 }
 
 /// CLI mirror of [`Scaler`].
@@ -432,7 +476,108 @@ fn convert(
     if let Some(line) = describe_quality(summary) {
         eprintln!("{line}");
     }
+    if let Some((fast, slow)) = catconvert_core::ai_estimate(&info, options) {
+        eprintln!(
+            "AI upscaling takes about {} to {}, depending on the graphics card",
+            duration(fast),
+            duration(slow)
+        );
+    }
     run(&ffmpeg, &plan, dry_run)
+}
+
+/// `40 s`, `3 min`.
+fn duration(secs: f64) -> String {
+    if secs < 90.0 {
+        format!("{:.0} s", secs.max(1.0))
+    } else {
+        format!("{:.0} min", secs / 60.0)
+    }
+}
+
+fn upscaler(action: UpscalerAction) -> Result<(), String> {
+    let dir = catconvert_core::upscaler_dir()
+        .ok_or("can't tell where to install: no home folder is set")?;
+    match action {
+        UpscalerAction::Status => {
+            let status = catconvert_core::upscaler_status(&dir);
+            match &status.binary {
+                Some(binary) => println!("upscaler: {}", binary.display()),
+                None => println!("upscaler: not installed"),
+            }
+            let models: Vec<_> = status.models.iter().map(|m| m.id()).collect();
+            println!(
+                "models: {}",
+                if models.is_empty() {
+                    "none".to_owned()
+                } else {
+                    models.join(", ")
+                }
+            );
+            println!("folder: {}", status.dir.display());
+            if status.outdated {
+                println!("an update comes with this version: run `catconvert upscaler install`");
+            }
+            Ok(())
+        }
+        UpscalerAction::Install { files } if files.is_empty() => {
+            println!("Download these files, then run `catconvert upscaler install <files>`:");
+            for download in catconvert_core::upscaler_downloads() {
+                println!("  {}", download.url);
+            }
+            if !catconvert_core::can_download_upscaler() {
+                println!(
+                    "  catconvert-upscaler-<platform>.zip from the CatConvert release of your \
+                     version (this build doesn't know its checksum, so any copy is accepted)"
+                );
+            }
+            Ok(())
+        }
+        UpscalerAction::Install { files } => {
+            let installed =
+                catconvert_core::install_upscaler(&dir, &files).map_err(|e| e.to_string())?;
+            for kind in installed {
+                println!(
+                    "installed {}",
+                    match kind {
+                        DownloadKind::Upscaler => "the upscaler",
+                        DownloadKind::Models => "the x4plus, x4plus-anime and animevideov3 models",
+                        DownloadKind::GeneralModel => "the general-x4v3 model",
+                    }
+                );
+            }
+            let status = catconvert_core::upscaler_status(&dir);
+            if !status.missing.is_empty() {
+                println!("still missing: run `catconvert upscaler install` to see what to fetch");
+            }
+            Ok(())
+        }
+        UpscalerAction::Check => {
+            let ffmpeg = Ffmpeg::locate().map_err(|e| e.to_string())?;
+            match ffmpeg.check_upscaler() {
+                GpuCheck::Ready { gpu } => {
+                    println!(
+                        "AI upscaling works on {}",
+                        gpu.as_deref().unwrap_or("this computer")
+                    );
+                    Ok(())
+                }
+                GpuCheck::NoGpu => {
+                    Err("no graphics card supports AI upscaling here (it needs Vulkan)".to_owned())
+                }
+                GpuCheck::BlackOutput { .. } => Err(
+                    "the graphics driver makes black pictures: update it to use AI upscaling"
+                        .to_owned(),
+                ),
+                GpuCheck::Failed { message } => Err(message),
+            }
+        }
+        UpscalerAction::Remove => {
+            catconvert_core::uninstall_upscaler(&dir).map_err(|e| e.to_string())?;
+            println!("removed {}", dir.display());
+            Ok(())
+        }
+    }
 }
 
 /// The quality setting in numbers, e.g. `video H.264 CRF 24, audio 128 kbps`.
@@ -616,6 +761,7 @@ fn main() -> ExitCode {
                 max_size: size,
                 upscale: resize.upscale,
                 scaler: resize.scaler.into(),
+                ai: resize.ai,
                 fps,
                 rotate,
                 flip,
@@ -672,6 +818,7 @@ fn main() -> ExitCode {
                 max_size: size,
                 upscale: resize.upscale,
                 scaler: resize.scaler.into(),
+                ai: resize.ai,
                 rotate,
                 flip,
                 quality,
@@ -709,6 +856,7 @@ fn main() -> ExitCode {
                 catconvert_core::scrub_file(&input, &output, metadata).map_err(|e| e.to_string()),
             )
         }
+        Command::Upscaler { action } => report(upscaler(action)),
     }
 }
 
@@ -1072,5 +1220,52 @@ mod tests {
             panic!("expected animate");
         };
         assert_eq!(resize.upscale, Some(Upscale::Size(720)));
+    }
+
+    #[test]
+    fn parses_ai_upscaling() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["catconvert", "convert", "cat.jpg", "--to", "png"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).map(|cli| match cli.command {
+                Command::Convert { resize, .. } => resize.ai,
+                _ => panic!("expected convert"),
+            })
+        };
+        assert_eq!(parse(&["--upscale", "4x"]).expect("parse"), None);
+        assert_eq!(
+            parse(&["--upscale", "4x", "--ai"]).expect("parse"),
+            Some(AiModel::General)
+        );
+        assert_eq!(
+            parse(&["--upscale", "2x", "--ai=anime-fast"]).expect("parse"),
+            Some(AiModel::AnimeFast)
+        );
+        assert_eq!(
+            parse(&["--ai", "photo", "--upscale", "2x"]).expect("parse"),
+            Some(AiModel::Photo)
+        );
+        assert!(parse(&["--ai"]).is_err(), "--ai needs --upscale");
+        let err = parse(&["--upscale", "2x", "--ai=x4plus"]).expect_err("unknown model");
+        assert!(err.to_string().contains("anime-fast"), "{err}");
+    }
+
+    #[test]
+    fn parses_upscaler_commands() {
+        let cli = Cli::try_parse_from(["catconvert", "upscaler", "install", "a.zip", "b.pth"])
+            .expect("parse");
+        let Command::Upscaler {
+            action: UpscalerAction::Install { files },
+        } = cli.command
+        else {
+            panic!("expected install");
+        };
+        assert_eq!(files, [PathBuf::from("a.zip"), PathBuf::from("b.pth")]);
+        for action in ["status", "check", "remove", "install"] {
+            Cli::try_parse_from(["catconvert", "upscaler", action]).expect(action);
+        }
+        assert_eq!(duration(0.2), "1 s");
+        assert_eq!(duration(45.0), "45 s");
+        assert_eq!(duration(300.0), "5 min");
     }
 }

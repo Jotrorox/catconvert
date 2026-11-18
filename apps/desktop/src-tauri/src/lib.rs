@@ -29,6 +29,9 @@
 //! folder joins the asset protocol's scope the first time (see
 //! [`compare_sample`]).
 //!
+//! AI upscaling is an optional download that Settings installs; see
+//! [`upscaler`].
+//!
 //! Files can also come in from outside the window ("Open with", the Finder
 //! Quick Action, "Send to"); see [`incoming`] and [`quick_action`].
 //!
@@ -38,14 +41,15 @@
 mod incoming;
 mod quick_action;
 mod theme;
+mod upscaler;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use catconvert_core::{
-    ConvertOptions, Destination, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, Naming,
-    OutputFormat, OutputPreview, OutputTarget, QualitySummary, Queue, Sample, SampleSide, Samples,
-    SavedFrame, SequenceOptions, VideoCodec,
+    AiModel, ConvertOptions, Destination, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo,
+    Naming, OutputFormat, OutputPreview, OutputTarget, QualitySummary, Queue, Sample, SampleSide,
+    Samples, SavedFrame, SequenceOptions, Upscaler, VideoCodec,
 };
 
 /// Folder in Downloads suggested when "Save to a folder" is first chosen.
@@ -57,6 +61,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::incoming::Incoming;
 use crate::quick_action::QuickActionStatus;
+use crate::upscaler::UpscalerState;
 
 /// Event name for [`catconvert_core::JobProgress`] payloads.
 const JOB_PROGRESS_EVENT: &str = "job-progress";
@@ -101,6 +106,10 @@ fn sidecar_dir() -> Option<PathBuf> {
 fn start_backend(app: &AppHandle) -> Backend {
     match Ffmpeg::locate_with(sidecar_dir().as_deref()) {
         Ok(ffmpeg) => {
+            // The core looks in the same folder, unless there is no home folder.
+            if let Ok(dir) = upscaler::install_dir(app) {
+                ffmpeg.set_upscaler(Upscaler::locate(Some(&dir)));
+            }
             let app = app.clone();
             Backend::Ready(Arc::new(Queue::new(ffmpeg, move |event| {
                 if let Err(err) = app.emit(JOB_PROGRESS_EVENT, &event) {
@@ -155,6 +164,8 @@ struct FfmpegStatus {
     /// Version of libjxl's tools, if `cjxl` was found.
     libjxl: Option<String>,
     jxl: JxlSupport,
+    /// The AI upscaling models that are installed (see Settings → Upscaling).
+    ai_models: Vec<AiModel>,
 }
 
 fn status_of(state: &AppState) -> FfmpegStatus {
@@ -195,6 +206,10 @@ fn status_of(state: &AppState) -> FfmpegStatus {
         reads_av1: ffmpeg.as_ref().is_some_and(Ffmpeg::reads_av1),
         libjxl: ffmpeg.as_ref().and_then(|f| f.jxl_tools().version.clone()),
         jxl: ffmpeg.as_ref().map(Ffmpeg::jxl_support).unwrap_or_default(),
+        ai_models: ffmpeg
+            .as_ref()
+            .map(|f| f.support().ai.iter().collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -219,17 +234,26 @@ async fn relocate_ffmpeg(
     Ok(status_of(&state))
 }
 
-/// License texts of the bundled tools, or `None` in builds without them.
+/// License texts of the bundled tools and of the AI upscaler and its models
+/// when installed, or `None` when there are neither.
 #[tauri::command]
 async fn third_party_licenses(app: AppHandle) -> Option<String> {
-    let path = app
+    let bundled = app
         .path()
         .resolve(LICENSES_RESOURCE, BaseDirectory::Resource)
-        .ok()?;
-    tauri::async_runtime::spawn_blocking(move || std::fs::read_to_string(path).ok())
-        .await
-        .ok()
-        .flatten()
+        .ok();
+    let upscaler = upscaler::install_dir(&app).ok();
+    tauri::async_runtime::spawn_blocking(move || {
+        let texts: Vec<String> = bundled
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .into_iter()
+            .chain(upscaler.and_then(|dir| catconvert_core::upscaler_licenses(&dir)))
+            .collect();
+        (!texts.is_empty()).then(|| texts.join("\n\n"))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Probe a file: ffprobe details when ffmpeg is available, size and
@@ -698,6 +722,7 @@ pub fn run() {
 
     builder
         .manage(Incoming::default())
+        .manage(UpscalerState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -749,6 +774,13 @@ pub fn run() {
             quick_action_status,
             set_quick_action,
             theme::set_window_theme,
+            upscaler::upscaler_status,
+            upscaler::check_upscaler_gpu,
+            upscaler::download_upscaler,
+            upscaler::cancel_upscaler_download,
+            upscaler::install_upscaler_files,
+            upscaler::remove_upscaler,
+            upscaler::ai_estimate,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

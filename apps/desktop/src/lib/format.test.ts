@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { formatBitrate, formatBytes, formatClock, formatSpan, parseClock } from "./format";
+import {
+  formatBitrate,
+  formatBytes,
+  formatClock,
+  formatDuration,
+  formatSpan,
+  parseClock,
+} from "./format";
 
 describe("format", () => {
   it("formats clock times", () => {
@@ -23,6 +30,14 @@ describe("format", () => {
     expect(formatSpan(27.84)).toBe("27.8 s");
     expect(formatSpan(245)).toBe("4 min 05 s");
     expect(formatBytes(48_000_000)).toBe("48.0 MB");
+  });
+
+  it("formats rough durations for estimates", () => {
+    expect(formatDuration(0.2)).toBe("1 s");
+    expect(formatDuration(42.4)).toBe("42 s");
+    expect(formatDuration(200)).toBe("3 min");
+    expect(formatDuration(7200)).toBe("2 h");
+    expect(formatDuration(Number.NaN)).toBe("–");
   });
 
   it("formats bitrates", () => {

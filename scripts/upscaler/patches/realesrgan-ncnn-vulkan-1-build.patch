@@ -1,0 +1,50 @@
+Build realesrgan-ncnn-vulkan without a Vulkan SDK and without LTO.
+
+ncnn's simplevk loader opens the Vulkan driver at runtime and brings its own
+Vulkan headers, so the app neither needs find_package(Vulkan) nor links a
+Vulkan loader; on macOS ncnn itself links the static MoltenVK passed in as
+Vulkan_LIBRARY. Global LTO is dropped: it slows the build a lot, and ncnn's
+per-ISA kernels (picked at runtime by CPU) must not be inlined into code every
+CPU runs.
+
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -26,7 +26,8 @@
+ 
+ find_package(Threads)
+ find_package(OpenMP)
+-find_package(Vulkan REQUIRED)
++# catconvert: no Vulkan SDK. ncnn's simplevk loader opens the driver at runtime
++# and brings its own headers; on macOS ncnn links Vulkan_LIBRARY (MoltenVK).
+ 
+ find_program(GLSLANGVALIDATOR_EXECUTABLE NAMES glslangValidator PATHS $ENV{VULKAN_SDK}/bin NO_CMAKE_FIND_ROOT_PATH)
+ message(STATUS "Found glslangValidator: ${GLSLANGVALIDATOR_EXECUTABLE}")
+@@ -86,16 +87,9 @@
+     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
+ endif()
+ 
+-# enable global link time optimization
+-cmake_policy(SET CMP0069 NEW)
+-set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
+-include(CheckIPOSupported)
+-check_ipo_supported(RESULT ipo_supported OUTPUT ipo_supported_output)
+-if(ipo_supported)
+-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+-else()
+-    message(WARNING "IPO is not supported: ${ipo_supported_output}")
+-endif()
++# catconvert: no global link time optimization. It slows the build down a lot,
++# and ncnn's per-ISA kernels (AVX-512 and so on, picked at runtime) must not be
++# inlined into code that runs on every CPU.
+ 
+ if(USE_SYSTEM_NCNN)
+     set(GLSLANG_TARGET_DIR "GLSLANG-NOTFOUND" CACHE PATH "Absolute path to glslangTargets.cmake directory")
+@@ -278,7 +272,7 @@
+ 
+ add_dependencies(realesrgan-ncnn-vulkan generate-spirv)
+ 
+-set(REALESRGAN_LINK_LIBRARIES ncnn webp ${Vulkan_LIBRARY})
++set(REALESRGAN_LINK_LIBRARIES ncnn webp)
+ 
+ if(USE_STATIC_MOLTENVK)
+     find_library(CoreFoundation NAMES CoreFoundation)
