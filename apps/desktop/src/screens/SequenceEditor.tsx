@@ -13,6 +13,7 @@ import { DestinationField } from "../components/DestinationField";
 import { Icon } from "../components/Icon";
 import { OutputField } from "../components/OutputField";
 import { QualityField } from "../components/QualityField";
+import { type SizePick, SizeSelect, UpscaleSettings } from "../components/SizeField";
 import {
   type ConvertOptions,
   type Fit,
@@ -33,16 +34,23 @@ import {
   codecOf,
   DIRECTIONS,
   FRAME_TIMES,
+  hugePixels,
   isLossless,
   JXL_EFFORTS,
   label,
+  MAX_UPSCALE_SIZE,
+  maxLongSide,
+  maxSequenceUpscale,
   playbackOrder,
   SEQUENCE_FORMATS,
   sequenceAutoSize,
+  sequenceFits,
   sequenceFrame,
   sequenceName,
+  sequenceUpscaleChoices,
   shortSide,
   sizeChoices,
+  upscaleTarget,
 } from "../lib/formats";
 import { createMediaQuery } from "../lib/media";
 import { targetOf } from "../lib/output";
@@ -197,9 +205,62 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
     return picture ? sizeChoices(picture) : [];
   });
   const autoSize = () => {
+    // An upscale lifts the default size cap.
+    if (options().upscale) return null;
     const cap = sequenceAutoSize(options().format);
     const picture = first();
     return cap !== null && picture && (shortSide(picture) ?? 0) > cap ? cap : null;
+  };
+
+  // Upscaling, like the editor's but always with even sides.
+  const firstShort = () => {
+    const picture = first();
+    return picture ? shortSide(picture) : null;
+  };
+  const upscaling = () => {
+    const short = firstShort();
+    return short !== null && upscaleTarget(short, options().upscale) !== null
+      ? (options().upscale ?? null)
+      : null;
+  };
+  const upscalePresets = createMemo(() => {
+    const picture = first();
+    return picture ? sequenceUpscaleChoices(picture, options()) : [];
+  });
+  const minUpscale = () => ((firstShort() ?? 0) + 2) & ~1;
+  const maxUpscale = () => {
+    const picture = first();
+    return (picture && maxSequenceUpscale(picture, options())) ?? MAX_UPSCALE_SIZE;
+  };
+  const [customUpscale, setCustomUpscale] = createSignal(false);
+  const showCustom = () => customUpscale() && upscaling() !== null;
+  const tooBig = () => {
+    const picture = first();
+    return upscaling() !== null && picture && !sequenceFits(picture, options())
+      ? { limit: maxLongSide(options().format), format: label(options().format) }
+      : null;
+  };
+  const huge = () => {
+    const f = frame();
+    return (
+      upscaling() !== null && f !== null && f.width * f.height > hugePixels(options().format, true)
+    );
+  };
+  const pickSize = (pick: SizePick) => {
+    if (pick !== "custom") {
+      setCustomUpscale(false);
+      updateSequenceOptions(
+        pick.upscale
+          ? { upscale: pick.upscale, maxSize: null }
+          : { maxSize: pick.maxSize, upscale: null },
+      );
+      return;
+    }
+    setCustomUpscale(true);
+    if (upscaling()) return updateSequenceOptions({ maxSize: null });
+    const half = Math.round((firstShort() ?? 0) * 1.5);
+    const start = Math.max(minUpscale(), Math.min(maxUpscale(), half) & ~1);
+    updateSequenceOptions({ upscale: { size: start }, maxSize: null });
   };
   const isJxl = () => options().format === "jxl";
   const lossless = () => isLossless(options());
@@ -271,7 +332,8 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
       state.ffmpeg?.found === true &&
       isAnimated(options().format) &&
       (codec === null || isCodecAvailable(codec)) &&
-      outputError() === null
+      outputError() === null &&
+      tooBig() === null
     );
   };
   const unavailableReason = (format: ConvertOptions["format"]) =>
@@ -567,29 +629,36 @@ export const SequenceEditor: Component<{ draft: SequenceDraft; compact: boolean 
           </fieldset>
 
           <Show when={first()?.width}>
-            <label class="field">
-              <span class="field-label">Size</span>
-              <select
-                class="select"
-                onChange={(e) => {
-                  const v = e.currentTarget.value;
-                  updateSequenceOptions({ maxSize: v === "" ? null : Number(v) });
-                }}
-              >
-                <option value="" selected={options().maxSize === null}>
-                  {autoSize() !== null
-                    ? `Auto (${autoSize()} px)`
-                    : `Like the first (${first()?.width}×${first()?.height})`}
-                </option>
-                <For each={sizes()}>
-                  {(size) => (
-                    <option value={size} selected={options().maxSize === size}>
-                      {size} px
-                    </option>
-                  )}
-                </For>
-              </select>
-            </label>
+            <SizeSelect
+              keepLabel={
+                autoSize() !== null
+                  ? `Auto (${autoSize()} px)`
+                  : `Like the first (${first()?.width}×${first()?.height})`
+              }
+              shrinkSizes={sizes()}
+              sizeText={(size) => `${size} px`}
+              presets={upscalePresets()}
+              presetText={(upscale) =>
+                "factor" in upscale ? `${upscale.factor}×` : `${upscale.size} px`
+              }
+              canCustom={firstShort() !== null && maxUpscale() >= minUpscale()}
+              maxSize={options().maxSize}
+              upscale={upscaling()}
+              custom={showCustom()}
+              onPick={pickSize}
+            />
+            <UpscaleSettings
+              custom={showCustom()}
+              minSize={minUpscale()}
+              maxSize={maxUpscale()}
+              target={upscaleTarget(firstShort() ?? 0, upscaling())}
+              result={frame()}
+              enlarged={upscaling() !== null}
+              scaler={options().scaler ?? "auto"}
+              huge={huge()}
+              tooBig={tooBig()}
+              onChange={updateSequenceOptions}
+            />
           </Show>
 
           <Show

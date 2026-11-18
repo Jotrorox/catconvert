@@ -19,6 +19,12 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
   shows, play forward, reversed or as a boomerang, and fit other shapes with
   black bars or by cropping. GIFs and animated JXL get the same speed, reverse
   and boomerang controls.
+- **Upscaling:** make photos and videos bigger than the original, 2×, 3×, 4×
+  or to 720p, 1080p, 1440p or 4K, with Lanczos (or spline or bicubic). Video
+  keeps its shape and even sides; the size estimate covers it, and very large
+  results get a warning first. Shrinking stays the default. It's classic
+  scaling, so it adds pixels, not detail (see
+  [docs/upscaling-ml-spike.md](docs/upscaling-ml-spike.md) for AI upscaling).
 - **H.265 / HEVC video:** write MP4, MOV and MKV files with H.265, 30–50%
   smaller than H.264 at the same look, with hardware playback on Apple devices,
   recent PCs, TVs and phones. Files are tagged `hvc1` so QuickTime, Safari and
@@ -152,6 +158,8 @@ mise run cli -- convert clip.mov --to mp3            # pull the audio
 mise run cli -- convert clip.mov --to mp4 --crop 9:16 --size 1080  # vertical, centred
 mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print the ffmpeg command
 mise run cli -- convert clip.mov --to mp4 --bitrate 4M          # exact video bitrate, two passes
+mise run cli -- convert photo.jpg --to png --upscale 2x         # 640×480 → 1280×960, Lanczos
+mise run cli -- convert clip.mov --to mp4 --upscale 1080p --scaler spline  # 720p → 1080p
 mise run cli -- convert clip.mov --to mp4 --out-dir ~/Movies --name "{name}_{height}p"  # elsewhere, renamed
 mise run cli -- animate cat*.jpg --to gif --frame 0.25 --direction boomerang  # pictures → animation
 ```

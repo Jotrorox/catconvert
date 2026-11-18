@@ -15,7 +15,6 @@ import type {
   SequenceOptions,
   VideoRate,
 } from "./api";
-import { pictureSize } from "./crop";
 import { formatBitrate, formatBytes } from "./format";
 import {
   autoLimits,
@@ -23,6 +22,7 @@ import {
   formatKind,
   isAnimatedImage,
   outputSeconds,
+  outputSize,
   playbackOrder,
   repacksJpeg,
   restoresJpeg,
@@ -72,19 +72,10 @@ function audioRate(info: MediaInfo, options: ConvertOptions, sourceRate: number 
   }
 }
 
-/** Picture area after the crop and downscaling, like `output_dims`. */
-function outputPixels(
-  info: MediaInfo,
-  options: ConvertOptions,
-  maxSize: number | null,
-): number | null {
-  const size = pictureSize(info, options);
-  if (!size) return null;
-  const short = Math.min(size.width, size.height);
-  const long = Math.max(size.width, size.height);
-  const target = maxSize === null ? null : Math.max(2, maxSize) & ~1;
-  if (target === null || target >= short) return size.width * size.height;
-  return target * Math.round((long * target) / short);
+/** Picture area after the crop, upscale and downscaling, like `output_dims`. */
+function outputPixels(info: MediaInfo, options: ConvertOptions): number | null {
+  const size = outputSize(info, options);
+  return size ? size.width * size.height : null;
 }
 
 /** Typical video bits per pixel per frame for a source codec at 1080p. */
@@ -199,7 +190,7 @@ export function estimateVideoBitrate(info: MediaInfo, options: ConvertOptions): 
   if (info.kind !== "video" || formatKind(options.format, info.kind) !== "video") return null;
   if (isAnimatedImage(options.format, info.kind) || codecOf(options) === null) return null;
   if (options.videoBitrate) return options.videoBitrate * 1000;
-  const pixels = outputPixels(info, options, options.maxSize);
+  const pixels = outputPixels(info, options);
   if (pixels === null) return null;
   const sourceFps = info.fps ?? 30;
   const fps = Math.min(sourceFps, options.fps ?? sourceFps);
@@ -221,7 +212,7 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
 
   if (out === "image") {
     // A picture, or one frame of a video.
-    const pixels = outputPixels(info, options, options.maxSize);
+    const pixels = outputPixels(info, options);
     if (pixels === null) return null;
     let bpp = imageBpp(options);
     if (info.kind === "image") {
@@ -252,7 +243,7 @@ export function estimateBytes(info: MediaInfo, options: ConvertOptions): number 
   // GIF or animated WebP and JPEG XL.
   const sourceAudio = sourceAudioRate(info);
   const limits = autoLimits(options.format, info.kind);
-  const pixels = outputPixels(info, options, options.maxSize ?? limits?.size ?? null);
+  const pixels = outputPixels(info, options);
   if (pixels === null) return null;
   // Speeding up packs more source frames into each second, until the cap.
   const speed = isAnimatedImage(options.format, info.kind) ? options.speed : 1;

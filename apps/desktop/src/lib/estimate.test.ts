@@ -285,3 +285,25 @@ describe("describeQuality", () => {
     expect(describeQuality(null, 1)).toBeNull();
   });
 });
+
+describe("upscaled estimates", () => {
+  const small: MediaInfo = { ...photo, width: 640, height: 480, sizeBytes: 100_000 };
+
+  it("counts the enlarged pixels of a picture", () => {
+    const plain = size(small, "png");
+    expect(size(small, "png", { upscale: { factor: 2 } })).toBeCloseTo(plain * 4, -2);
+    // A target the picture already reaches changes nothing.
+    expect(size(small, "png", { upscale: { size: 480 } })).toBe(plain);
+  });
+
+  it("raises a video's bitrate with its size", () => {
+    const hd: MediaInfo = { ...clip, width: 1280, height: 720 };
+    const plain = estimateVideoBitrate(hd, opts("mp4")) ?? 0;
+    const bigger = estimateVideoBitrate(hd, opts("mp4", { upscale: { size: 1080 } })) ?? 0;
+    expect(bigger).toBeGreaterThan(plain * 1.5);
+  });
+
+  it("lifts an animation's default cap when upscaling", () => {
+    expect(size(clip, "gif", { upscale: { factor: 2 } })).toBeGreaterThan(size(clip, "gif") * 10);
+  });
+});

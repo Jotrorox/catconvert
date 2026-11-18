@@ -44,7 +44,9 @@ import {
   type RecipeId,
   recipeFrom,
   replacesOriginal,
+  scalerFrom,
   sequenceOptions,
+  upscaleFrom,
 } from "./formats";
 import {
   dirName,
@@ -258,7 +260,7 @@ function historyItemFrom(raw: unknown): HistoryItem | null {
   return {
     ...rest,
     inputs,
-    options,
+    options: withResize(options),
     ...(sequence && typeof sequence.frameSecs === "number" ? { sequence } : {}),
     ...(typeof command === "string" ? { command } : {}),
   };
@@ -305,6 +307,18 @@ function loadSettings(): Defaults {
   };
 }
 
+/**
+ * Stored settings with the upscale and scaler checked. Settings saved before
+ * upscaling existed get none and "auto"; a recipe's are left out, so the
+ * defaults it is applied over fill them in.
+ */
+function withResize<T extends Partial<ConvertOptions>>(options: T, partial = false): T {
+  const fixed = { ...options };
+  if (!partial || "upscale" in options) fixed.upscale = upscaleFrom(options.upscale);
+  if (!partial || "scaler" in options) fixed.scaler = scalerFrom(options.scaler);
+  return fixed;
+}
+
 function loadRecipes(): Recipe[] {
   const parsed = load(RECIPES_KEY);
   if (!Array.isArray(parsed)) return [];
@@ -316,7 +330,10 @@ function loadRecipes(): Recipe[] {
         keepMetadata?: unknown;
       };
       const metadata = metadataFrom(recipe.options);
-      return { ...recipe, options: metadata ? { ...options, metadata } : options };
+      return {
+        ...recipe,
+        options: withResize(metadata ? { ...options, metadata } : options, true),
+      };
     });
 }
 

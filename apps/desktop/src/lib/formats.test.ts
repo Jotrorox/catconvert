@@ -16,26 +16,33 @@ import {
   fpsChoices,
   initialOptions,
   isAnimatedImage,
+  isHuge,
   isUntouched,
   keepsLocation,
   keepsMetadata,
   locationLine,
   looksLikePicture,
+  maxUpscaleSize,
   metadataFrom,
   naturalOrder,
   outputHasSound,
   outputSeconds,
+  outputSize,
   playbackOrder,
   RECIPES,
   recipeDetail,
   recipeFrom,
   repacksJpeg,
   replacesOriginal,
+  scalerFrom,
   sequenceFormat,
   sequenceFrame,
   sequenceName,
   sequenceOptions,
+  sequenceUpscaleChoices,
   sizeChoices,
+  upscaleChoices,
+  upscaleFrom,
 } from "./formats";
 
 const clip: MediaInfo = {
@@ -374,6 +381,158 @@ describe("formats", () => {
   });
 });
 
+describe("upscaling", () => {
+  const photo: MediaInfo = {
+    ...clip,
+    path: "/a/cat.jpg",
+    fileName: "cat.jpg",
+    extension: "jpg",
+    kind: "image",
+    durationSecs: null,
+    width: 640,
+    height: 480,
+    fps: null,
+    videoCodec: "mjpeg",
+    audioCodec: null,
+  };
+  const hd: MediaInfo = { ...clip, width: 1280, height: 720 };
+  const uhd: MediaInfo = { ...clip, width: 3840, height: 2160 };
+  const png = defaultOptions("png");
+  const mp4 = defaultOptions("mp4");
+
+  it("enlarges by a factor or to a short side, never shrinking", () => {
+    expect(outputSize(photo, { ...png, upscale: { factor: 2 } })).toEqual({
+      width: 1280,
+      height: 960,
+    });
+    expect(outputSize(photo, { ...png, upscale: { factor: 1.5 } })).toEqual({
+      width: 960,
+      height: 720,
+    });
+    expect(outputSize(hd, { ...mp4, upscale: { size: 1080 } })).toEqual({
+      width: 1920,
+      height: 1080,
+    });
+    // A target the picture already reaches changes nothing.
+    expect(outputSize(uhd, { ...mp4, upscale: { size: 1080 } })).toEqual({
+      width: 3840,
+      height: 2160,
+    });
+    // Turned and cropped first, then enlarged.
+    expect(
+      outputSize(photo, {
+        ...png,
+        rotate: 90,
+        crop: { aspect: [1, 1], area: null },
+        upscale: { factor: 2 },
+      }),
+    ).toEqual({ width: 960, height: 960 });
+  });
+
+  it("keeps video sides even and caps the result with an explicit size", () => {
+    const odd: MediaInfo = { ...clip, width: 641, height: 361 };
+    expect(outputSize(odd, { ...mp4, upscale: { size: 721 } })).toEqual({
+      width: 1278,
+      height: 720,
+    });
+    expect(outputSize(hd, { ...mp4, upscale: { factor: 3 }, maxSize: 1080 })).toEqual({
+      width: 1920,
+      height: 1080,
+    });
+  });
+
+  it("lifts an animation's default size cap only when upscaling", () => {
+    const gif = defaultOptions("gif");
+    expect(outputSize(hd, gif)).toEqual({ width: 852, height: 480 });
+    expect(outputSize(hd, { ...gif, upscale: { factor: 2 } })).toEqual({
+      width: 2560,
+      height: 1440,
+    });
+    expect(outputSize(hd, { ...gif, upscale: { factor: 2 }, maxSize: 480 })).toEqual({
+      width: 852,
+      height: 480,
+    });
+  });
+
+  it("offers presets that enlarge the file and fit the format", () => {
+    expect(upscaleChoices(photo, png)).toEqual([
+      { factor: 2 },
+      { factor: 3 },
+      { factor: 4 },
+      { size: 720 },
+      { size: 1080 },
+      { size: 1440 },
+      { size: 2160 },
+    ]);
+    expect(upscaleChoices(hd, mp4)).toEqual([
+      { factor: 2 },
+      { factor: 3 },
+      { factor: 4 },
+      { size: 1080 },
+      { size: 1440 },
+      { size: 2160 },
+    ]);
+    // Video encoders stop at 8192 px on the long side: 4K only doubles.
+    expect(upscaleChoices(uhd, mp4)).toEqual([{ factor: 2 }]);
+    expect(maxUpscaleSize(uhd, mp4)).toBe(4608);
+    // A still from that video can go further.
+    expect(upscaleChoices(uhd, defaultOptions("png"))).toEqual([
+      { factor: 2 },
+      { factor: 3 },
+      { factor: 4 },
+    ]);
+    expect(sequenceUpscaleChoices(photo, defaultOptions("gif"))).toHaveLength(7);
+  });
+
+  it("warns about huge results only when upscaling makes them", () => {
+    expect(isHuge(uhd, { ...mp4, upscale: { factor: 2 } })).toBe(true);
+    expect(isHuge(hd, { ...mp4, upscale: { size: 2160 } })).toBe(false);
+    expect(isHuge(uhd, mp4)).toBe(false);
+    expect(isHuge(hd, { ...defaultOptions("gif"), upscale: { size: 1440 } })).toBe(true);
+    expect(isHuge(photo, { ...png, upscale: { factor: 8 } })).toBe(false);
+    const big: MediaInfo = { ...photo, width: 4032, height: 3024 };
+    expect(isHuge(big, { ...png, upscale: { factor: 2 } })).toBe(false);
+    expect(isHuge(big, { ...png, upscale: { factor: 3 } })).toBe(true);
+  });
+
+  it("counts an upscale as an edit and describes it in recipes", () => {
+    expect(isUntouched(photo, { ...png, upscale: { factor: 2 } })).toBe(false);
+    expect(isUntouched(photo, { ...png, upscale: { size: 480 } })).toBe(true);
+    expect(recipeDetail(photo, { ...png, upscale: { factor: 2 } })).toBe("2× upscale · lossless");
+    expect(recipeDetail(hd, { ...mp4, upscale: { size: 1080 } })).toBe(
+      "Upscaled to 1080p · balanced",
+    );
+  });
+
+  it("carries an upscale to other files unless it gets too big", () => {
+    const available = () => true;
+    const options = { ...mp4, upscale: { factor: 2 }, scaler: "spline" } as const;
+    expect(fitOptions(hd, options, available)).toMatchObject({
+      upscale: { factor: 2 },
+      scaler: "spline",
+    });
+    expect(fitOptions(uhd, { ...mp4, upscale: { factor: 3 } }, available)?.upscale).toBeNull();
+    // A target the file reaches stays, as it changes nothing...
+    expect(fitOptions(uhd, { ...mp4, upscale: { size: 1080 } }, available)?.upscale).toEqual({
+      size: 1080,
+    });
+    // ...except where it would lift an animation's default size cap.
+    const gif = { ...defaultOptions("gif"), upscale: { size: 1080 } };
+    expect(fitOptions(uhd, gif, available)?.upscale).toBeNull();
+  });
+
+  it("reads stored upscale settings, defaulting what's missing or wrong", () => {
+    expect(upscaleFrom(undefined)).toBeNull();
+    expect(upscaleFrom({ factor: 2 })).toEqual({ factor: 2 });
+    expect(upscaleFrom({ size: 1080 })).toEqual({ size: 1080 });
+    expect(upscaleFrom({ factor: 20 })).toBeNull();
+    expect(upscaleFrom({ size: "big" })).toBeNull();
+    expect(scalerFrom(undefined)).toBe("auto");
+    expect(scalerFrom("spline")).toBe("spline");
+    expect(scalerFrom("nearest")).toBe("auto");
+  });
+});
+
 describe("pictures → animation", () => {
   const photo = (path: string, width = 4000, height = 3000): MediaInfo => ({
     ...clip,
@@ -435,6 +594,20 @@ describe("pictures → animation", () => {
       height: 640,
     });
     expect(sequenceFrame({ ...photo("/p/a.jpg"), width: null }, gif)).toBeNull();
+    // An upscale lifts the default cap; an explicit size still applies.
+    const small = photo("/p/a.jpg", 640, 480);
+    expect(sequenceFrame(small, { ...gif, upscale: { factor: 2 } })).toEqual({
+      width: 1280,
+      height: 960,
+    });
+    expect(sequenceFrame(small, { ...gif, upscale: { size: 721 } })).toEqual({
+      width: 960,
+      height: 720,
+    });
+    expect(sequenceFrame(small, { ...gif, upscale: { factor: 4 }, maxSize: 1080 })).toEqual({
+      width: 1440,
+      height: 1080,
+    });
   });
 
   it("names the animation after the pictures or their folder", () => {

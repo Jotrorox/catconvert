@@ -141,6 +141,19 @@ export type Destination =
   | { kind: "folder"; path: string; byKind: boolean }
   | { kind: "replaceInput" };
 
+/**
+ * Making the picture bigger: `factor` multiplies both sides (1–8), `size` is
+ * the short side to reach in pixels (2–16384, e.g. 1080 for 1080p). Never
+ * shrinks; a target the picture already reaches changes nothing.
+ */
+export type Upscale = { factor: number } | { size: number };
+
+/**
+ * How pixels are resampled. `auto` is Lanczos for pictures, GIFs and any
+ * enlargement, and ffmpeg's bicubic for shrinking video.
+ */
+export type Scaler = "auto" | "lanczos" | "spline" | "bicubic";
+
 /** What became of an original a conversion replaced. */
 export type Replaced = { to: "trash" } | { to: "renamed"; path: string };
 
@@ -148,8 +161,12 @@ export type ConvertOptions = {
   format: OutputFormat;
   trimStart: number | null;
   trimEnd: number | null;
-  /** Short side in pixels; never upscales. */
+  /** Short side in pixels; never upscales. Caps the result of `upscale` too. */
   maxSize: number | null;
+  /** Enlarge the picture first; `null` keeps its size (shrink-only, as before). */
+  upscale: Upscale | null;
+  /** Resampling filter for any resize. */
+  scaler: Scaler;
   fps: number | null;
   rotate: Rotation;
   flip: boolean;

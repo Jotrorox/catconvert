@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::convert::{
     ANIMATED_JXL_MAX_SIZE, ANIMATED_WEBP_MAX_SIZE, FRAME_MEMORY_BUDGET, GIF_MAX_SIZE, VideoRate,
-    cjxl_step, free_path, lerp, push_animated_webp, push_ffmpeg_jxl, push_mp4_flags,
-    push_video_encoder, scratch_path, turn_filters,
+    check_side, cjxl_step, enlarged_dims, free_path, lerp, push_animated_webp, push_ffmpeg_jxl,
+    push_mp4_flags, push_video_encoder, scratch_path, turn_filters,
 };
 use crate::ffmpeg::format_secs;
 use crate::jxl::is_jxl;
@@ -118,7 +118,8 @@ const MAX_RUNS: usize = 8;
 ///
 /// The pictures play as `options.direction` says. The frame takes the size
 /// of the first picture (after its EXIF rotation), shrunk by
-/// `options.max_size` or the format's usual cap, as for a video. `support`
+/// `options.max_size` or the format's usual cap, as for a video, or enlarged
+/// by `options.upscale`. `support`
 /// says which JPEG XL tools are installed.
 ///
 /// # Errors
@@ -126,7 +127,8 @@ const MAX_RUNS: usize = 8;
 /// [`Error::Unsupported`] for fewer than two or more than [`MAX_PICTURES`]
 /// pictures, an input that isn't a still picture or whose name can't go in a
 /// list file, a format that doesn't animate, an unknown size of the first
-/// picture, a frame time outside 0.02–60 s, or missing JPEG XL tools.
+/// picture, a frame time outside 0.02–60 s, an upscale past what the format
+/// takes, or missing JPEG XL tools.
 pub fn plan_sequence(
     inputs: &[MediaInfo],
     options: &ConvertOptions,
@@ -204,13 +206,14 @@ pub fn plan_sequence(
         scratch.push(decoded);
     }
 
+    let flags = options.scaler.sharp_flags();
     let fit = match sequence.fit {
         Fit::Pad => format!(
-            "scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,\
+            "scale={width}:{height}:force_original_aspect_ratio=decrease:flags={flags},\
              pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
         ),
         Fit::Crop => format!(
-            "scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,\
+            "scale={width}:{height}:force_original_aspect_ratio=increase:flags={flags},\
              crop={width}:{height}"
         ),
     };
@@ -601,8 +604,9 @@ fn frame_centis(secs: f64) -> Result<u32> {
     Ok(centis as u32)
 }
 
-/// The frame: the first picture's displayed size, shrunk so its short side
-/// is at most the chosen or default cap, with even sides for video encoders.
+/// The frame: the first picture's displayed size, enlarged by the upscale or
+/// shrunk so its short side is at most the chosen or default cap, with even
+/// sides for video encoders.
 fn frame_size(first: &MediaInfo, options: &ConvertOptions) -> Result<(u32, u32)> {
     let (w, h) = first
         .width
@@ -617,6 +621,14 @@ fn frame_size(first: &MediaInfo, options: &ConvertOptions) -> Result<(u32, u32)>
         OutputFormat::Jxl => Some(ANIMATED_JXL_MAX_SIZE),
         _ => None,
     };
+    if let Some(upscale) = options.upscale {
+        upscale.validate()?;
+    }
+    let video = options.codec().is_some();
+    if let Some(dims) = enlarged_dims((w, h), options, true) {
+        check_side(dims, options, video)?;
+        return Ok(dims);
+    }
     let target = options.max_size.or(default_max).map(|t| t.max(2) & !1);
     let (w, h) = match target {
         Some(t) if t < w.min(h) => {
@@ -1150,5 +1162,39 @@ mod tests {
         assert!(OutputFormat::Webp.animates_pictures());
         assert!(!OutputFormat::Png.animates_pictures());
         assert!(!OutputFormat::Mp3.animates_pictures());
+    }
+
+    #[test]
+    fn upscale_enlarges_the_frame_and_skips_the_usual_cap() {
+        let small = (1..=3)
+            .map(|i| picture(&format!("icon {i}.png"), "png", 320, 240))
+            .collect::<Vec<_>>();
+        let options = ConvertOptions {
+            upscale: Some(crate::Upscale::Factor(2.0)),
+            scaler: crate::Scaler::Spline,
+            ..gif()
+        };
+        assert_eq!(frame_size(&small[0], &options).expect("size"), (640, 480));
+        let plan = plan_of(&small, &options, &SequenceOptions::default());
+        assert!(
+            plan.command_line()
+                .contains("scale=640:480:force_original_aspect_ratio=decrease:flags=spline"),
+            "{}",
+            plan.command_line()
+        );
+        // 1080p for a video slideshow, even past the first picture's size.
+        let mp4 = ConvertOptions {
+            format: OutputFormat::Mp4,
+            upscale: Some(crate::Upscale::Size(1080)),
+            ..ConvertOptions::default()
+        };
+        assert_eq!(frame_size(&small[0], &mp4).expect("size"), (1440, 1080));
+        // Too big for a video file.
+        let huge = ConvertOptions {
+            upscale: Some(crate::Upscale::Factor(4.0)),
+            ..mp4
+        };
+        let err = frame_size(&cats(1)[0], &huge).expect_err("too big");
+        assert!(err.to_string().contains("16000×12000"), "{err}");
     }
 }

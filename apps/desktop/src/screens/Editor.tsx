@@ -18,6 +18,7 @@ import { DestinationField } from "../components/DestinationField";
 import { Icon } from "../components/Icon";
 import { OutputField } from "../components/OutputField";
 import { QualityField } from "../components/QualityField";
+import { type SizePick, SizeSelect, UpscaleSettings } from "../components/SizeField";
 import { TrimBar } from "../components/TrimBar";
 import {
   type Aspect,
@@ -58,22 +59,29 @@ import {
   codecOf,
   DIRECTIONS,
   describeStreams,
+  enlarges,
   FADE_CHOICES,
   fadeSpans,
+  fitsLimits,
   folderName,
   formatKind,
   fpsChoices,
   groupsFor,
   isAnimatedImage,
+  isHuge,
   isLossless,
   JXL_EFFORTS,
   keepsLocation,
   keepsMetadata,
   label,
   locationLine,
+  MAX_UPSCALE_SIZE,
   METADATA_CHOICES,
+  maxLongSide,
+  maxUpscaleSize,
   outputHasSound,
   outputSeconds,
+  outputSize,
   repacksJpeg,
   replacesOriginal,
   restoresJpeg,
@@ -82,6 +90,9 @@ import {
   sizeChoices,
   sizeLabel,
   speedLabel,
+  upscaleChoices,
+  upscaleLabel,
+  upscaleTarget,
 } from "../lib/formats";
 import { FALLBACK_FPS, stepFrame } from "../lib/frames";
 import { dirName, targetOf } from "../lib/output";
@@ -551,8 +562,47 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
   const animatedImage = () => isAnimatedImage(options().format, info().kind);
   const auto = () => autoLimits(options().format, info().kind);
   const autoSize = () => {
+    // An upscale lifts the animation's default size cap.
+    if (options().upscale) return null;
     const limit = auto()?.size;
     return limit !== undefined && (shortSide(info(), options()) ?? 0) > limit ? limit : null;
+  };
+
+  // Upscaling. The short side is the picture's after the turn and crop.
+  const sourceShort = () => shortSide(info(), options());
+  const upscaling = () => (enlarges(info(), options()) ? (options().upscale ?? null) : null);
+  const upscalePresets = createMemo(() => upscaleChoices(info(), options()));
+  const evenSides = () => outKind() === "video";
+  const minUpscale = () => {
+    const short = sourceShort() ?? 1;
+    return evenSides() ? (short + 2) & ~1 : short + 1;
+  };
+  const maxUpscale = () => maxUpscaleSize(info(), options()) ?? MAX_UPSCALE_SIZE;
+  const canCustomUpscale = () => sourceShort() !== null && maxUpscale() >= minUpscale();
+  /** "Custom…" was picked; cleared by any other size and on another file. */
+  const [customUpscale, setCustomUpscale] = createSignal(false);
+  createEffect(on(info, () => setCustomUpscale(false), { defer: true }));
+  const showCustom = () => customUpscale() && upscaling() !== null;
+  const tooBig = () =>
+    upscaling() !== null && !fitsLimits(info(), options())
+      ? { limit: maxLongSide(options().format), format: label(options().format) }
+      : null;
+  const pickSize = (pick: SizePick) => {
+    if (pick !== "custom") {
+      setCustomUpscale(false);
+      updateOptions(
+        pick.upscale
+          ? { upscale: pick.upscale, maxSize: null }
+          : { maxSize: pick.maxSize, upscale: null },
+      );
+      return;
+    }
+    setCustomUpscale(true);
+    if (upscaling()) return updateOptions({ maxSize: null });
+    // Start halfway to 2×, within what the format can hold.
+    const half = Math.round((sourceShort() ?? 0) * 1.5);
+    const start = Math.max(minUpscale(), Math.min(maxUpscale(), half) & (evenSides() ? ~1 : ~0));
+    updateOptions({ upscale: { size: start }, maxSize: null });
   };
   // Speeding an animation up packs more source frames into each second.
   const playedFps = () => (info().fps ?? 30) * (animatedImage() ? options().speed : 1);
@@ -645,7 +695,8 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       isAvailable(options().format) &&
       (chosen === null || isCodecAvailable(chosen)) &&
       !(custom() && commandError() !== null) &&
-      outputError() === null
+      outputError() === null &&
+      tooBig() === null
     );
   };
 
@@ -673,8 +724,21 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       items.push({ icon: "scissors", text: `Keeps ${formatSpan(trimEnd() - trimStart())}` });
     }
     if (visual()) {
-      const size = o.maxSize ?? autoSize();
-      if (size !== null) items.push({ icon: "image", text: sizeLabel(size, outKind()) });
+      const upscale = upscaling();
+      const result = outputSize(info(), o);
+      if (upscale && result) {
+        const dims = `${result.width}×${result.height}`;
+        items.push({
+          icon: "image",
+          text:
+            "factor" in upscale
+              ? `${upscale.factor}× · ${dims}`
+              : `Upscaled to ${outKind() === "image" ? dims : sizeLabel(upscale.size, outKind())}`,
+        });
+      } else {
+        const size = o.maxSize ?? autoSize();
+        if (size !== null) items.push({ icon: "image", text: sizeLabel(size, outKind()) });
+      }
       if (o.rotate) items.push({ icon: "rotate", text: `Turned ${o.rotate}°` });
       if (o.flip) items.push({ icon: "flip", text: "Mirrored" });
       const cropped = cropLabel(picture(), o.crop);
@@ -1240,29 +1304,22 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
             <Show when={visual() || (outKind() === "video" && info().kind === "video")}>
               <div class="two-col">
                 <Show when={visual() && info().width !== null}>
-                  <label class="field">
-                    <span class="field-label">Size</span>
-                    <select
-                      class="select"
-                      onChange={(e) => {
-                        const v = e.currentTarget.value;
-                        updateOptions({ maxSize: v === "" ? null : Number(v) });
-                      }}
-                    >
-                      <option value="" selected={options().maxSize === null}>
-                        {autoSize() !== null
-                          ? `Auto (${sizeLabel(autoSize() ?? 0, outKind())})`
-                          : `Original (${sizeLabel(shortSide(info(), options()) ?? 0, info().kind)})`}
-                      </option>
-                      <For each={sizes()}>
-                        {(size) => (
-                          <option value={size} selected={options().maxSize === size}>
-                            {sizeLabel(size, outKind())}
-                          </option>
-                        )}
-                      </For>
-                    </select>
-                  </label>
+                  <SizeSelect
+                    keepLabel={
+                      autoSize() !== null
+                        ? `Auto (${sizeLabel(autoSize() ?? 0, outKind())})`
+                        : `Original (${sizeLabel(sourceShort() ?? 0, info().kind)})`
+                    }
+                    shrinkSizes={sizes()}
+                    sizeText={(size) => sizeLabel(size, outKind())}
+                    presets={upscalePresets()}
+                    presetText={(upscale) => upscaleLabel(upscale, outKind())}
+                    canCustom={canCustomUpscale()}
+                    maxSize={options().maxSize}
+                    upscale={upscaling()}
+                    custom={showCustom()}
+                    onPick={pickSize}
+                  />
                 </Show>
                 <Show when={outKind() === "video" && info().kind === "video"}>
                   <label class="field">
@@ -1290,6 +1347,21 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                   </label>
                 </Show>
               </div>
+            </Show>
+
+            <Show when={visual() && info().width !== null}>
+              <UpscaleSettings
+                custom={showCustom()}
+                minSize={minUpscale()}
+                maxSize={maxUpscale()}
+                target={upscaleTarget(sourceShort() ?? 0, upscaling())}
+                result={outputSize(info(), options())}
+                enlarged={upscaling() !== null}
+                scaler={options().scaler ?? "auto"}
+                huge={isHuge(info(), options())}
+                tooBig={tooBig()}
+                onChange={updateOptions}
+              />
             </Show>
 
             <Show when={animatedImage()}>

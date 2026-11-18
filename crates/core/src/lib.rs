@@ -41,9 +41,10 @@ mod sequence;
 
 pub use convert::{
     AudioRate, ConvertOptions, Crop, CropArea, Direction, HARDWARE_QUALITY_RANGE,
-    HEVC_HARDWARE_ENCODER, JxlOptions, JxlSupport, Metadata, OutputFormat, Plan, QualitySummary,
-    SoundOptions, Step, Support, Tool, VIDEO_KBPS, VideoCodec, VideoRate, crf_range,
-    frame_output_path, frame_plan, output_path, plan, quality_summary,
+    HEVC_HARDWARE_ENCODER, JxlOptions, JxlSupport, MAX_SIDE, MAX_UPSCALE_FACTOR, MAX_VIDEO_SIDE,
+    Metadata, OutputFormat, Plan, QualitySummary, Scaler, SoundOptions, Step, Support, Tool,
+    Upscale, VIDEO_KBPS, VideoCodec, VideoRate, crf_range, frame_output_path, frame_plan,
+    output_path, plan, quality_summary, upscale_warning,
 };
 pub use custom::{
     INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER, command_template, custom_plan, fill_command,
