@@ -37,6 +37,16 @@ depends = ["setup"]
 dir = "{{config_root}}/apps/desktop"
 run = "pnpm tauri build"
 
+[tasks.icons]
+description = "Regenerate the app icons in apps/desktop/src-tauri/icons from assets/app-icon.svg"
+depends = ["setup"]
+dir = "{{config_root}}/apps/desktop"
+run = [
+  "pnpm tauri icon ../../assets/app-icon.svg",
+  # Desktop-only app: drop the mobile and unused outputs `tauri icon` always writes.
+  "rm -rf src-tauri/icons/android src-tauri/icons/ios src-tauri/icons/64x64.png",
+]
+
 [tasks.media-tools]
 description = "Build the ffmpeg/libjxl tools the app bundles (slow; default target: this machine)"
 usage = 'arg "[target]" help="Rust target triple, e.g. universal-apple-darwin"'
