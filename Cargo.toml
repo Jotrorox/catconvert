@@ -4,7 +4,7 @@ members = ["crates/*", "apps/desktop/src-tauri"]
 
 [workspace.package]
 # Bumped together with tauri.conf.json and package.json by `mise run release <version>`.
-version = "0.1.4"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.100"
 license = "BSD-3-Clause"
