@@ -1273,6 +1273,26 @@ describe("CatConvert", () => {
     expect(screen.getByRole("button", { name: /^Small webm/ })).toBeInTheDocument();
   });
 
+  it("leads back to the open file after a detour through Settings", async () => {
+    await openVideo();
+    navigate("settings");
+    await screen.findByRole("heading", { name: "Settings" });
+
+    // Files dropped meanwhile wait behind the open one, with a way back to it.
+    openPaths(["/clips/b.mov"]);
+    expect(screen.getByText("1 more waiting their turn")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open editor" }));
+    expect(screen.getByRole("heading", { name: "clip.mov" })).toBeInTheDocument();
+
+    // The Convert tab shows the editor rather than an empty drop zone.
+    navigate("settings");
+    fireEvent.click(screen.getByRole("button", { name: "Convert" }));
+    expect(screen.getByRole("heading", { name: "clip.mov" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Drop files on the kitty" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("converts every waiting file with one set of settings", async () => {
     render(() => <App />);
     await ffmpegFound();
