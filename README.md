@@ -38,6 +38,13 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 - **Frame by frame:** step through a video and save any frame as a PNG
   (←/→ and S). HDR video, which iPhones record by default, is tone-mapped when it
   becomes a picture or GIF.
+- **Before and after:** press C (or the compare button on the preview) to see
+  the original next to what the current settings make of it, encoded for real
+  and updated as you change the format or quality. Drag the divider to wipe
+  between them, or put them side by side on wide windows; phones flip between
+  the two with a tap. Zoom to 100% or 200% to judge compression up close; both
+  halves stay in step. Videos compare the frame on screen. Finished files open
+  the same comparison from the Queue and History. The choice is remembered.
 - **Privacy:** remove location data and keep the rest of the metadata.
 - **Size estimate** before you convert, and a serial queue with live progress.
 - **Your choice of where files go** (Settings, or per conversion in the

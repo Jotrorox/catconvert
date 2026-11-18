@@ -746,38 +746,7 @@ pub fn plan(
         }
     }
 
-    // JPEG XL that ffmpeg can't decode: let djxl unpack it to (A)PNG first.
-    let mut source = input.clone();
-    if jxl_in && !jxl.ffmpeg_reads(input.kind == MediaKind::Video) {
-        if !jxl.djxl {
-            return Err(Error::unsupported(
-                "reading JPEG XL needs djxl from libjxl or an ffmpeg built with libjxl",
-            ));
-        }
-        let ext = if input.kind == MediaKind::Video {
-            "apng"
-        } else {
-            "png"
-        };
-        let decoded = scratch_path(output, "decoded", ext);
-        steps.push(Step {
-            tool: Tool::Djxl,
-            args: vec![
-                input.path.clone().into_os_string(),
-                decoded.clone().into_os_string(),
-                "--quiet".into(),
-            ],
-            duration_secs: None,
-            weight: 0.2,
-        });
-        source.path = decoded.clone();
-        source.extension = Some(ext.into());
-        source.video_codec = Some(ext.into());
-        // Whether djxl's PNG keeps HDR tags is up to libjxl; don't guess.
-        source.hdr = false;
-        source.tile_grid = None;
-        scratch.push(decoded);
-    }
+    let source = readable_source(input, jxl, output, &mut steps, &mut scratch)?;
 
     if format == OutputFormat::Jxl {
         // cjxl holds the whole animation, both halves of a boomerang.
@@ -955,6 +924,92 @@ pub fn plan(
     })
 }
 
+/// The input as ffmpeg can read it: `input` itself, or for JPEG XL that
+/// ffmpeg can't decode, a (A)PNG that a djxl step added to `steps` unpacks
+/// next to `output` first.
+fn readable_source(
+    input: &MediaInfo,
+    jxl: JxlSupport,
+    output: &Path,
+    steps: &mut Vec<Step>,
+    scratch: &mut Vec<PathBuf>,
+) -> Result<MediaInfo> {
+    let mut source = input.clone();
+    if !is_jxl(input) || jxl.ffmpeg_reads(input.kind == MediaKind::Video) {
+        return Ok(source);
+    }
+    if !jxl.djxl {
+        return Err(Error::unsupported(
+            "reading JPEG XL needs djxl from libjxl or an ffmpeg built with libjxl",
+        ));
+    }
+    let ext = if input.kind == MediaKind::Video {
+        "apng"
+    } else {
+        "png"
+    };
+    let decoded = scratch_path(output, "decoded", ext);
+    steps.push(Step {
+        tool: Tool::Djxl,
+        args: vec![
+            input.path.clone().into_os_string(),
+            decoded.clone().into_os_string(),
+            "--quiet".into(),
+        ],
+        duration_secs: None,
+        weight: 0.2,
+    });
+    source.path = decoded.clone();
+    source.extension = Some(ext.into());
+    source.video_codec = Some(ext.into());
+    // Whether djxl's PNG keeps HDR tags is up to libjxl; don't guess.
+    source.hdr = false;
+    source.tile_grid = None;
+    scratch.push(decoded);
+    Ok(source)
+}
+
+/// Plan writing the frames a conversion of `input` with `options` would
+/// encode, through the same trim, turn, crop, size and frame-rate filters,
+/// into a lossless PNG at `output` instead of encoding them. Keeps the last
+/// frame, or the first unless `last`. HDR is tone-mapped where this ffmpeg
+/// can, as a PNG can't hold it.
+///
+/// This is the "before" half of a comparison (see [`crate::sample_plan`]):
+/// the same pixels the encoder gets, so only the encoding differs.
+///
+/// # Errors
+///
+/// As [`plan`].
+pub(crate) fn frames_plan(
+    input: &MediaInfo,
+    options: &ConvertOptions,
+    output: &Path,
+    last: bool,
+    support: Support,
+) -> Result<Plan> {
+    // The same checks as the conversion itself.
+    plan(input, options, output, support)?;
+    let trim = trim_range(input, options)?;
+    let mut steps = Vec::new();
+    let mut scratch = Vec::new();
+    let source = readable_source(input, support.jxl, output, &mut steps, &mut scratch)?;
+    steps.push(ffmpeg_step(
+        &source,
+        options,
+        trim,
+        Sink::Sample { last },
+        output,
+        support,
+    ));
+    Ok(Plan {
+        steps,
+        output: output.to_path_buf(),
+        scratch,
+        writes: Vec::new(),
+    })
+}
+
 /// Where an ffmpeg step writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sink<'a> {
@@ -967,6 +1022,9 @@ enum Sink<'a> {
     SecondPass { log: &'a Path },
     /// Lossless PNG (or APNG when `animated`) for another tool to pick up.
     Frames { animated: bool },
+    /// The frames the encoder would get, as a lossless PNG of the last one
+    /// (or the first unless `last`), to compare the encoded result with.
+    Sample { last: bool },
 }
 
 /// The ffmpeg call that applies the edits in `options` to `input` and writes `out`.
@@ -1060,6 +1118,26 @@ fn ffmpeg_step(
     let q = options.quality.min(100);
 
     match (format, sink) {
+        (_, Sink::Sample { last }) => {
+            // The filters of the branch below that would encode this format.
+            let mut filters = match format {
+                OutputFormat::Mp4 | OutputFormat::Mov | OutputFormat::Mkv | OutputFormat::Webm => {
+                    video_filters(input, options, None, true)
+                }
+                _ if format.kind() == MediaKind::Image && !animated => {
+                    video_filters(input, options, None, format == OutputFormat::Avif)
+                }
+                _ => animation_filters(input, options, lead_trim),
+            };
+            if support.tone_map && input.hdr {
+                filters.insert(0, TONE_MAP_FILTER.to_owned());
+            }
+            let first: &[&str] = if last { &[] } else { &["-frames:v", "1"] };
+            push_video(&mut push, input, first, &filters);
+            // Every frame overwrites the last; fast zlib, as it is only looked at.
+            push(&["-c:v", "png", "-compression_level", "1", "-update", "1"]);
+            push(&["-an", "-sn", "-dn"]);
+        }
         (OutputFormat::Jxl, Sink::Frames { animated }) => {
             let filters = tone_mapped(animation_filters(input, options, lead_trim));
             if animated {
@@ -1202,7 +1280,7 @@ fn ffmpeg_step(
     }
 
     match options.metadata {
-        _ if matches!(sink, Sink::FirstPass { .. }) => {}
+        _ if matches!(sink, Sink::FirstPass { .. } | Sink::Sample { .. }) => {}
         Metadata::Keep => {}
         // Videos keep their place in container tags, e.g. `location` or
         // `com.apple.quicktime.location.ISO6709`; an empty value deletes one.
@@ -1220,7 +1298,7 @@ fn ffmpeg_step(
         Sink::Frames { .. } => 0.4,
         // x264 and libvpx analyse quickly on the first pass.
         Sink::FirstPass { .. } => 0.5,
-        Sink::Output | Sink::SecondPass { .. } => 1.0,
+        Sink::Output | Sink::SecondPass { .. } | Sink::Sample { .. } => 1.0,
     };
     Step {
         tool: Tool::Ffmpeg,
@@ -1723,7 +1801,7 @@ fn jxl_distance(options: &ConvertOptions) -> String {
 }
 
 /// The size and frame-rate caps an animation gets when the user picks none.
-fn animation_defaults(format: OutputFormat) -> (Option<u32>, Option<f64>) {
+pub(crate) fn animation_defaults(format: OutputFormat) -> (Option<u32>, Option<f64>) {
     match format {
         OutputFormat::Gif => (Some(GIF_MAX_SIZE), Some(GIF_FPS)),
         OutputFormat::Jxl => (Some(ANIMATED_JXL_MAX_SIZE), Some(ANIMATED_JXL_FPS)),
@@ -1862,7 +1940,7 @@ pub(crate) fn result_dims(input: &MediaInfo, options: &ConvertOptions) -> Option
 }
 
 /// Frame rate assumed for a video that doesn't say.
-const FALLBACK_FPS: f64 = 30.0;
+pub(crate) const FALLBACK_FPS: f64 = 30.0;
 
 /// Plan saving the frame of `input` at `at_secs` as a PNG, with the crop,
 /// turn, mirror, size and metadata choices of `options`. Their trim, frame

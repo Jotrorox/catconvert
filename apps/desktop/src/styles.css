@@ -2009,6 +2009,383 @@ code {
   }
 }
 
+/* Before and after. The comparison covers the single view, which stays as it
+   was underneath; the frame bar and tools float above both. */
+
+.preview .frame-bar,
+.preview .preview-tools {
+  z-index: 2;
+}
+
+/* Side by side, the preview takes the editor's whole width (see .compare-wide)
+   and gets wider, so each half keeps a useful shape. */
+.preview.compare-side {
+  aspect-ratio: 2 / 1;
+}
+
+.file-grid.compare-wide {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.compare {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background:
+    repeating-conic-gradient(var(--checker-a) 0% 25%, var(--checker-b) 0% 50%) 50% / 22px 22px,
+    var(--sunken);
+  animation: fade-in 200ms ease both;
+}
+
+.compare-pair {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 3px;
+  background: var(--surface);
+}
+
+.compare-stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.compare-pair .compare-stage {
+  position: relative;
+  background:
+    repeating-conic-gradient(var(--checker-a) 0% 25%, var(--checker-b) 0% 50%) 50% / 22px 22px,
+    var(--sunken);
+}
+
+.compare.zoomed .compare-stage {
+  cursor: grab;
+}
+
+.compare.zoomed .compare-stage.dragging {
+  cursor: grabbing;
+}
+
+.compare[data-mode="wipe"]:not(.zoomed) .compare-stage {
+  cursor: ew-resize;
+}
+
+.compare[data-mode="flip"]:not(.zoomed) .compare-stage {
+  cursor: pointer;
+}
+
+.compare-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.compare-content {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+}
+
+.compare-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  animation: fade-in 180ms ease both;
+}
+
+/* At 200% every pixel shows as a crisp square, artefacts included. */
+.compare-img.pixelated {
+  image-rendering: pixelated;
+}
+
+/* Opaque, so a half still on its way never shows the other one through it. */
+.compare-skeleton {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(100deg, transparent 30%, var(--sheen) 50%, transparent 70%) 0 0 / 200% 100%,
+    linear-gradient(var(--skeleton-from), var(--skeleton-to));
+  animation: shimmer 1.3s linear infinite;
+}
+
+.compare-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 2;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--media-line);
+  box-shadow: 0 0 0 1px var(--media-outline);
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+/* A generous invisible grip around the line. */
+.compare-divider::before {
+  content: "";
+  position: absolute;
+  inset: 0 -12px;
+}
+
+.compare-divider:focus-visible {
+  outline: none;
+}
+
+.compare-knob {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 999px;
+  background: var(--glass);
+  color: var(--ink);
+  box-shadow: var(--shadow-lift);
+  transform: translate(-50%, -50%);
+  transition: transform 260ms var(--spring);
+}
+
+.compare-divider:hover .compare-knob,
+.compare-stage.dragging .compare-knob {
+  transform: translate(-50%, -50%) scale(1.08);
+}
+
+.compare-divider:focus-visible .compare-knob {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.compare-label {
+  position: absolute;
+  top: 12px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(50% - 18px);
+  padding: 5px 11px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--scrim);
+  color: var(--on-scrim);
+  font-size: 12.5px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.compare-label.left {
+  left: 12px;
+}
+
+.compare-label.right {
+  right: 12px;
+}
+
+.compare-pair .compare-label,
+.compare-label.flip-label {
+  max-width: calc(100% - 24px);
+}
+
+.compare-label.flip-label {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.compare-icon {
+  flex: none;
+}
+
+.flip-hint {
+  flex: none;
+  opacity: 0.72;
+}
+
+.compare-spinner {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  border: 2px solid var(--scrim-wash);
+  border-top-color: var(--on-scrim);
+  border-radius: 50%;
+  animation: compare-spin 800ms linear infinite;
+}
+
+@keyframes compare-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+.compare-error {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 3;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: min(420px, calc(100% - 32px));
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: var(--scrim-strong);
+  color: var(--on-scrim);
+  font-size: 13px;
+  font-weight: 600;
+  transform: translate(-50%, -50%);
+}
+
+.compare-error-icon {
+  flex: none;
+  margin-top: 1px;
+}
+
+.compare-seg {
+  display: flex;
+  gap: 2px;
+  margin: 0;
+  padding: 4px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--glass);
+  box-shadow: var(--shadow-soft);
+}
+
+.compare-chip {
+  display: grid;
+  place-items: center;
+  min-width: 34px;
+  height: 34px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 800;
+  white-space: nowrap;
+  transition:
+    background 160ms ease,
+    color 160ms ease,
+    transform 260ms var(--spring);
+}
+
+.compare-chip.icon {
+  width: 34px;
+  padding: 0;
+}
+
+.compare-chip:hover {
+  background: var(--sunken);
+}
+
+.compare-chip:active {
+  transform: scale(0.92);
+}
+
+.compare-chip[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* Narrow previews: the zoom stays, the labels shrink. */
+@container (max-width: 440px) {
+  .compare-chip {
+    padding: 0 6px;
+    font-size: 12px;
+  }
+
+  .compare-label {
+    padding: 4px 9px;
+    font-size: 12px;
+  }
+}
+
+/* A finished file next to its original, over the Queue or History. */
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--drop-veil);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  animation: fade-in 180ms ease both;
+}
+
+.sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: min(880px, 100%);
+  max-height: calc(100vh - 48px);
+  padding: 18px 20px 20px;
+  overflow: auto;
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-float);
+  animation: rise-in 320ms var(--settle) both;
+}
+
+.sheet.wide {
+  width: min(1180px, 100%);
+}
+
+.sheet-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sheet-heading {
+  min-width: 0;
+}
+
+.sheet-title {
+  font-size: 22px;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.compare-time {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.compare-range {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.shell.compact .sheet-backdrop {
+  place-items: end stretch;
+  padding: 0;
+}
+
+.shell.compact .sheet {
+  max-height: 92vh;
+  border-radius: var(--radius-card) var(--radius-card) 0 0;
+  padding-bottom: calc(20px + env(safe-area-inset-bottom));
+}
+
 .audio-art {
   position: relative;
   display: grid;
