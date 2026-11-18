@@ -26,6 +26,7 @@ import type {
   VideoCodec,
 } from "./api";
 import * as api from "./api";
+import { type CompareLayout, canCompare } from "./compare";
 import { baseName } from "./format";
 import {
   codecFor,
@@ -155,6 +156,18 @@ export type Toast = {
   action?: { label: string; run: () => void };
 };
 
+/** A finished file shown next to its original (from the Queue or History). */
+export type Comparison = {
+  /** The converted file's name. */
+  name: string;
+  /** The original, probed. */
+  input: MediaInfo;
+  output: string;
+  outputBytes: number;
+  /** The settings it was converted with. */
+  options: ConvertOptions;
+};
+
 /** Where the in-app updater is. */
 export type UpdateState =
   | { status: "idle" }
@@ -202,6 +215,8 @@ type State = {
   lastFolder: string | null;
   /** The Finder Quick Action, once Settings has looked. */
   quickAction: QuickActionStatus | null;
+  /** A finished file being compared with its original. */
+  comparison: Comparison | null;
   toasts: Toast[];
 };
 
@@ -304,6 +319,8 @@ function loadSettings(): Defaults {
       ? (parsed.output as OutputChoice)
       : DEFAULTS.output,
     outputFolder: typeof parsed.outputFolder === "string" ? parsed.outputFolder : null,
+    compare: parsed.compare === true,
+    compareLayout: parsed.compareLayout === "side" ? "side" : "wipe",
   };
 }
 
@@ -358,6 +375,7 @@ const [state, setState] = createStore<State>({
   batch: null,
   lastFolder: null,
   quickAction: null,
+  comparison: null,
   toasts: [],
 });
 
@@ -1236,6 +1254,81 @@ export async function saveFrame(at: number) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Comparing finished files with their originals
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a finished job can be shown next to its original: a picture or
+ * video made from one file that is still there, with generated settings (an
+ * edited command may have cropped or turned it in ways the settings don't
+ * say).
+ */
+export function canCompareJob(job: JobEntry): boolean {
+  return (
+    job.stage === "done" &&
+    job.sequence === null &&
+    !job.custom &&
+    !job.replaces &&
+    canCompare(job.input, job.options.format)
+  );
+}
+
+/** Like {@link canCompareJob}, for a History entry (going by the last `checkHistory`). */
+export function canCompareHistory(item: HistoryItem): boolean {
+  const input = item.inputs?.[0];
+  return (
+    input !== undefined &&
+    item.options !== undefined &&
+    item.inputs?.length === 1 &&
+    !item.sequence &&
+    item.command === undefined &&
+    !item.replaced &&
+    // A frame saved from a video keeps the video's settings, not its own.
+    item.format === item.options.format &&
+    canCompare({ kind: item.kind }, item.format) &&
+    !state.missing.includes(item.output) &&
+    !state.missingInputs.includes(input)
+  );
+}
+
+/** Show a finished job's file next to its original. */
+export function compareJob(id: JobId) {
+  const job = state.jobs.find((j) => j.id === id);
+  if (!job || !canCompareJob(job)) return;
+  setState("comparison", {
+    name: baseName(job.output),
+    input: plain(job.input),
+    output: job.output,
+    outputBytes: job.outputBytes ?? 0,
+    options: plain(job.options),
+  });
+}
+
+/** Show a History entry's file next to its original, probing the original first. */
+export async function compareHistoryItem(id: string) {
+  const item = state.history.find((i) => i.id === id);
+  const path = item?.inputs?.[0];
+  if (!item || !path || !item.options || !canCompareHistory(item)) return;
+  const options = plain(item.options);
+  try {
+    const input = await api.probeFile(path);
+    setState("comparison", {
+      name: baseName(item.output),
+      input,
+      output: item.output,
+      outputBytes: item.outputBytes,
+      options,
+    });
+  } catch (error) {
+    toast(`Couldn't open ${baseName(path)}: ${errorText(error)}`, { tone: "error" });
+  }
+}
+
+export function closeComparison() {
+  setState("comparison", null);
+}
+
 export function isFinal(stage: JobStage) {
   return stage === "done" || stage === "failed" || stage === "cancelled";
 }
@@ -1610,6 +1703,16 @@ export function updateSettings(patch: Partial<Defaults>) {
   });
 }
 
+/** Turn the editor's before/after comparison on or off; remembered for next time. */
+export function setCompare(on: boolean) {
+  updateSettings({ compare: on });
+}
+
+/** Wipe between the two or show them side by side; remembered for next time. */
+export function setCompareLayout(layout: CompareLayout) {
+  updateSettings({ compareLayout: layout });
+}
+
 /**
  * Make `choice` where converted files go by default. Choosing a folder for
  * the first time takes the suggested one (`CatConvert` in Downloads), or
@@ -1788,6 +1891,7 @@ export function resetStore() {
     batch: null,
     lastFolder: null,
     quickAction: null,
+    comparison: null,
     toasts: [],
   });
 }

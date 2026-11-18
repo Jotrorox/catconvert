@@ -10,8 +10,10 @@ import { baseName, formatBytes, formatWhen } from "../lib/format";
 import { formatKind, KIND_TONE, label } from "../lib/formats";
 import {
   allRecipes,
+  canCompareHistory,
   checkHistory,
   chooseFiles,
+  compareHistoryItem,
   convertAgain,
   dragOut,
   type HistoryItem,
@@ -85,6 +87,12 @@ export const RecentRow: Component<{ item: HistoryItem; actions?: boolean }> = (p
       }
       items.push({ separator: true });
     }
+    if (canCompareHistory(item)) {
+      items.push({
+        label: "Compare with the original",
+        run: () => void compareHistoryItem(item.id),
+      });
+    }
     items.push({
       label: "Show in folder",
       run: () => void reveal(item.output),
@@ -143,6 +151,17 @@ export const RecentRow: Component<{ item: HistoryItem; actions?: boolean }> = (p
             format={props.item.format}
             disabled={missing()}
           />
+        </Show>
+        <Show when={props.actions && canCompareHistory(props.item)}>
+          <button
+            type="button"
+            class="icon-btn plain"
+            aria-label={`Compare ${baseName(props.item.output)} with the original`}
+            title="Compare with the original"
+            onClick={() => void compareHistoryItem(props.item.id)}
+          >
+            <Icon name="compare" size={18} />
+          </button>
         </Show>
         <Show when={source() !== null}>
           <button

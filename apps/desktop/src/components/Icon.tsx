@@ -80,6 +80,25 @@ const ICONS = {
     </>
   ),
   crop: () => <path d="M6.5 3v12.5a2 2 0 0 0 2 2H21M3 6.5h12.5a2 2 0 0 1 2 2V21" />,
+  wipe: () => (
+    <>
+      <rect x="3.5" y="5" width="17" height="14" rx="3" />
+      <path d="M12 2.5v19M8 10l-2 2 2 2M16 10l2 2-2 2" />
+    </>
+  ),
+  columns: () => (
+    <>
+      <rect x="3" y="5.5" width="7.5" height="13" rx="2" />
+      <rect x="13.5" y="5.5" width="7.5" height="13" rx="2" />
+    </>
+  ),
+  compare: () => (
+    <>
+      <path d="M12 5h5.5a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3H12Z" fill="currentColor" stroke="none" />
+      <rect x="3.5" y="5" width="17" height="14" rx="3" />
+      <path d="M12 2.5v19" />
+    </>
+  ),
   folder: () => (
     <path d="M3.5 7.5a2 2 0 0 1 2-2h3.8l2 2.2h7.2a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z" />
   ),

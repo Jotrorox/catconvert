@@ -26,6 +26,10 @@
 //! place ([`Destination`], chosen in [`ConvertOptions::destination`]). An
 //! [`OutputTarget`] can pick another folder, name or name pattern for one
 //! conversion (see [`Naming`] and [`resolve_output`]).
+//!
+//! Before converting, [`Samples`] can render the original and what the
+//! current settings make of it for a side-by-side comparison
+//! ([`sample_plan`] plans each half).
 
 mod convert;
 mod custom;
@@ -36,6 +40,7 @@ mod job;
 mod jxl;
 mod media;
 mod output;
+mod sample;
 mod scrub;
 mod sequence;
 
@@ -58,6 +63,9 @@ pub use job::{JobId, JobProgress, JobStage, JobTicket, Queue, SavedFrame};
 pub use jxl::{JxlTools, LIBJXL_ENV, has_jpeg_reconstruction, is_jxl_file};
 pub use media::{MediaInfo, MediaKind, jpeg_orientation, probe};
 pub use output::{Collision, Naming, OutputPreview, OutputTarget, PLACEHOLDERS, check_stem};
+pub use sample::{
+    SAMPLE_LEAD_SECS, Sample, SampleDecode, SamplePlan, SampleSide, Samples, sample_plan,
+};
 pub use scrub::scrub_file;
 pub use sequence::{
     Fit, MAX_PICTURES, SequenceOptions, plan_sequence, sequence_naming, sequence_output_path,

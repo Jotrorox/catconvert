@@ -17,6 +17,7 @@ use crate::convert::{
 };
 use crate::jxl::{self, JxlTools};
 use crate::media::{self, MediaInfo, MediaKind};
+use crate::sample::Pick;
 use crate::scrub;
 use crate::{Error, Result};
 
@@ -526,6 +527,77 @@ impl Ffmpeg {
             });
         }
         Ok(bytes)
+    }
+
+    /// Decode one frame of `input` into a lossless PNG at `out`: the first at
+    /// or after `pick`'s time, or the very last. With `limit`, the short side
+    /// is shrunk to at most that many pixels. `tone_map` turns HDR into SDR
+    /// where this ffmpeg can, the way [`Ffmpeg::frame`] shows HDR sources.
+    ///
+    /// Used to show an encoded comparison sample or a finished file in the
+    /// webview, whatever format it is in (see [`crate::Samples`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Ffmpeg`] if decoding fails or there is no frame to pick.
+    pub(crate) fn decode_png(
+        &self,
+        input: &Path,
+        pick: Pick,
+        limit: Option<u32>,
+        tone_map: bool,
+        out: &Path,
+    ) -> Result<()> {
+        let input = &self.readable(input)?;
+        let grid = self.tile_grid(input);
+        let seek_input = !jxl::is_jxl_file(input);
+        let at = match pick {
+            Pick::At(at) if at > 0.0 => Some(format_secs(at)),
+            _ => None,
+        };
+        let mut cmd = base_command(&self.ffmpeg);
+        cmd.args(["-hide_banner", "-nostdin", "-v", "error"]);
+        if let Some(at) = at.as_deref().filter(|_| seek_input) {
+            cmd.args(["-ss", at]);
+        }
+        cmd.arg("-i").arg(input);
+        if let Some(at) = at.as_deref().filter(|_| !seek_input) {
+            cmd.args(["-ss", at]);
+        }
+        let mut filters = Vec::new();
+        if tone_map && self.tone_map {
+            filters.push(TONE_MAP_FILTER.to_owned());
+        }
+        if let Some(limit) = limit {
+            let t = even(limit.max(2));
+            filters.push(format!(
+                "scale='if(gte(iw,ih),-2,min(iw,{t}))':'if(gte(iw,ih),min(ih,{t}),-2)':flags=lanczos"
+            ));
+        }
+        let chain = filters.join(",");
+        match grid {
+            Some(group) if chain.is_empty() => cmd.args(["-map", &format!("[0:g:{group}]")]),
+            Some(group) => cmd
+                .arg("-filter_complex")
+                .arg(format!("[0:g:{group}]{chain}[v]"))
+                .args(["-map", "[v]"]),
+            None if chain.is_empty() => cmd.args(["-map", "0:v:0"]),
+            None => cmd.args(["-map", "0:v:0", "-vf", &chain]),
+        };
+        if !matches!(pick, Pick::Last) {
+            cmd.args(["-frames:v", "1"]);
+        }
+        // Every frame overwrites the one before, so the last one stays.
+        cmd.args(["-c:v", "png", "-compression_level", "1", "-update", "1"])
+            .args(["-an", "-sn", "-dn", "-y"])
+            .arg(out);
+        capture(&mut cmd, &self.ffmpeg)?;
+        if !out.is_file() {
+            return Err(Error::Ffmpeg {
+                message: "no frame to show".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Render the first audio track as a PNG waveform of `width`×`height`

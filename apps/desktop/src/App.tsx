@@ -1,5 +1,6 @@
 import { createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js";
 import { CatPeek } from "./components/Cat";
+import { ComparisonSheet } from "./components/ComparisonSheet";
 import { Sidebar, type Tab, TabBar } from "./components/Navigation";
 import { Toasts } from "./components/Toasts";
 import { inTauri, onFileDrop, onJobProgress, onOpenedFiles, type UnlistenFn } from "./lib/api";
@@ -91,6 +92,9 @@ export default function App() {
             <p class="display">Drop to add</p>
           </div>
         </div>
+      </Show>
+      <Show when={state.comparison} keyed>
+        {(comparison) => <ComparisonSheet comparison={comparison} compact={compact()} />}
       </Show>
       <Toasts />
     </div>

@@ -24,6 +24,11 @@
 //! creates and checks the Settings folder, and playback and "Show in folder"
 //! work per file as above.
 //!
+//! The editor's before/after comparison shows samples that
+//! [`catconvert_core::Samples`] renders into a private temp folder; that
+//! folder joins the asset protocol's scope the first time (see
+//! [`compare_sample`]).
+//!
 //! Files can also come in from outside the window ("Open with", the Finder
 //! Quick Action, "Send to"); see [`incoming`] and [`quick_action`].
 //!
@@ -35,12 +40,12 @@ mod quick_action;
 mod theme;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use catconvert_core::{
     ConvertOptions, Destination, Error, Ffmpeg, JobId, JobTicket, JxlSupport, MediaInfo, Naming,
-    OutputFormat, OutputPreview, OutputTarget, QualitySummary, Queue, SavedFrame, SequenceOptions,
-    VideoCodec,
+    OutputFormat, OutputPreview, OutputTarget, QualitySummary, Queue, Sample, SampleSide, Samples,
+    SavedFrame, SequenceOptions, VideoCodec,
 };
 
 /// Folder in Downloads suggested when "Save to a folder" is first chosen.
@@ -67,6 +72,7 @@ enum Backend {
 
 struct AppState {
     backend: RwLock<Backend>,
+    compare: Compare,
 }
 
 impl AppState {
@@ -315,6 +321,65 @@ async fn playback_source(
 async fn loudness(state: State<'_, AppState>, path: String) -> Result<Option<f64>, String> {
     let ffmpeg = state.queue()?.ffmpeg().clone();
     blocking(move || ffmpeg.loudness(path.as_ref())).await
+}
+
+/// Before/after samples for the editor's comparison, in a temp folder the
+/// webview may read once the first sample is made.
+#[derive(Default)]
+struct Compare {
+    samples: Arc<Samples>,
+    allowed: OnceLock<()>,
+}
+
+impl Compare {
+    /// Let the webview load samples through the asset protocol.
+    fn allow(&self, app: &AppHandle) -> Result<(), String> {
+        if self.allowed.get().is_none() {
+            let root = self.samples.root().map_err(|err| err.to_string())?;
+            app.asset_protocol_scope()
+                .allow_directory(&root, true)
+                .map_err(|err| err.to_string())?;
+            let _ = self.allowed.set(());
+        }
+        Ok(())
+    }
+}
+
+/// One half of the editor's before/after comparison: the original, or what
+/// `options` make of it, at the frame `at` seconds in, with the short side
+/// at most `limit` pixels (`None`: full size). The picture is loaded from
+/// the returned path through the asset protocol.
+#[tauri::command]
+async fn compare_sample(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    info: MediaInfo,
+    options: ConvertOptions,
+    side: SampleSide,
+    at: f64,
+    limit: Option<u32>,
+) -> Result<Sample, String> {
+    let ffmpeg = state.queue()?.ffmpeg().clone();
+    state.compare.allow(&app)?;
+    let samples = Arc::clone(&state.compare.samples);
+    blocking(move || samples.render(&ffmpeg, &info, &options, side, at, limit)).await
+}
+
+/// A finished file's frame at `at` seconds as a picture the webview can
+/// show, to compare it with its original. `hdr` tone-maps HDR video.
+#[tauri::command]
+async fn compare_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    at: f64,
+    limit: Option<u32>,
+    hdr: bool,
+) -> Result<Sample, String> {
+    let ffmpeg = state.queue()?.ffmpeg().clone();
+    state.compare.allow(&app)?;
+    let samples = Arc::clone(&state.compare.samples);
+    blocking(move || samples.render_file(&ffmpeg, Path::new(&path), at, limit, hdr)).await
 }
 
 /// The command(s) a conversion would run, for the "show command" panel.
@@ -642,6 +707,7 @@ pub fn run() {
             let backend = start_backend(app.handle());
             app.manage(AppState {
                 backend: RwLock::new(backend),
+                compare: Compare::default(),
             });
             // Windows' "Open with" and "Send to" and Linux file managers pass
             // the files as arguments.
@@ -656,6 +722,8 @@ pub fn run() {
             relocate_ffmpeg,
             probe_file,
             preview_frame,
+            compare_sample,
+            compare_file,
             waveform,
             playback_source,
             loudness,
