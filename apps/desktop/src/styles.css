@@ -2858,13 +2858,14 @@ code {
   gap: 6px;
 }
 
+/* Pink unless a parent picks a tone, so a chip row is never left uncoloured. */
 .format-chip {
   min-width: 50px;
   padding: 7px 10px;
   border: 1.5px solid transparent;
   border-radius: 12px;
-  background: var(--tone-bg);
-  color: var(--tone-ink);
+  background: var(--tone-bg, var(--pink-bg));
+  color: var(--tone-ink, var(--pink-ink));
   font-size: 13.5px;
   font-weight: 800;
   letter-spacing: 0.02em;
@@ -2885,9 +2886,9 @@ button.format-chip:not(:disabled):active {
 }
 
 .format-chip[aria-pressed="true"] {
-  background: var(--tone-ink);
+  background: var(--tone-ink, var(--pink-ink));
   color: var(--on-accent);
-  box-shadow: 0 4px 10px -4px var(--tone-ink);
+  box-shadow: 0 4px 10px -4px var(--tone-ink, var(--pink-ink));
   animation: chip-pop 380ms var(--spring);
 }
 
@@ -3041,6 +3042,12 @@ button.format-chip:not(:disabled):active {
   color: var(--muted);
   font-size: 13px;
   font-variant-numeric: tabular-nums;
+}
+
+/* Video codec */
+
+.codec-field .format-chips {
+  margin-bottom: 6px;
 }
 
 /* Upscaling */
