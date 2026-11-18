@@ -99,7 +99,8 @@ const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The SHA-256 of this version's upscaler download for this platform,
 /// compiled in by the release build (`CATCONVERT_UPSCALER_SHA256`). Local
-/// builds have none and can only install the upscaler from a file.
+/// builds have none: they take the upscaler from a file, or download it
+/// with the weaker check of [`unpinned_download`].
 fn pinned_pack_sha256() -> Option<&'static str> {
     option_env!("CATCONVERT_UPSCALER_SHA256")
         .map(str::trim)
@@ -137,6 +138,49 @@ pub struct Download {
 #[must_use]
 pub fn can_download() -> bool {
     PACK_TARGET.is_some() && pinned_pack_sha256().is_some()
+}
+
+/// Where a build without a compiled-in SHA-256 can fetch the upscaler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpinnedDownload {
+    pub url: String,
+    /// The name to save it under.
+    pub file_name: String,
+    /// The `.sha256` published next to it, for [`matches_checksum`].
+    pub checksum_url: String,
+}
+
+/// The upscaler for a build made from source, which has no SHA-256 of it
+/// compiled in: the zip in the release of this version, and the checksum
+/// published with it. That checksum comes from the same place as the file, so
+/// it shows a damaged download but not a swapped one; such builds already
+/// take any upscaler zip the user picks (see [`install_files`]). `None` in
+/// release builds, which check against their own SHA-256 ([`downloads`]), and
+/// where no upscaler is built for this platform.
+#[must_use]
+pub fn unpinned_download() -> Option<UnpinnedDownload> {
+    if pinned_pack_sha256().is_some() {
+        return None;
+    }
+    let file_name = format!("{UPSCALER_NAME}-{}.zip", PACK_TARGET?);
+    let url = format!("{RELEASES}/v{}/{file_name}", env!("CARGO_PKG_VERSION"));
+    Some(UnpinnedDownload {
+        checksum_url: format!("{url}.sha256"),
+        url,
+        file_name,
+    })
+}
+
+/// Whether `file` has the SHA-256 that `checksum` starts with: the text of a
+/// `.sha256` file as `shasum` writes it, the hash and then the file's name.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the file can't be read.
+pub fn matches_checksum(file: &Path, checksum: &str) -> Result<bool> {
+    let expected = checksum.split_whitespace().next().unwrap_or_default();
+    let well_formed = expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit());
+    Ok(well_formed && sha256_file(file)?.eq_ignore_ascii_case(expected))
 }
 
 /// Every file a complete install fetches, the upscaler only where
@@ -573,6 +617,35 @@ mod tests {
             sha256_file(&path).expect("hash"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn checks_a_file_against_a_published_checksum() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("abc");
+        std::fs::write(&path, b"abc").expect("write");
+        let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(matches_checksum(&path, &format!("{sha}  abc\n")).expect("hash"));
+        assert!(matches_checksum(&path, &sha.to_ascii_uppercase()).expect("hash"));
+        let other = sha.replace('b', "c");
+        assert!(!matches_checksum(&path, &format!("{other}  abc\n")).expect("hash"));
+        // Not a checksum at all, e.g. an error page.
+        assert!(!matches_checksum(&path, "").expect("hash"));
+        assert!(!matches_checksum(&path, "<html>Not Found</html>").expect("hash"));
+    }
+
+    #[test]
+    fn only_builds_without_a_pinned_upscaler_download_it_unpinned() {
+        let unpinned = unpinned_download();
+        assert_eq!(
+            unpinned.is_some(),
+            PACK_TARGET.is_some() && pinned_pack_sha256().is_none()
+        );
+        if let Some(download) = unpinned {
+            assert!(download.url.starts_with(RELEASES));
+            assert!(download.url.ends_with(&download.file_name));
+            assert_eq!(download.checksum_url, format!("{}.sha256", download.url));
+        }
     }
 
     #[test]

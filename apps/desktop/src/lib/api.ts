@@ -393,7 +393,10 @@ export type UpscalerInfo = {
   missing: UpscalerPart[];
   /** The installed upscaler isn't the one this version comes with. */
   outdated: boolean;
-  /** Release builds can download the upscaler; local ones install it from a file. */
+  /**
+   * This build has the upscaler's SHA-256 built in, as releases do. The models
+   * can be downloaded either way, and see `unpinned`.
+   */
   canDownload: boolean;
   /** Bytes still to download, as far as known. */
   downloadBytes: number;
@@ -401,10 +404,24 @@ export type UpscalerInfo = {
   gpu: GpuCheck | null;
   /** A download or install is running. */
   busy: boolean;
+  /**
+   * A build from source: it downloads the upscaler from its version's release
+   * and checks it against the checksum published there, having no SHA-256 of
+   * its own.
+   */
+  unpinned: boolean;
 };
 
-/** How far the AI upscaling download has got. */
-export type UpscalerDownload = { received: number; total: number | null };
+/**
+ * How far the AI upscaling download has got, and what it is busy with: the
+ * files are fetched, then installed, then tried on the graphics card. Only
+ * fetching can be cancelled.
+ */
+export type UpscalerDownload = {
+  stage: "downloading" | "installing" | "testing";
+  received: number;
+  total: number | null;
+};
 
 /** Whether "Convert with CatConvert" is in Finder's Quick Actions menu. */
 export type QuickActionStatus = {

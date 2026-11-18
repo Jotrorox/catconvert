@@ -219,6 +219,10 @@ type State = {
   upscaler: api.UpscalerInfo | null;
   /** How far the AI upscaling download has got, while it runs. */
   upscalerDownload: api.UpscalerDownload | null;
+  /** Why the last AI upscaling download or install didn't work, until the next try. */
+  upscalerError: string | null;
+  /** The part of Settings to bring into view when it opens next. */
+  settingsTarget: "upscaler" | null;
   /** A finished file being compared with its original. */
   comparison: Comparison | null;
   toasts: Toast[];
@@ -381,6 +385,8 @@ const [state, setState] = createStore<State>({
   quickAction: null,
   upscaler: null,
   upscalerDownload: null,
+  upscalerError: null,
+  settingsTarget: null,
   comparison: null,
   toasts: [],
 });
@@ -493,10 +499,27 @@ async function upscalerChanged(info: api.UpscalerInfo) {
   await refreshFfmpeg();
 }
 
+/** Open Settings at AI upscaling, e.g. from the editor's "Add detail" link. */
+export function openUpscalerSettings() {
+  setState({ settingsTarget: "upscaler" });
+  navigate("settings");
+}
+
+/** Settings has brought its target into view. */
+export function clearSettingsTarget() {
+  setState({ settingsTarget: null });
+}
+
 function gpuToast(info: api.UpscalerInfo) {
   switch (info.gpu?.status) {
     case "ready":
-      toast(info.gpu.gpu ? `AI upscaling is ready on ${info.gpu.gpu}` : "AI upscaling is ready");
+      toast(
+        info.gpu.gpu ? `AI upscaling is ready on ${info.gpu.gpu}` : "AI upscaling is ready",
+        // Whoever came from a picture to install it gets a way back to it.
+        busyEditing() && state.screen !== "edit"
+          ? { action: { label: "Back to the editor", run: () => navigate("edit") } }
+          : {},
+      );
       break;
     case "noGpu":
       toast("Installed, but this computer has no graphics card AI upscaling can use", {
@@ -516,17 +539,36 @@ function gpuToast(info: api.UpscalerInfo) {
   }
 }
 
-/** Download and install AI upscaling, then try it out. */
+/** The user stopped the running download, so its failure is no news. */
+let upscalerCancelled = false;
+
+/**
+ * Download and install what AI upscaling still needs, then try it out. A
+ * failure stays in Settings (`upscalerError`) until the next try, since a
+ * toast is gone before a slow connection has been looked at.
+ */
 export async function downloadUpscaler() {
   if (state.upscalerDownload) return;
-  setState({ upscalerDownload: { received: 0, total: state.upscaler?.downloadBytes || null } });
+  upscalerCancelled = false;
+  setState({
+    upscalerError: null,
+    upscalerDownload: {
+      stage: "downloading",
+      received: 0,
+      total: state.upscaler?.downloadBytes || null,
+    },
+  });
   try {
     const info = await api.downloadUpscaler((progress) => setState({ upscalerDownload: progress }));
     await upscalerChanged(info);
-    gpuToast(info);
+    if (info.gpu) gpuToast(info);
+    else if (!info.binary) toast("The models are in. The upscaler itself is still missing");
   } catch (error) {
-    toast(errorText(error), { tone: "error" });
+    if (upscalerCancelled) toast("Download cancelled");
+    else setState({ upscalerError: errorText(error) });
+    // Part of it may be in all the same: the models, without the upscaler.
     await loadUpscaler();
+    await refreshFfmpeg();
   } finally {
     setState({ upscalerDownload: null });
   }
@@ -534,6 +576,7 @@ export async function downloadUpscaler() {
 
 /** Stop the running AI upscaling download. */
 export async function cancelUpscalerDownload() {
+  upscalerCancelled = true;
   try {
     await api.cancelUpscalerDownload();
   } catch {
@@ -545,6 +588,7 @@ export async function cancelUpscalerDownload() {
 export async function installUpscalerFromFiles() {
   const paths = await api.pickUpscalerFiles();
   if (paths.length === 0) return;
+  setState({ upscalerError: null });
   try {
     const info = await api.installUpscalerFiles(paths);
     await upscalerChanged(info);
@@ -554,7 +598,8 @@ export async function installUpscalerFromFiles() {
       gpuToast(info);
     }
   } catch (error) {
-    toast(errorText(error), { tone: "error" });
+    // Says which file was wrong, which takes longer to read than a toast stays.
+    setState({ upscalerError: errorText(error) });
   }
 }
 
@@ -562,6 +607,7 @@ export async function installUpscalerFromFiles() {
 export async function removeUpscaler() {
   try {
     await upscalerChanged(await api.removeUpscaler());
+    setState({ upscalerError: null });
     toast("AI upscaling removed");
   } catch (error) {
     toast(errorText(error), { tone: "error" });
@@ -2052,8 +2098,11 @@ export function resetStore() {
     quickAction: null,
     upscaler: null,
     upscalerDownload: null,
+    upscalerError: null,
+    settingsTarget: null,
     comparison: null,
     toasts: [],
   });
   upscalerCheck = null;
+  upscalerCancelled = false;
 }
