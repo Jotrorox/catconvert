@@ -26,12 +26,14 @@ import {
   restartApp,
   setOutput,
   setOutputByKind,
+  setTheme,
   state,
   toast,
   toggleQuickAction,
   type UpdateState,
   updateSettings,
 } from "../lib/store";
+import { THEME_CHOICES } from "../lib/theme";
 
 const INSTALL = [
   { os: "macOS", command: "brew install ffmpeg" },
@@ -130,6 +132,33 @@ const StartingSettings: Component = () => {
     </section>
   );
 };
+
+/** Light, dark, or the same as the system. */
+const Appearance: Component = () => (
+  <section class="card defaults">
+    <h2 class="section-title">Appearance</h2>
+    <fieldset class="field theme-field">
+      <legend class="field-label">Theme</legend>
+      <div class="format-chips">
+        <For each={THEME_CHOICES}>
+          {(item) => (
+            <button
+              type="button"
+              class="format-chip"
+              aria-pressed={state.theme === item.choice}
+              onClick={() => setTheme(item.choice)}
+            >
+              {item.label}
+            </button>
+          )}
+        </For>
+      </div>
+      <span class="item-meta">
+        Same as system turns dark and light along with your computer, even while CatConvert is open.
+      </span>
+    </fieldset>
+  </section>
+);
 
 const OUTPUT_CHOICES: readonly { choice: OutputChoice; label: string; detail: string }[] = [
   {
@@ -414,6 +443,8 @@ export const SettingsScreen: Component = () => {
       <OutputSettings />
 
       <OtherApps />
+
+      <Appearance />
 
       <UpdatesCard />
 

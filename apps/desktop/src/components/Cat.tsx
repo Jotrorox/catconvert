@@ -26,14 +26,14 @@ export const CatPeek: Component<CatProps> = (props) => (
       <ellipse cx="60" cy="97" rx="46" ry="5" fill="var(--cat-shadow)" stroke="none" />
     </Show>
     <g class="cat-ear left">
-      <path d="M27 52 31 13l27 19Z" fill="#fff" />
+      <path d="M27 52 31 13l27 19Z" fill="var(--cat-fur)" />
       <path d="m33.5 40 1.5-18 15 10.5Z" fill="var(--cat-pink)" stroke="none" />
     </g>
     <g class="cat-ear right">
-      <path d="M93 52 89 13 62 32Z" fill="#fff" />
+      <path d="M93 52 89 13 62 32Z" fill="var(--cat-fur)" />
       <path d="m86.5 40-1.5-18-15 10.5Z" fill="var(--cat-pink)" stroke="none" />
     </g>
-    <path d="M20 94V65c0-26 18-38 40-38s40 12 40 38v29Z" fill="#fff" />
+    <path d="M20 94V65c0-26 18-38 40-38s40 12 40 38v29Z" fill="var(--cat-fur)" />
     <Show
       when={props.sleepy}
       fallback={
@@ -49,9 +49,23 @@ export const CatPeek: Component<CatProps> = (props) => (
       <path d="M20 66 5 63.5M20 72.5 5 74.5M100 66l15-2.5M100 72.5l15 2" stroke-width="2.6" />
     </Show>
     <Show when={props.sleepy}>
-      <rect x="6" y="86" width="108" height="18" rx="9" fill="#fff" />
+      <rect x="6" y="86" width="108" height="18" rx="9" fill="var(--cat-fur)" />
     </Show>
-    <ellipse class="cat-paw left" cx="45" cy={props.sleepy ? 87 : 94} rx="12" ry="7" fill="#fff" />
-    <ellipse class="cat-paw right" cx="75" cy={props.sleepy ? 87 : 94} rx="12" ry="7" fill="#fff" />
+    <ellipse
+      class="cat-paw left"
+      cx="45"
+      cy={props.sleepy ? 87 : 94}
+      rx="12"
+      ry="7"
+      fill="var(--cat-fur)"
+    />
+    <ellipse
+      class="cat-paw right"
+      cx="75"
+      cy={props.sleepy ? 87 : 94}
+      rx="12"
+      ry="7"
+      fill="var(--cat-fur)"
+    />
   </svg>
 );

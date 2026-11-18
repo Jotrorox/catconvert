@@ -420,6 +420,7 @@ type Commands = {
   take_opened_files: { args: Record<string, never>; result: string[] };
   quick_action_status: { args: Record<string, never>; result: QuickActionStatus };
   set_quick_action: { args: { installed: boolean }; result: QuickActionStatus };
+  set_window_theme: { args: { theme: ThemeChoice }; result: null };
   "plugin:drag|start_drag": {
     args: { item: string[]; image: string; options: { mode: "copy" }; onEvent: Channel<DragEnd> };
     result: null;
@@ -774,6 +775,19 @@ export async function quickActionStatus(): Promise<QuickActionStatus> {
 /** Add or remove the Finder Quick Action. */
 export function setQuickAction(installed: boolean): Promise<QuickActionStatus> {
   return command("set_quick_action", { installed });
+}
+
+/** The app's look: follow the system, or always light or dark. */
+export type ThemeChoice = "system" | "light" | "dark";
+
+/**
+ * Give the native window (title bar, background behind the page) the theme,
+ * remembered for the next launch so the window opens in it, and show the
+ * window if it is still hidden: it starts hidden so it never flashes white.
+ */
+export async function setWindowTheme(theme: ThemeChoice): Promise<void> {
+  if (!inTauri) return;
+  await command("set_window_theme", { theme });
 }
 
 /** A drag out of the window is in progress, so a drop on it is our own file coming back. */

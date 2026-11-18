@@ -62,6 +62,8 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 - **Edit the command:** tweak the ffmpeg (or libjxl) arguments by hand before
   converting, and keep the edit in a recipe. It runs without a shell, only
   with CatConvert's tools, and still writes only the chosen output.
+- **Light and dark:** follows the system's appearance as it changes, or stays
+  light or dark (Settings → Appearance).
 - **Auto-updates** from GitHub Releases, signed with the updater key.
 
 Conversion runs through `ffmpeg`/`ffprobe` and libjxl's tools. Release builds

@@ -55,6 +55,7 @@ import {
   USUAL_OUTPUT,
   withoutExtension,
 } from "./output";
+import { applyTheme, storedTheme, THEME_KEY, type ThemeChoice } from "./theme";
 
 export type Screen = "convert" | "edit" | "queue" | "recipes" | "history" | "settings";
 
@@ -191,6 +192,8 @@ type State = {
   settings: Defaults;
   /** Recipes the user saved from the editor. */
   recipes: Recipe[];
+  /** Light, dark, or following the system. */
+  theme: ThemeChoice;
   /** Waiting files being queued with one set of settings. */
   batch: { done: number; total: number } | null;
   /** The folder last chosen to save in, for the next files opened while the app runs. */
@@ -334,6 +337,7 @@ const [state, setState] = createStore<State>({
   missingInputs: [],
   settings: loadSettings(),
   recipes: loadRecipes(),
+  theme: storedTheme(),
   batch: null,
   lastFolder: null,
   quickAction: null,
@@ -1563,6 +1567,24 @@ export async function toggleQuickAction() {
 // Settings and recipes
 // ---------------------------------------------------------------------------
 
+/**
+ * Show the chosen theme in the page and the native window. Called once before
+ * the app renders, so the first paint is already in the right colours.
+ */
+export function showTheme() {
+  applyTheme(state.theme);
+  void api.setWindowTheme(state.theme).catch(() => {
+    // The page is themed either way; only the title bar may not match.
+  });
+}
+
+/** Switch to `theme` and remember it. */
+export function setTheme(theme: ThemeChoice) {
+  setState("theme", theme);
+  save(THEME_KEY, theme);
+  showTheme();
+}
+
 export function updateSettings(patch: Partial<Defaults>) {
   setState("settings", (settings) => {
     const next = { ...settings, ...patch, formats: { ...settings.formats, ...patch.formats } };
@@ -1745,6 +1767,7 @@ export function resetStore() {
     missingInputs: [],
     settings: loadSettings(),
     recipes: loadRecipes(),
+    theme: storedTheme(),
     batch: null,
     lastFolder: null,
     quickAction: null,

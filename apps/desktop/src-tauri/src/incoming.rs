@@ -84,6 +84,7 @@ pub fn files_in_urls(urls: &[tauri::Url]) -> Vec<PathBuf> {
 /// Bring the window forward, e.g. when another launch handed us files.
 pub fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
