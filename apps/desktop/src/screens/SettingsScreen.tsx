@@ -2,7 +2,13 @@ import { type Component, createSignal, For, Match, onMount, Show, Switch } from 
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
 import { ReplaceConfirm } from "../components/ReplaceConfirm";
-import { type GpuCheck, type OutputFormat, thirdPartyLicenses } from "../lib/api";
+import {
+  type GpuCheck,
+  type OutputFormat,
+  thirdPartyLicenses,
+  type UpscalerDownload,
+  type UpscalerPart,
+} from "../lib/api";
 import { formatBytes } from "../lib/format";
 import {
   AI_MODELS,
@@ -13,6 +19,7 @@ import {
   type OutputChoice,
   QUALITY_STEPS,
   qualityStep,
+  recommendedAi,
 } from "../lib/formats";
 import { os } from "../lib/platform";
 import {
@@ -21,6 +28,7 @@ import {
   checkForUpdates,
   checkUpscalerGpu,
   chooseOutputFolder,
+  clearSettingsTarget,
   confirmReplace,
   downloadUpscaler,
   installUpdate,
@@ -515,46 +523,133 @@ function gpuText(check: GpuCheck | null): string {
   }
 }
 
+/** The files an install is made of, as Settings names them. */
+const PART_NAMES: Record<UpscalerPart, string> = {
+  upscaler: "the upscaler",
+  models: "three of the models",
+  generalModel: "the Photos model",
+};
+
+/** "a", "a and b", "a, b and c". */
+function listed(items: readonly string[]): string {
+  return items.length < 2
+    ? items.join("")
+    : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+/** What the download is busy with, and a word on how long that takes. */
+const STAGES: Record<UpscalerDownload["stage"], { title: string; detail: string | null }> = {
+  downloading: { title: "Downloading AI upscaling…", detail: null },
+  installing: { title: "Installing AI upscaling…", detail: "Checking and unpacking the files." },
+  testing: {
+    title: "Trying it on your graphics card…",
+    detail: "Enlarging a test picture, which takes a moment.",
+  },
+};
+
+const AI_NEEDS: Record<typeof os, string> = {
+  macos: "Needs macOS 12 or later.",
+  windows: "Needs a graphics card with a Vulkan driver.",
+  linux: "Needs a graphics card with a Vulkan driver.",
+  other: "Needs a graphics card with a Vulkan driver.",
+};
+
 /** Settings → AI upscaling: download, install from files, test, remove. */
 const AiUpscaling: Component = () => {
-  onMount(() => void loadUpscaler());
+  let section: HTMLElement | undefined;
+  let heading: HTMLHeadingElement | undefined;
+  onMount(() => {
+    void loadUpscaler();
+    // Arriving from the editor's "Add detail with AI upscaling": this card is
+    // halfway down the page.
+    if (state.settingsTarget !== "upscaler") return;
+    clearSettingsTarget();
+    section?.scrollIntoView?.({ block: "start" });
+    heading?.focus({ preventScroll: true });
+  });
+
   const info = () => state.upscaler;
   const progress = () => state.upscalerDownload;
-  const installed = () => (info()?.models.length ?? 0) > 0 && info()?.binary;
-  const complete = () => installed() && info()?.missing.length === 0;
   const busy = () => progress() !== null || info()?.busy === true;
   const pct = () => {
     const p = progress();
     return p?.total ? Math.min(100, Math.round((p.received / p.total) * 100)) : null;
   };
-  const models = () =>
-    AI_MODELS.filter((m) => info()?.models.includes(m.model))
-      .map((m) => m.label.replace(/^AI: (.)/, (_, first: string) => first.toUpperCase()))
-      .join(" · ");
+
+  /** What conversions still lack: an upscaler found elsewhere stands in for an installed one. */
+  const needed = () =>
+    (info()?.missing ?? []).filter((part) => part !== "upscaler" || !info()?.binary);
+  const usable = () => Boolean(info()?.binary) && (info()?.models.length ?? 0) > 0;
+  const complete = () => usable() && needed().length === 0;
+  /** Something is in the install folder. */
+  const started = () => info()?.origin === "installed" || (info()?.missing.length ?? 3) < 3;
+  /** The upscaler can be downloaded: checked by a built-in SHA-256, or by the release's. */
+  const downloadsUpscaler = () => Boolean(info()?.canDownload || info()?.unpinned);
+  /** The parts this build can download: the models always, the upscaler where one is built. */
+  const fetchable = () => needed().filter((part) => part !== "upscaler" || downloadsUpscaler());
+  const update = () => Boolean(info()?.outdated && info()?.canDownload);
+  /** No upscaler is built for this computer, so one has to be handed over as a file. */
+  const upscalerFromFile = () => needed().includes("upscaler") && !downloadsUpscaler();
+  /** A build from source, which trusts the release's own checksum for the upscaler. */
+  const unpinned = () => needed().includes("upscaler") && info()?.unpinned === true;
+  const cantRun = () => {
+    const gpu = info()?.gpu?.status;
+    return gpu === "noGpu" || gpu === "blackOutput" || gpu === "failed";
+  };
+
   const size = () => {
     const bytes = info()?.downloadBytes ?? 0;
     return bytes > 0 ? ` (about ${formatBytes(bytes)})` : "";
   };
+  const downloadLabel = () => {
+    if (fetchable().length === 0) return "Update the upscaler";
+    if (upscalerFromFile()) return `Download the models${size()}`;
+    return started() ? `Download the rest${size()}` : `Download and install${size()}`;
+  };
+
+  /** The model to start with: the first one, or the first that is installed. */
+  const recommended = () =>
+    usable() ? recommendedAi(info()?.models ?? []) : (AI_MODELS[0]?.model ?? null);
+
+  // Installing from files is the way round a download: open where it is the only way.
+  const [fromFiles, setFromFiles] = createSignal<boolean>();
+  const showFromFiles = () => fromFiles() ?? upscalerFromFile();
 
   return (
-    <section class="card update-card" aria-labelledby="ai-title">
-      <h2 class="section-title" id="ai-title">
+    <section ref={section} class="card update-card ai-card" aria-labelledby="ai-title">
+      <h2 ref={heading} class="section-title" id="ai-title" tabindex="-1">
         AI upscaling
       </h2>
       <p class="item-meta">
-        Enlarges photos and drawings with Real-ESRGAN, which adds detail instead of just making them
-        bigger. It runs on the graphics card and is an optional download: CatConvert's upscaler from
-        this release, and the models straight from the official Real-ESRGAN release. Downloading
-        only fetches files; nothing is sent.
+        Adds detail when a photo or drawing is made bigger, instead of only adding pixels. An
+        optional download that runs on your graphics card, with Real-ESRGAN.
       </p>
       <div class="update-body">
         <Show
           when={progress()}
           fallback={
             <>
-              <Show when={installed()} fallback={<p class="label-strong">Not installed</p>}>
-                <p class="label-strong">Installed</p>
-                <p class="item-meta">Models: {models()}</p>
+              <Switch>
+                <Match when={usable() && cantRun()}>
+                  <p class="label-strong">
+                    <Icon name="alert" size={16} class="update-error-icon" />
+                    Installed, but it can't run here
+                  </p>
+                </Match>
+                <Match when={usable()}>
+                  <p class="label-strong">
+                    <Icon name="check" size={16} class="ai-ready-icon" />
+                    Installed
+                  </p>
+                </Match>
+                <Match when={started()}>
+                  <p class="label-strong">Partly installed</p>
+                </Match>
+                <Match when={true}>
+                  <p class="label-strong">Not installed</p>
+                </Match>
+              </Switch>
+              <Show when={usable()}>
                 <p class="item-meta" role="status">
                   {gpuText(info()?.gpu ?? null)}
                 </p>
@@ -562,35 +657,35 @@ const AiUpscaling: Component = () => {
                   {(binary) => <p class="item-meta mono path">Using {binary()}</p>}
                 </Show>
               </Show>
-              <Show when={installed() && !complete()}>
-                <p class="item-meta">Some files are still missing{size()}.</p>
+              <Show when={started() && needed().length > 0}>
+                <p class="item-meta">
+                  Still missing: {listed(needed().map((part) => PART_NAMES[part]))}.
+                </p>
               </Show>
-              <Show when={info()?.outdated}>
+              <Show when={update()}>
                 <p class="item-meta">This version of CatConvert comes with a newer upscaler.</p>
               </Show>
+              <Show when={state.upscalerError}>
+                {(message) => (
+                  <p class="lossless-note warning-note ai-error" role="alert">
+                    <Icon name="alert" size={16} class="ai-error-icon" />
+                    <span>{message()}</span>
+                  </p>
+                )}
+              </Show>
               <div class="settings-actions">
-                <Show when={info()?.canDownload && (!complete() || info()?.outdated)}>
+                <Show when={fetchable().length > 0 || update()}>
                   <button
                     type="button"
                     class="btn btn-primary"
                     disabled={busy()}
                     onClick={() => void downloadUpscaler()}
                   >
-                    <Icon name="sparkle" size={16} />
-                    {installed() ? "Download the rest" : `Download and install${size()}`}
+                    <Icon name={state.upscalerError ? "refresh" : "sparkle"} size={16} />
+                    {downloadLabel()}
                   </button>
                 </Show>
-                <Show when={!complete() || !info()?.canDownload}>
-                  <button
-                    type="button"
-                    class="btn btn-outline"
-                    disabled={busy()}
-                    onClick={() => void installUpscalerFromFiles()}
-                  >
-                    Install from file…
-                  </button>
-                </Show>
-                <Show when={installed()}>
+                <Show when={usable()}>
                   <button
                     type="button"
                     class="btn btn-outline"
@@ -601,7 +696,7 @@ const AiUpscaling: Component = () => {
                     Test again
                   </button>
                 </Show>
-                <Show when={info()?.origin === "installed" || (info()?.missing.length ?? 3) < 3}>
+                <Show when={started()}>
                   <button
                     type="button"
                     class="btn btn-outline"
@@ -612,21 +707,76 @@ const AiUpscaling: Component = () => {
                   </button>
                 </Show>
               </div>
-              <Show when={!info()?.canDownload && !complete()}>
-                <p class="item-meta">
-                  To install without this app downloading, fetch{" "}
-                  <code class="mono">catconvert-upscaler-…zip</code> from this version's release,{" "}
-                  <code class="mono">realesrgan-ncnn-vulkan-20220424-ubuntu.zip</code> and{" "}
-                  <code class="mono">realesr-general-x4v3.pth</code> from the Real-ESRGAN v0.2.5.0
-                  release, then pick them with “Install from file…”.
-                </p>
+              <Show when={!complete()}>
+                <Show when={!usable()}>
+                  <p class="item-meta">
+                    {AI_NEEDS[os]} CatConvert tries it on your computer right after installing.
+                    Downloading only fetches files: the upscaler from this CatConvert release, the
+                    models from the official Real-ESRGAN release. Nothing is sent.
+                  </p>
+                </Show>
+                <Show when={unpinned()}>
+                  <p class="item-meta">
+                    This CatConvert was built from source. Releases check the upscaler against a
+                    fingerprint built into them; this one checks it against the checksum published
+                    with the release, which catches a damaged download but not a swapped one. To use
+                    your own, build it with <code class="mono">mise run upscaler</code> and install
+                    it from a file.
+                  </p>
+                </Show>
+                <Show when={upscalerFromFile()}>
+                  <p class="item-meta">
+                    CatConvert has no upscaler to download for this kind of computer. If you have
+                    one, install it from a file or point{" "}
+                    <code class="mono">CATCONVERT_UPSCALER</code> at it; the models can still be
+                    downloaded here.
+                  </p>
+                </Show>
+                <button
+                  type="button"
+                  class="link-btn"
+                  aria-expanded={showFromFiles()}
+                  aria-controls="ai-from-files"
+                  onClick={() => setFromFiles(!showFromFiles())}
+                >
+                  Install from files instead
+                </button>
+                <Show when={showFromFiles()}>
+                  <div class="ai-from-files" id="ai-from-files">
+                    <p class="item-meta">
+                      For a computer that can't download here. Fetch these somewhere else, then pick
+                      them all at once or one at a time:
+                    </p>
+                    <ul class="ai-files item-meta">
+                      <li>
+                        <code class="mono">catconvert-upscaler-…zip</code> from this version's
+                        CatConvert release
+                      </li>
+                      <li>
+                        <code class="mono">realesrgan-ncnn-vulkan-20220424-ubuntu.zip</code> and{" "}
+                        <code class="mono">realesr-general-x4v3.pth</code> from the Real-ESRGAN
+                        v0.2.5.0 release
+                      </li>
+                    </ul>
+                    <button
+                      type="button"
+                      class="btn btn-outline"
+                      disabled={busy()}
+                      onClick={() => void installUpscalerFromFiles()}
+                    >
+                      Install from file…
+                    </button>
+                  </div>
+                </Show>
               </Show>
             </>
           }
         >
           {(p) => (
             <>
-              <p class="label-strong">Downloading AI upscaling…</p>
+              <p class="label-strong" role="status">
+                {STAGES[p().stage].title}
+              </p>
               <div
                 class="progress update-progress"
                 role="progressbar"
@@ -638,19 +788,52 @@ const AiUpscaling: Component = () => {
                 <div class="progress-fill" style={{ width: `${Math.max(pct() ?? 100, 4)}%` }} />
               </div>
               <p class="item-meta">
-                {formatBytes(p().received)}
-                {p().total ? ` of ${formatBytes(p().total ?? 0)}` : ""}
+                {STAGES[p().stage].detail ??
+                  `${formatBytes(p().received)}${p().total ? ` of ${formatBytes(p().total ?? 0)}` : ""}`}
               </p>
-              <button
-                type="button"
-                class="btn btn-outline"
-                onClick={() => void cancelUpscalerDownload()}
-              >
-                Cancel
-              </button>
+              <Show when={p().stage === "downloading"}>
+                <button
+                  type="button"
+                  class="btn btn-outline"
+                  onClick={() => void cancelUpscalerDownload()}
+                >
+                  Cancel
+                </button>
+              </Show>
             </>
           )}
         </Show>
+      </div>
+      <div class="ai-guide">
+        <h3 class="field-label" id="ai-guide-title">
+          {usable() ? "Which one to pick" : "What you get"}
+        </h3>
+        <ul class="ai-models" aria-labelledby="ai-guide-title">
+          <For each={AI_MODELS}>
+            {(choice) => (
+              <li data-off={(usable() && !info()?.models.includes(choice.model)) || undefined}>
+                <span class="ai-model-name">
+                  {choice.name}
+                  <Show when={recommended() === choice.model}>
+                    <span class="ai-model-tag">Recommended</span>
+                  </Show>
+                  <Show when={usable() && !info()?.models.includes(choice.model)}>
+                    <span class="ai-model-tag" data-tone="plain">
+                      Not installed
+                    </span>
+                  </Show>
+                </span>
+                <span class="item-meta">{choice.hint}</span>
+              </li>
+            )}
+          </For>
+        </ul>
+        <p class="item-meta">
+          {usable()
+            ? "Choose a bigger size for a picture in the editor, then pick one of these as the scaler."
+            : "Once installed, they appear as scalers in the editor when a picture is made bigger."}{" "}
+          For videos and animations, upscaling stays classic.
+        </p>
       </div>
       <p class="item-meta settings-note">
         Real-ESRGAN models © 2021 Xintao Wang, BSD-3-Clause, as published with xinntao/Real-ESRGAN.

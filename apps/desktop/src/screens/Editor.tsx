@@ -134,7 +134,7 @@ import {
   isAvailable,
   isCodecAvailable,
   makeAnimation,
-  navigate,
+  openUpscalerSettings,
   saveFrame,
   saveRecipe,
   setCompare,
@@ -1521,7 +1521,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 aiModels={aiModels()}
                 ai={options().ai ?? null}
                 aiEstimate={aiSecs()}
-                onSetUpAi={() => navigate("settings")}
+                onSetUpAi={openUpscalerSettings}
                 onChange={updateOptions}
               />
             </Show>

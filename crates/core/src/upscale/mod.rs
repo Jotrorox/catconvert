@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use install::{
-    Download, DownloadKind, UpscalerStatus, can_download, downloads, install_files, licenses,
-    status, uninstall,
+    Download, DownloadKind, UnpinnedDownload, UpscalerStatus, can_download, downloads,
+    install_files, licenses, matches_checksum, status, uninstall, unpinned_download,
 };
 
 /// Environment variable naming an upscaler binary (our

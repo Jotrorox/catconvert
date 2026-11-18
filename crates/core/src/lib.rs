@@ -73,8 +73,10 @@ pub use sequence::{
 };
 pub use upscale::{
     AiModel, AiModels, Download, DownloadKind, GpuCheck, MAX_AI_PIXELS, MAX_AI_SCALE, UPSCALER_ENV,
-    Upscaler, UpscalerOrigin, UpscalerStatus, can_download as can_download_upscaler,
-    default_dir as upscaler_dir, downloads as upscaler_downloads,
-    estimate_secs as ai_estimate_secs, install_files as install_upscaler,
-    licenses as upscaler_licenses, status as upscaler_status, uninstall as uninstall_upscaler,
+    UnpinnedDownload, Upscaler, UpscalerOrigin, UpscalerStatus,
+    can_download as can_download_upscaler, default_dir as upscaler_dir,
+    downloads as upscaler_downloads, estimate_secs as ai_estimate_secs,
+    install_files as install_upscaler, licenses as upscaler_licenses,
+    matches_checksum as upscaler_matches_checksum, status as upscaler_status,
+    uninstall as uninstall_upscaler, unpinned_download as unpinned_upscaler_download,
 };

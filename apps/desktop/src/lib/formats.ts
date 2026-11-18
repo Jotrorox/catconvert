@@ -708,13 +708,41 @@ export function upscaleFrom(stored: unknown): Upscale | null {
   return null;
 }
 
-/** The AI upscaling models, in the order the editor lists them. */
-export const AI_MODELS: readonly { model: AiModel; label: string }[] = [
-  { model: "general", label: "AI: photos" },
-  { model: "photo", label: "AI: photos, most detail (slow)" },
-  { model: "anime", label: "AI: drawings and anime" },
-  { model: "anime-fast", label: "AI: anime, quick" },
+/**
+ * The AI upscaling models, in the order the editor lists them: `label` in the
+ * Scaler menu, `name` and `hint` where Settings says which one to pick.
+ */
+export const AI_MODELS: readonly { model: AiModel; label: string; name: string; hint: string }[] = [
+  {
+    model: "general",
+    label: "AI: photos",
+    name: "Photos",
+    hint: "Natural-looking detail in a few seconds. Start here.",
+  },
+  {
+    model: "photo",
+    label: "AI: photos, most detail (slow)",
+    name: "Photos, most detail",
+    hint: "The crispest result, but several times slower. Worth it for a picture you'll print.",
+  },
+  {
+    model: "anime",
+    label: "AI: drawings and anime",
+    name: "Drawings and anime",
+    hint: "Clean lines and flat colours for illustrations, comics and anime.",
+  },
+  {
+    model: "anime-fast",
+    label: "AI: anime, quick",
+    name: "Anime, quick",
+    hint: "The fastest one, for anime screenshots and frames.",
+  },
 ];
+
+/** The model to suggest first: the first of {@link AI_MODELS} that `installed` has. */
+export function recommendedAi(installed: readonly AiModel[]): AiModel | null {
+  return AI_MODELS.find((m) => installed.includes(m.model))?.model ?? null;
+}
 
 /** A stored AI model if it is one, otherwise `null` (classic upscaling). */
 export function aiFrom(stored: unknown): AiModel | null {

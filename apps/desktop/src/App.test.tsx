@@ -6,6 +6,7 @@ import type {
   FfmpegStatus,
   MediaInfo,
   OutputFormat,
+  UpscalerDownload,
   UpscalerInfo,
 } from "./lib/api";
 import * as api from "./lib/api";
@@ -1013,6 +1014,7 @@ describe("CatConvert", () => {
       downloadBytes: 51_816_585,
       gpu: null,
       busy: false,
+      unpinned: false,
     };
     const ready: UpscalerInfo = {
       ...missing,
@@ -1025,15 +1027,24 @@ describe("CatConvert", () => {
     };
     vi.mocked(api.upscalerStatus).mockResolvedValue(missing);
     let finish = (_info: UpscalerInfo) => {};
+    let progress = (_progress: UpscalerDownload) => {};
     vi.mocked(api.downloadUpscaler).mockImplementation(
       (onProgress) =>
         new Promise((resolve) => {
-          onProgress({ received: 25_000_000, total: 50_000_000 });
+          onProgress({ stage: "downloading", received: 25_000_000, total: 50_000_000 });
+          progress = onProgress;
           finish = resolve;
         }),
     );
     render(() => <App />);
     navigate("settings");
+    // Before installing: what comes with it, and which one to start with.
+    const guide = await screen.findByRole("list", { name: "What you get" });
+    expect(
+      within(guide)
+        .getAllByRole("listitem")
+        .map((li) => li.firstElementChild?.textContent),
+    ).toEqual(["PhotosRecommended", "Photos, most detail", "Drawings and anime", "Anime, quick"]);
     fireEvent.click(
       await screen.findByRole("button", { name: "Download and install (about 51.8 MB)" }),
     );
@@ -1041,14 +1052,17 @@ describe("CatConvert", () => {
       await screen.findByRole("progressbar", { name: "Downloading AI upscaling" }),
     ).toHaveAttribute("aria-valuenow", "50");
     expect(screen.getByText("25.0 MB of 50.0 MB")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    // Once the files are in, it says what it is busy with, and can't be cancelled.
+    progress({ stage: "installing", received: 50_000_000, total: 50_000_000 });
+    expect(await screen.findByText("Installing AI upscaling…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+    progress({ stage: "testing", received: 50_000_000, total: 50_000_000 });
+    expect(await screen.findByText("Trying it on your graphics card…")).toBeInTheDocument();
     vi.mocked(api.ffmpegStatus).mockResolvedValue({ ...status(), aiModels: ready.models });
     finish(ready);
     expect(await screen.findByText("Installed")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Models: Photos · Photos, most detail (slow) · Drawings and anime · Anime, quick",
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Which one to pick" })).toBeInTheDocument();
     expect(screen.getByText("Works on Apple M5.")).toBeInTheDocument();
     expect(await screen.findByText("AI upscaling is ready on Apple M5")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Download/ })).not.toBeInTheDocument();
@@ -1064,6 +1078,7 @@ describe("CatConvert", () => {
         "The graphics driver makes black pictures. Update it, then test again.",
       ),
     ).toBeInTheDocument();
+    expect(screen.getByText("Installed, but it can't run here")).toBeInTheDocument();
     // A driver that makes black pictures takes the models off the menu.
     expect(aiModels()).toEqual([]);
 
@@ -1086,6 +1101,7 @@ describe("CatConvert", () => {
       downloadBytes: 51_816_585,
       gpu: null,
       busy: false,
+      unpinned: false,
     });
     vi.mocked(api.pickUpscalerFiles).mockResolvedValue(["/dl/catconvert-upscaler.zip"]);
     vi.mocked(api.installUpscalerFiles).mockResolvedValue({
@@ -1099,20 +1115,163 @@ describe("CatConvert", () => {
       downloadBytes: 4_885_111,
       gpu: { status: "noGpu" },
       busy: false,
+      unpinned: false,
     });
     render(() => <App />);
     navigate("settings");
     expect(await screen.findByText("Not installed")).toBeInTheDocument();
+    // Where no upscaler is built for the computer, the models still download.
     expect(screen.queryByRole("button", { name: /Download and install/ })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Download the models (about 51.8 MB)" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/no upscaler to download for this kind of computer/),
+    ).toBeInTheDocument();
+    // The files to pick are spelled out, since they are the only way to the upscaler.
+    expect(screen.getByRole("button", { name: "Install from files instead" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
     expect(screen.getByText(/realesr-general-x4v3\.pth/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Install from file…" }));
-    expect(await screen.findByText("Installed")).toBeInTheDocument();
+    expect(await screen.findByText("Installed, but it can't run here")).toBeInTheDocument();
     expect(api.installUpscalerFiles).toHaveBeenCalledWith(["/dl/catconvert-upscaler.zip"]);
     expect(screen.getByText(/no graphics card AI upscaling can use/)).toBeInTheDocument();
-    expect(screen.getByText("Some files are still missing (about 4.9 MB).")).toBeInTheDocument();
+    expect(screen.getByText("Still missing: the Photos model.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download the rest (about 4.9 MB)" })).toBeEnabled();
+    // What isn't there yet is marked, and the suggestion moves to what is.
+    expect(
+      within(screen.getByRole("list", { name: "Which one to pick" }))
+        .getAllByRole("listitem")
+        .map((li) => li.firstElementChild?.textContent),
+    ).toEqual([
+      "PhotosNot installed",
+      "Photos, most detailRecommended",
+      "Drawings and anime",
+      "Anime, quick",
+    ]);
     expect(
       await screen.findByText("Installed. A file is still missing: see Settings → AI upscaling"),
     ).toBeInTheDocument();
+  });
+
+  it("keeps a failed AI upscaling download on the page until the next try", async () => {
+    const missing: UpscalerInfo = {
+      dir: "/data/upscaler",
+      binary: null,
+      origin: null,
+      models: [],
+      missing: ["upscaler", "models", "generalModel"],
+      outdated: false,
+      canDownload: true,
+      downloadBytes: 51_816_585,
+      gpu: null,
+      busy: false,
+      unpinned: false,
+    };
+    vi.mocked(api.upscalerStatus).mockResolvedValue(missing);
+    vi.mocked(api.downloadUpscaler).mockRejectedValueOnce(
+      "couldn't download realesr-general-x4v3.pth: the server didn't answer. Check your internet connection, then try again",
+    );
+    render(() => <App />);
+    navigate("settings");
+    fireEvent.click(await screen.findByRole("button", { name: /Download and install/ }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn't download realesr-general-x4v3.pth: the server didn't answer.",
+    );
+    expect(screen.getByText("Not installed")).toBeInTheDocument();
+
+    // Stopping a download is no error.
+    let stop = (_reason: string) => {};
+    vi.mocked(api.downloadUpscaler).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          stop = reject;
+        }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Download and install/ }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(api.cancelUpscalerDownload).toHaveBeenCalledOnce();
+    stop("the download was cancelled");
+    expect(await screen.findByText("Download cancelled")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /Download and install/ })).toBeEnabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("downloads the upscaler in a build from source, saying how it is checked", async () => {
+    const missing: UpscalerInfo = {
+      dir: "/data/upscaler",
+      binary: null,
+      origin: null,
+      models: [],
+      missing: ["upscaler", "models", "generalModel"],
+      outdated: false,
+      canDownload: false,
+      downloadBytes: 51_816_585,
+      gpu: null,
+      busy: false,
+      unpinned: true,
+    };
+    const models: UpscalerInfo = {
+      ...missing,
+      models: [],
+      missing: ["upscaler"],
+      downloadBytes: 0,
+    };
+    vi.mocked(api.upscalerStatus).mockResolvedValue(missing);
+    // The release has no upscaler: the models are installed all the same.
+    vi.mocked(api.downloadUpscaler).mockImplementation(async () => {
+      vi.mocked(api.upscalerStatus).mockResolvedValue(models);
+      throw "the release of CatConvert 0.1.6 has no upscaler to download";
+    });
+    render(() => <App />);
+    navigate("settings");
+    expect(await screen.findByText(/built from source/)).toBeInTheDocument();
+    expect(screen.getByText(/checksum published with the release/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Install from files instead" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Download and install (about 51.8 MB)" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The release of CatConvert 0.1.6 has no upscaler to download",
+    );
+    expect(await screen.findByText("Partly installed")).toBeInTheDocument();
+    expect(screen.getByText("Still missing: the upscaler.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download the rest" })).toBeEnabled();
+  });
+
+  it("says which file was wrong when installing from files", async () => {
+    vi.mocked(api.upscalerStatus).mockResolvedValue({
+      dir: "/data/upscaler",
+      binary: null,
+      origin: null,
+      models: [],
+      missing: ["upscaler", "models", "generalModel"],
+      outdated: false,
+      canDownload: true,
+      downloadBytes: 51_816_585,
+      gpu: null,
+      busy: false,
+      unpinned: false,
+    });
+    vi.mocked(api.pickUpscalerFiles).mockResolvedValue(["/dl/holiday.jpg"]);
+    vi.mocked(api.installUpscalerFiles).mockRejectedValue(
+      "holiday.jpg isn't one of the files AI upscaling installs from",
+    );
+    render(() => <App />);
+    navigate("settings");
+    // Where the app can download, the files are a way round it, kept out of the way.
+    const instead = await screen.findByRole("button", { name: "Install from files instead" });
+    expect(instead).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "Install from file…" })).not.toBeInTheDocument();
+    fireEvent.click(instead);
+    fireEvent.click(screen.getByRole("button", { name: "Install from file…" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Holiday.jpg isn't one of the files AI upscaling installs from",
+    );
   });
 
   it("says when CatConvert is up to date, and why a check failed", async () => {
@@ -2589,6 +2748,12 @@ describe("upscaling", () => {
     ]);
     expect(screen.queryByRole("button", { name: /AI upscaling/ })).not.toBeInTheDocument();
 
+    // One click picks the model to start with, without a look through the menu.
+    fireEvent.click(screen.getByRole("button", { name: "Add detail with AI" }));
+    expect(scaler()).toHaveDisplayValue("AI: photos");
+    expect(screen.queryByRole("button", { name: "Add detail with AI" })).not.toBeInTheDocument();
+    fireEvent.change(scaler(), { target: { value: "spline" } });
+
     fireEvent.change(scaler(), { target: { value: "ai:general" } });
     expect(scaler()).toHaveDisplayValue("AI: photos");
     expect(
@@ -2622,7 +2787,10 @@ describe("upscaling", () => {
         .map((option) => option.textContent),
     ).toEqual(["Lanczos (sharp)", "Spline", "Bicubic (softer)"]);
     fireEvent.click(screen.getByRole("button", { name: "Add detail with AI upscaling" }));
-    expect(await screen.findByRole("heading", { name: "AI upscaling" })).toBeInTheDocument();
+    // Straight to its card, which is halfway down Settings.
+    const heading = await screen.findByRole("heading", { name: "AI upscaling" });
+    expect(heading).toHaveFocus();
+    expect(state.settingsTarget).toBeNull();
     expect(screen.getByText("Not installed")).toBeInTheDocument();
   });
 
@@ -2637,7 +2805,7 @@ describe("upscaling", () => {
         .getAllByRole("option")
         .map((option) => option.textContent),
     ).toEqual(["Lanczos (sharp)", "Spline", "Bicubic (softer)"]);
-    expect(screen.queryByRole("button", { name: /AI upscaling/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Add detail with AI/ })).not.toBeInTheDocument();
   });
 
   it("turns a 720p video into 1080p", async () => {

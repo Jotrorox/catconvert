@@ -2,7 +2,7 @@ import { type Component, createEffect, createMemo, createSignal, For, on, Show }
 import type { AiModel, ConvertOptions, Scaler, Upscale } from "../lib/api";
 import type { Size } from "../lib/crop";
 import { formatDuration } from "../lib/format";
-import { AI_MODELS, SCALERS, sameUpscale } from "../lib/formats";
+import { AI_MODELS, recommendedAi, SCALERS, sameUpscale } from "../lib/formats";
 import { Icon } from "./Icon";
 
 /** What the Size select can pick: a shrink cap, an upscale preset or a custom upscale. */
@@ -116,7 +116,7 @@ type SettingsProps = {
   ai?: AiModel | null;
   /** Seconds the AI pass roughly takes, on a fast and a slow graphics card. */
   aiEstimate?: [number, number] | null;
-  /** Open Settings → AI upscaling, offered when no model is installed. */
+  /** Open Settings → AI upscaling, offered when no model can be used. */
   onSetUpAi?: () => void;
   onChange: (patch: Partial<ConvertOptions>) => void;
 };
@@ -256,10 +256,25 @@ export const UpscaleSettings: Component<SettingsProps> = (props) => {
                     fallback={
                       <>
                         <span class="item-meta">Upscaling makes it bigger, not sharper.</span>
-                        <Show when={props.aiApplies && aiChoices().length === 0 && props.onSetUpAi}>
-                          {(setUp) => (
-                            <button type="button" class="link-btn" onClick={() => setUp()()}>
-                              Add detail with AI upscaling
+                        <Show
+                          when={recommendedAi(aiChoices().map((m) => m.model))}
+                          fallback={
+                            <Show when={props.aiApplies && props.onSetUpAi}>
+                              {(setUp) => (
+                                <button type="button" class="link-btn" onClick={() => setUp()()}>
+                                  Add detail with AI upscaling
+                                </button>
+                              )}
+                            </Show>
+                          }
+                        >
+                          {(model) => (
+                            <button
+                              type="button"
+                              class="link-btn"
+                              onClick={() => props.onChange({ ai: model() })}
+                            >
+                              Add detail with AI
                             </button>
                           )}
                         </Show>

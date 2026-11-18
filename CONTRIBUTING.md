@@ -67,6 +67,14 @@ own version, as `catconvert-upscaler-<target>.zip`, and checks it against a
 SHA-256 compiled into the app and the CLI (`CATCONVERT_UPSCALER_SHA256`, set by
 the release workflow).
 
+A build from source has no such SHA-256. Its Settings page downloads the zip
+from the release of its version all the same and checks it against the
+`.sha256` published next to it, which catches a damaged download but, coming
+from the same place, not a swapped one; the page says so. Until that release
+exists, the download installs the models and reports the upscaler as missing:
+build it with `mise run upscaler` and install the zip from a file, or set
+`CATCONVERT_UPSCALER`.
+
 - `scripts/upscaler/build.sh` builds it from the sources pinned in
   `scripts/upscaler/sources.lock` (realesrgan-ncnn-vulkan, ncnn with its
   glslang, libwebp, and MoltenVK on macOS), with the small patches in
