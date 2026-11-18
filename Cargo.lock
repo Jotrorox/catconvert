@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "catconvert-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "catconvert-core",
  "clap",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "catconvert-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "brotli-decompressor",
  "chrono",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "catconvert-desktop"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "catconvert-core",
  "reqwest",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "catconvert-ffi"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "catconvert-core",
  "tempfile",
