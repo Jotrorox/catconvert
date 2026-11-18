@@ -300,9 +300,17 @@ build_upscaler() {
     # then takes the Vulkan entry point from it instead of a dylib.
     mvk=(-DUSE_STATIC_MOLTENVK=ON -DVulkan_LIBRARY="$lib")
   fi
-  # upstream's CMakeLists builds ncnn with only the layers its models use (its
-  # options win over ncnn's defaults). Convolution on the GPU also creates
-  # Reshape (1x1 kernels) and Quantize (int8) layers, so turn those on too.
+  # upstream's CMakeLists (from 2022) turns off every ncnn layer its models
+  # don't use, but layers ncnn gained since then default to on, and some of
+  # them share shaders with layers it turns off (RMSNorm uses LayerNorm's), so
+  # that mix doesn't compile. GPU convolution also creates Reshape and
+  # Quantize layers at runtime. Build ncnn whole instead: a few MB more, and
+  # any model ncnn can run works.
+  local layers=() layer
+  while read -r layer; do
+    layers+=("-DWITH_LAYER_$layer=ON")
+  done < <(sed -n 's/.*option(WITH_LAYER_\([a-z0-9_]*\) "" OFF).*/\1/p' "$src/src/CMakeLists.txt")
+  [ "${#layers[@]}" -gt 0 ] || die "found no layer options in realesrgan-ncnn-vulkan's CMakeLists.txt"
   cmake_build "$src/src" "$src/_build" \
     ${CMAKE_EXTRA[@]+"${CMAKE_EXTRA[@]}"} \
     ${mvk[@]+"${mvk[@]}"} \
@@ -312,8 +320,7 @@ build_upscaler() {
     -DNCNN_SIMPLEOMP=OFF \
     -DNCNN_SIMPLEVK=ON \
     -DNCNN_SYSTEM_GLSLANG=OFF \
-    -DWITH_LAYER_reshape=ON \
-    -DWITH_LAYER_quantize=ON
+    "${layers[@]}"
 }
 
 # ---------------------------------------------------------------------------
