@@ -6,9 +6,11 @@ import { dragIcon, startDragOnMove } from "../lib/drag";
 import { baseName, formatBytes, formatClock } from "../lib/format";
 import { formatKind, label, playbackOrder } from "../lib/formats";
 import {
+  canCompareJob,
   cancelJob,
   chooseFiles,
   clearFinished,
+  compareJob,
   dragOut,
   inputBytes,
   isFinal,
@@ -263,6 +265,17 @@ export const QueueScreen: Component<{ compact: boolean }> = (props) => {
                         name={baseName(job.output)}
                         format={job.options.format}
                       />
+                    </Show>
+                    <Show when={canCompareJob(job)}>
+                      <button
+                        type="button"
+                        class="btn btn-soft"
+                        title="See it next to the original"
+                        onClick={() => compareJob(job.id)}
+                      >
+                        <Icon name="compare" size={16} />
+                        Compare
+                      </button>
                     </Show>
                     <Show when={job.stage === "done"}>
                       <button

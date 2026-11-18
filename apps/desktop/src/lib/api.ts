@@ -292,6 +292,22 @@ export type SavedFrame = {
   outputBytes: number;
 };
 
+/** Which half of a before/after comparison. */
+export type SampleSide = "original" | "converted";
+
+/** One half of a comparison, ready to show. */
+export type Sample = {
+  /** The picture, through the asset protocol. */
+  url: string;
+  /** Size of the encoded sample, or of the finished file; `null` for the original. */
+  bytes: number | null;
+  /** `bytes` is the size of the whole result, not just of a sample. */
+  exact: boolean;
+};
+
+/** A sample as the backend reports it, before its path becomes a URL. */
+type RawSample = { path: string; bytes: number | null; exact: boolean };
+
 export type JobTicket = {
   id: JobId;
   output: string;
@@ -352,6 +368,20 @@ type Commands = {
   preview_frame: {
     args: { path: string; at: number; height: number; hdr: boolean };
     result: ArrayBuffer;
+  };
+  compare_sample: {
+    args: {
+      info: MediaInfo;
+      options: ConvertOptions;
+      side: SampleSide;
+      at: number;
+      limit: number | null;
+    };
+    result: RawSample;
+  };
+  compare_file: {
+    args: { path: string; at: number; limit: number | null; hdr: boolean };
+    result: RawSample;
   };
   waveform: {
     args: { path: string; width: number; height: number; color: string };
@@ -498,6 +528,39 @@ export async function previewFrame(
   hdr = false,
 ): Promise<string> {
   return blobUrl(await command("preview_frame", { path, at, height, hdr }), "image/jpeg");
+}
+
+function sampleFrom(raw: RawSample): Sample {
+  return { url: convertFileSrc(raw.path), bytes: raw.bytes, exact: raw.exact };
+}
+
+/**
+ * One half of a before/after comparison of converting `info` with `options`:
+ * the original (turned, mirrored and cropped, but not encoded) or what the
+ * settings make of it, at the frame `at` seconds in. `limit` caps the short
+ * side in pixels; `null` renders at full size.
+ */
+export async function compareSample(
+  info: MediaInfo,
+  options: ConvertOptions,
+  side: SampleSide,
+  at: number,
+  limit: number | null,
+): Promise<Sample> {
+  return sampleFrom(await command("compare_sample", { info, options, side, at, limit }));
+}
+
+/**
+ * The frame of a finished file at `at` seconds, to compare it with its
+ * original. `hdr` tone-maps an HDR video the way its original is shown.
+ */
+export async function compareFile(
+  path: string,
+  at: number,
+  limit: number | null,
+  hdr: boolean,
+): Promise<Sample> {
+  return sampleFrom(await command("compare_file", { path, at, limit, hdr }));
 }
 
 /**

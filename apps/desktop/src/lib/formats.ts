@@ -2,6 +2,7 @@
  * What the UI knows about output formats, edit defaults and recipes. The
  * backend validates everything again; this only decides what to offer.
  */
+
 import type {
   ConvertOptions,
   Destination,
@@ -13,6 +14,7 @@ import type {
   SequenceOptions,
   VideoCodec,
 } from "./api";
+import type { CompareLayout } from "./compare";
 import { aspectText, cropBox, cropForOtherFile, pictureSize, turnedSize } from "./crop";
 import { formatBitrate } from "./format";
 
@@ -409,6 +411,10 @@ export type Defaults = {
   outputByKind: boolean;
   /** The user has agreed once that replacing moves originals to the Trash. */
   replaceConfirmed: boolean;
+  /** The editor compares the original with the result (toggled there, with C). */
+  compare: boolean;
+  /** How the comparison is laid out on wide windows. */
+  compareLayout: CompareLayout;
 };
 
 /** Keeping all but the location suits an app that never sends files anywhere. */
@@ -420,6 +426,8 @@ export const DEFAULTS: Defaults = {
   outputFolder: null,
   outputByKind: false,
   replaceConfirmed: false,
+  compare: false,
+  compareLayout: "wipe",
 };
 
 /**

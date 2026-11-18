@@ -13,6 +13,8 @@ import {
 } from "solid-js";
 import { CatPeek } from "../components/Cat";
 import { CodecField } from "../components/CodecField";
+import { CompareControls } from "../components/CompareControls";
+import { CompareView } from "../components/CompareView";
 import { CropOverlay } from "../components/CropOverlay";
 import { DestinationField } from "../components/DestinationField";
 import { Icon } from "../components/Icon";
@@ -23,6 +25,7 @@ import {
   type Aspect,
   type ConvertOptions,
   checkCommand,
+  compareSample,
   loudness,
   type MediaInfo,
   type OutputPreview,
@@ -32,11 +35,23 @@ import {
   qualitySummary,
 } from "../lib/api";
 import {
+  canCompare,
+  convertedKey,
+  convertedName,
+  convertedSize,
+  createSample,
+  originalKey,
+  originalLabel,
+  PREVIEW_LIMIT,
+  type Zoom,
+} from "../lib/compare";
+import {
   ASPECTS,
   cropBox,
   cropLabel,
   keptArea,
   mirrorCrop,
+  pictureSize,
   type Size,
   sameAspect,
   turnCrop,
@@ -106,6 +121,8 @@ import {
   makeAnimation,
   saveFrame,
   saveRecipe,
+  setCompare,
+  setCompareLayout,
   setCustomCommand,
   setDraftDestination,
   skipDraft,
@@ -388,8 +405,58 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     }
   };
 
+  // Before and after -----------------------------------------------------------
+
+  /** The result can be shown next to the original right now. */
+  const canShowCompare = () => {
+    const chosen = codec();
+    return (
+      visual() &&
+      hasPicture() &&
+      !custom() &&
+      canCompare(info(), options().format) &&
+      state.ffmpeg?.found === true &&
+      readable() &&
+      isAvailable(options().format) &&
+      (chosen === null || isCodecAvailable(chosen))
+    );
+  };
+  const comparing = () => state.settings.compare && canShowCompare();
+  const toggleCompare = () => {
+    const on = !state.settings.compare;
+    if (on) setCropping(false);
+    setCompare(on);
+  };
+  const compareMode = () => (props.compact ? "flip" : state.settings.compareLayout);
+  const [zoom, setZoom] = createSignal<Zoom>("fit");
+  /** Zoomed in, samples are made at full size so 100% shows real pixels. */
+  const sampleLimit = () => (zoom() === "fit" ? PREVIEW_LIMIT : null);
+  /** The moment compared: the frame on screen (not the one playing). */
+  const compareAt = () => (info().kind === "video" ? scrub() : 0);
+  const originalSample = createSample(() => {
+    if (!comparing()) return null;
+    const [at, limit, snapshot] = [compareAt(), sampleLimit(), { ...options() }];
+    return {
+      key: originalKey(info(), snapshot, at, limit),
+      run: () => compareSample(info(), snapshot, "original", at, limit),
+    };
+  });
+  const convertedSample = createSample(() => {
+    if (!comparing()) return null;
+    const [at, limit, snapshot] = [compareAt(), sampleLimit(), { ...options() }];
+    return {
+      key: convertedKey(info(), snapshot, at, limit),
+      run: () => compareSample(info(), snapshot, "converted", at, limit),
+    };
+  });
+  const convertedLabel = () => {
+    const size = convertedSize(info(), options(), convertedSample.state().sample);
+    return `${convertedName(info(), options())}${size ? ` · ${size}` : ""}`;
+  };
+
   // Space plays or pauses (Shift+Space the selection), ← → (or , .) step a
-  // frame and S saves it, unless the key is meant for a field, button or slider.
+  // frame, S saves it and C compares, unless the key is meant for a field,
+  // button or slider.
   const onKey = (event: KeyboardEvent) => {
     const target = event.target instanceof HTMLElement ? event.target : null;
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -405,6 +472,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
       return;
     }
     if (target?.closest("input, textarea, select, [role=slider]")) return;
+    if (event.key.toLowerCase() === "c" && !event.shiftKey && canShowCompare()) {
+      event.preventDefault();
+      toggleCompare();
+      return;
+    }
     if (!canStep()) return;
     if (event.key === "ArrowLeft" || event.key === ",") stepBy(-1);
     else if (event.key === "ArrowRight" || event.key === ".") stepBy(1);
@@ -787,14 +859,19 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
         </div>
       </Show>
 
-      <div class="file-grid">
+      <div
+        class="file-grid"
+        classList={{ "compare-wide": comparing() && compareMode() === "side" }}
+      >
         <div class="stack">
           <div
             class="preview"
             data-kind={info().kind}
             classList={{
               "out-audio": outKind() === "audio" && info().kind !== "audio",
-              cropping: cropping() && visual(),
+              cropping: cropping() && visual() && !comparing(),
+              comparing: comparing(),
+              "compare-side": comparing() && compareMode() === "side",
             }}
           >
             <Show
@@ -840,7 +917,7 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 )}
               </Show>
             </Show>
-            <Show when={visual() && cropping()}>
+            <Show when={visual() && cropping() && !comparing()}>
               <fieldset class="crop-bar" aria-label="Crop shape">
                 <For each={ASPECTS}>
                   {(preset) => (
@@ -881,6 +958,26 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                   <Icon name="check" size={16} />
                 </button>
               </fieldset>
+            </Show>
+            {/* Over the single view, which stays as it was underneath. */}
+            <Show when={comparing()}>
+              <CompareView
+                before={{
+                  state: originalSample.state(),
+                  label: originalLabel(info()),
+                  onBroken: originalSample.retry,
+                }}
+                after={{
+                  state: convertedSample.state(),
+                  label: convertedLabel(),
+                  onBroken: convertedSample.retry,
+                }}
+                picture={pictureSize(info(), options())}
+                mode={compareMode()}
+                zoom={zoom()}
+                onZoom={setZoom}
+                name={info().fileName}
+              />
             </Show>
             <Show when={info().kind === "video"}>
               <div class="frame-bar">
@@ -935,35 +1032,60 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
             </Show>
             <Show when={visual() && !custom()}>
               <div class="preview-tools">
-                <button
-                  type="button"
-                  class="tool-btn"
-                  aria-label="Rotate 90°"
-                  title="Rotate 90°"
-                  onClick={rotate}
+                <Show
+                  when={!comparing()}
+                  fallback={
+                    <CompareControls
+                      zoom={zoom()}
+                      onZoom={setZoom}
+                      layout={props.compact ? null : state.settings.compareLayout}
+                      onLayout={setCompareLayout}
+                    />
+                  }
                 >
-                  <Icon name="rotate" size={20} />
-                </button>
-                <button
-                  type="button"
-                  class="tool-btn"
-                  aria-label="Mirror"
-                  title="Mirror"
-                  aria-pressed={options().flip}
-                  onClick={mirror}
-                >
-                  <Icon name="flip" size={20} />
-                </button>
-                <Show when={picture()}>
                   <button
                     type="button"
                     class="tool-btn"
-                    aria-label="Crop"
-                    title="Crop"
-                    aria-pressed={cropping()}
-                    onClick={() => setCropping(!cropping())}
+                    aria-label="Rotate 90°"
+                    title="Rotate 90°"
+                    onClick={rotate}
                   >
-                    <Icon name="crop" size={20} />
+                    <Icon name="rotate" size={20} />
+                  </button>
+                  <button
+                    type="button"
+                    class="tool-btn"
+                    aria-label="Mirror"
+                    title="Mirror"
+                    aria-pressed={options().flip}
+                    onClick={mirror}
+                  >
+                    <Icon name="flip" size={20} />
+                  </button>
+                  <Show when={picture()}>
+                    <button
+                      type="button"
+                      class="tool-btn"
+                      aria-label="Crop"
+                      title="Crop"
+                      aria-pressed={cropping()}
+                      onClick={() => setCropping(!cropping())}
+                    >
+                      <Icon name="crop" size={20} />
+                    </button>
+                  </Show>
+                </Show>
+                <Show when={canShowCompare()}>
+                  <button
+                    type="button"
+                    class="tool-btn"
+                    aria-label="Compare with the original"
+                    aria-keyshortcuts="C"
+                    title="Compare with the original (C)"
+                    aria-pressed={comparing()}
+                    onClick={toggleCompare}
+                  >
+                    <Icon name="compare" size={20} />
                   </button>
                 </Show>
               </div>

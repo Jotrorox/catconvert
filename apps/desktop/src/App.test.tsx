@@ -21,6 +21,8 @@ vi.mock("./lib/api", () => ({
   relocateFfmpeg: vi.fn(),
   probeFile: vi.fn(),
   previewFrame: vi.fn(async () => "blob:frame"),
+  compareSample: vi.fn(),
+  compareFile: vi.fn(),
   waveform: vi.fn(async () => "blob:wave"),
   playbackUrl: vi.fn(async (path: string) => `asset://localhost${path}`),
   loudness: vi.fn(async () => -22),
@@ -211,6 +213,17 @@ beforeEach(() => {
   vi.mocked(api.chooseSavePath).mockResolvedValue(null);
   vi.mocked(api.pickFolder).mockResolvedValue(null);
   vi.mocked(api.askReplace).mockResolvedValue("cancel");
+  let samples = 0;
+  vi.mocked(api.compareSample).mockImplementation(async (_info, _options, side, _at, limit) => ({
+    url: `asset://localhost/samples/${side}-${++samples}.png`,
+    bytes: side === "converted" ? 612_000 : null,
+    exact: side === "converted" && limit === null,
+  }));
+  vi.mocked(api.compareFile).mockImplementation(async () => ({
+    url: `asset://localhost/samples/file-${++samples}.png`,
+    bytes: 0,
+    exact: true,
+  }));
   vi.mocked(api.startJob).mockImplementation(async (path, options) => ({
     id: 7,
     output: path.replace(/\.\w+$/, `.${options.format}`),
@@ -232,6 +245,18 @@ async function openSong() {
 
 /** Let the player load (microtasks and resolved promises). */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+async function openPhoto() {
+  render(() => <App />);
+  await ffmpegFound();
+  openPaths([PHOTO.path]);
+  return screen.findByRole("heading", { name: "cat.jpg" });
+}
+
+/** The calls to `compareSample` for one half. */
+function sampleCalls(side: api.SampleSide) {
+  return vi.mocked(api.compareSample).mock.calls.filter((call) => call[2] === side);
+}
 
 async function openVideo() {
   render(() => <App />);
@@ -2314,5 +2339,191 @@ describe("CatConvert", () => {
       const { inputs: _inputs, options: _options, ...shown } = broken;
       expect(state.history).toEqual([shown]);
     });
+  });
+});
+
+describe("Before and after", () => {
+  it("shows the original next to the converted picture, and remembers it", async () => {
+    await openPhoto();
+    fireEvent.click(screen.getByRole("button", { name: "JPG" }));
+    const toggle = screen.getByRole("button", { name: "Compare with the original" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("region", { name: "Before and after" })).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    const view = within(await screen.findByRole("region", { name: "Before and after" }));
+    await waitFor(() => expect(view.getByAltText("cat.jpg converted")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(view.getByAltText("Original of cat.jpg")).toHaveAttribute(
+        "src",
+        expect.stringContaining("original-"),
+      ),
+    );
+    // Both halves at preview size, from the editor's settings.
+    const [info, options, , at, limit] = sampleCalls("converted")[0] ?? [];
+    expect(info?.path).toBe(PHOTO.path);
+    expect(options?.format).toBe("jpg");
+    expect([at, limit]).toEqual([0, 1080]);
+    expect(sampleCalls("original")).toHaveLength(1);
+    expect(view.getByText("Original · 48.0 MB")).toBeInTheDocument();
+    expect(view.getByText(/^JPG q60 · ~[\d.]+ [KM]B$/)).toBeInTheDocument();
+    // Remembered for the next file and the next launch.
+    expect(state.settings.compare).toBe(true);
+    expect(JSON.parse(localStorage.getItem("catconvert.settings.v1") ?? "{}")).toMatchObject({
+      compare: true,
+    });
+
+    // A new quality is encoded again; the original stays as it was.
+    fireEvent.input(screen.getByRole("slider", { name: "Quality" }), { target: { value: "30" } });
+    await waitFor(() => expect(sampleCalls("converted")).toHaveLength(2));
+    expect(sampleCalls("converted")[1]?.[1].quality).toBe(30);
+    expect(sampleCalls("original")).toHaveLength(1);
+    await waitFor(() => expect(view.getByText(/ q30 · /)).toBeInTheDocument());
+
+    // Zooming in renders full-size samples, whose size is exact.
+    fireEvent.click(screen.getByRole("button", { name: "100%" }));
+    expect(screen.getByRole("button", { name: "100%" })).toHaveAttribute("aria-pressed", "true");
+    await waitFor(() => expect(sampleCalls("converted").at(-1)?.[4]).toBeNull());
+    await waitFor(() => expect(sampleCalls("original").at(-1)?.[4]).toBeNull());
+    await waitFor(() => expect(view.getByText(/ q30 · 612 KB$/)).toBeInTheDocument());
+
+    // C turns it off again: the single view is just as it was.
+    fireEvent.keyDown(window, { key: "c" });
+    expect(screen.queryByRole("region", { name: "Before and after" })).not.toBeInTheDocument();
+    expect(screen.getByAltText("Preview of cat.jpg")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rotate 90°" })).toBeInTheDocument();
+    expect(state.settings.compare).toBe(false);
+  });
+
+  it("opens files compared when it was left on", async () => {
+    updateSettings({ compare: true, compareLayout: "side" });
+    await openPhoto();
+    const view = within(await screen.findByRole("region", { name: "Before and after" }));
+    await waitFor(() => expect(view.getByAltText("cat.jpg converted")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Side by side" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    // Side by side, the preview takes the editor's whole width.
+    expect(document.querySelector(".file-grid")).toHaveClass("compare-wide");
+    fireEvent.click(screen.getByRole("button", { name: "Wipe" }));
+    expect(state.settings.compareLayout).toBe("wipe");
+    expect(document.querySelector(".file-grid")).not.toHaveClass("compare-wide");
+    expect(view.getByRole("slider", { name: /Divider/ })).toBeInTheDocument();
+  });
+
+  it("compares the frame on screen of a video and wipes with the keyboard", async () => {
+    await openVideo();
+    fireEvent.keyDown(window, { key: "c" });
+    await waitFor(() => expect(sampleCalls("converted")).toHaveLength(1));
+    // The preview opens at 1 s.
+    expect(sampleCalls("converted")[0]?.[3]).toBe(1);
+    expect(sampleCalls("original")[0]?.[3]).toBe(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Next frame" }));
+    await waitFor(() => expect(sampleCalls("converted")).toHaveLength(2));
+    expect(Math.ceil((sampleCalls("converted")[1]?.[3] ?? 0) * 30)).toBe(31);
+    expect(sampleCalls("original")).toHaveLength(2);
+
+    const divider = screen.getByRole("slider", { name: /Divider/ });
+    expect(divider).toHaveAttribute("aria-valuenow", "50");
+    fireEvent.keyDown(divider, { key: "ArrowRight" });
+    expect(divider).toHaveAttribute("aria-valuenow", "52");
+    fireEvent.keyDown(divider, { key: "Home" });
+    expect(divider).toHaveAttribute("aria-valuenow", "0");
+    // Keys on the divider don't step frames.
+    expect(sampleCalls("converted")).toHaveLength(2);
+  });
+
+  it("says when a preview couldn't be made", async () => {
+    vi.mocked(api.compareSample).mockImplementation(async (_info, _options, side) => {
+      if (side === "converted") throw "this ffmpeg can't write AVIF";
+      return { url: "asset://localhost/samples/original.png", bytes: null, exact: false };
+    });
+    await openPhoto();
+    fireEvent.click(screen.getByRole("button", { name: "Compare with the original" }));
+    expect(
+      await screen.findByText("Couldn't make the preview: this ffmpeg can't write AVIF"),
+    ).toBeInTheDocument();
+  });
+
+  it("flips between the halves on phones", async () => {
+    const matchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("max-width"),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      await openPhoto();
+      fireEvent.click(screen.getByRole("button", { name: "Compare with the original" }));
+      const view = within(await screen.findByRole("region", { name: "Before and after" }));
+      // No room to split: one half at a time, the converted one first.
+      expect(screen.queryByRole("button", { name: "Side by side" })).not.toBeInTheDocument();
+      expect(view.queryByRole("slider")).not.toBeInTheDocument();
+      const flip = await view.findByRole("button", { name: /^PNG · / });
+      expect(flip).toHaveAttribute("aria-pressed", "false");
+      fireEvent.click(flip);
+      expect(view.getByRole("button", { name: /^Original/ })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+    } finally {
+      window.matchMedia = matchMedia;
+    }
+  });
+
+  it("isn't offered for sound or an edited command", async () => {
+    await openSong();
+    expect(
+      screen.queryByRole("button", { name: "Compare with the original" }),
+    ).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "c" });
+    expect(api.compareSample).not.toHaveBeenCalled();
+  });
+
+  it("compares a finished file from the Queue and History with its original", async () => {
+    vi.mocked(api.startJob).mockResolvedValue({
+      id: 7,
+      output: "/photos/cat.avif",
+      inputs: [PHOTO],
+      command: "ffmpeg …",
+    });
+    await openPhoto();
+    fireEvent.click(screen.getByRole("button", { name: "Rotate 90°" }));
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    applyProgress({
+      jobId: 7,
+      stage: "done",
+      progress: 1,
+      speed: null,
+      outputBytes: 610_000,
+      error: null,
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Compare" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "cat.avif" }));
+    await waitFor(() => expect(api.compareFile).toHaveBeenCalledTimes(1));
+    expect(api.compareFile).toHaveBeenCalledWith("/photos/cat.avif", 0, 1080, false);
+    // The original is turned like the result, so only the encoding differs.
+    await waitFor(() => expect(sampleCalls("original")).toHaveLength(1));
+    expect(sampleCalls("original")[0]?.[1]).toMatchObject({ rotate: 90 });
+    expect(dialog.getByText(/ · 610 KB$/)).toBeInTheDocument();
+    expect(dialog.getByText("Original · 48.0 MB")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Compare cat.avif with the original" }),
+    );
+    expect(await screen.findByRole("dialog", { name: "cat.avif" })).toBeInTheDocument();
+    expect(api.probeFile).toHaveBeenLastCalledWith(PHOTO.path);
+    await waitFor(() => expect(api.compareFile).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 });
