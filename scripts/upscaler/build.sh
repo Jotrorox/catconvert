@@ -257,7 +257,6 @@ cmake_build() {
     "${generator[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_IGNORE_PREFIX_PATH="/opt/homebrew;/usr/local;/opt/local" \
-    -DCMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH=OFF \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DBUILD_SHARED_LIBS=OFF \
     "$@"
