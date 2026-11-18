@@ -24,16 +24,16 @@ tauri.workspace = true
 tauri-plugin-dialog.workspace = true
 tauri-plugin-opener.workspace = true
 tauri-plugin-updater.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 
 # Desktop only: neither builds for iOS or Android.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-drag.workspace = true
 tauri-plugin-single-instance.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -4,6 +4,7 @@
  */
 
 import type {
+  AiModel,
   ConvertOptions,
   Destination,
   Direction,
@@ -293,6 +294,7 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     maxSize: null,
     upscale: null,
     scaler: "auto",
+    ai: null,
     fps: null,
     rotate: 0,
     flip: false,
@@ -706,6 +708,27 @@ export function upscaleFrom(stored: unknown): Upscale | null {
   return null;
 }
 
+/** The AI upscaling models, in the order the editor lists them. */
+export const AI_MODELS: readonly { model: AiModel; label: string }[] = [
+  { model: "general", label: "AI: photos" },
+  { model: "photo", label: "AI: photos, most detail (slow)" },
+  { model: "anime", label: "AI: drawings and anime" },
+  { model: "anime-fast", label: "AI: anime, quick" },
+];
+
+/** A stored AI model if it is one, otherwise `null` (classic upscaling). */
+export function aiFrom(stored: unknown): AiModel | null {
+  return AI_MODELS.find((m) => m.model === stored)?.model ?? null;
+}
+
+/**
+ * Whether AI upscaling can apply to this output: still pictures, including a
+ * frame saved from a video, but not videos or animations (as in the core).
+ */
+export function aiApplies(info: MediaInfo, format: OutputFormat): boolean {
+  return formatKind(format, info.kind) === "image";
+}
+
 /** A stored scaler if it is one, otherwise `"auto"`. */
 export function scalerFrom(stored: unknown): Scaler {
   return stored === "lanczos" || stored === "spline" || stored === "bicubic" ? stored : "auto";
@@ -812,6 +835,7 @@ export function fitOptions(
   const lifts = !enlarges(info, { ...fitted, upscale }) && autoLimits(fitted.format, info.kind);
   fitted.upscale = upscale && !lifts && fitsLimits(info, { ...fitted, upscale }) ? upscale : null;
   fitted.scaler = scalerFrom(fitted.scaler);
+  fitted.ai = aiFrom(fitted.ai);
   return fitted;
 }
 

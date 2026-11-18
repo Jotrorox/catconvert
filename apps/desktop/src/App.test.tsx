@@ -1,10 +1,17 @@
 import { fireEvent, render, screen, waitFor, within } from "@solidjs/testing-library";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { ConvertOptions, FfmpegStatus, MediaInfo, OutputFormat } from "./lib/api";
+import type {
+  ConvertOptions,
+  FfmpegStatus,
+  MediaInfo,
+  OutputFormat,
+  UpscalerInfo,
+} from "./lib/api";
 import * as api from "./lib/api";
 import { DEFAULTS } from "./lib/formats";
 import {
+  aiModels,
   applyProgress,
   navigate,
   openPaths,
@@ -82,6 +89,14 @@ vi.mock("./lib/api", () => ({
   quickActionStatus: vi.fn(async () => ({ supported: false, installed: false })),
   setQuickAction: vi.fn(),
   dragFiles: vi.fn(async () => {}),
+  upscalerStatus: vi.fn(async () => null),
+  checkUpscalerGpu: vi.fn(),
+  downloadUpscaler: vi.fn(),
+  cancelUpscalerDownload: vi.fn(async () => null),
+  pickUpscalerFiles: vi.fn(async () => []),
+  installUpscalerFiles: vi.fn(),
+  removeUpscaler: vi.fn(),
+  aiEstimate: vi.fn(async () => [2, 9]),
   NO_JXL: {},
   NEXT_TO_ORIGINAL: { folder: null, name: null, collision: "keepBoth" },
   NAME_PLACEHOLDERS: [
@@ -414,6 +429,7 @@ describe("CatConvert", () => {
         maxSize: 720,
         upscale: null,
         scaler: "auto",
+        ai: null,
         fps: null,
         rotate: 90,
         flip: false,
@@ -983,6 +999,120 @@ describe("CatConvert", () => {
     expect(await screen.findByText("CatConvert 0.2.0 is installed")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Restart now/ }));
     expect(api.relaunch).toHaveBeenCalledOnce();
+  });
+
+  it("downloads AI upscaling, tests it and removes it again", async () => {
+    const missing: UpscalerInfo = {
+      dir: "/data/upscaler",
+      binary: null,
+      origin: null,
+      models: [],
+      missing: ["upscaler", "models", "generalModel"],
+      outdated: false,
+      canDownload: true,
+      downloadBytes: 51_816_585,
+      gpu: null,
+      busy: false,
+    };
+    const ready: UpscalerInfo = {
+      ...missing,
+      binary: "/data/upscaler/catconvert-upscaler",
+      origin: "installed",
+      models: ["general", "photo", "anime", "anime-fast"],
+      missing: [],
+      downloadBytes: 0,
+      gpu: { status: "ready", gpu: "Apple M5" },
+    };
+    vi.mocked(api.upscalerStatus).mockResolvedValue(missing);
+    let finish = (_info: UpscalerInfo) => {};
+    vi.mocked(api.downloadUpscaler).mockImplementation(
+      (onProgress) =>
+        new Promise((resolve) => {
+          onProgress({ received: 25_000_000, total: 50_000_000 });
+          finish = resolve;
+        }),
+    );
+    render(() => <App />);
+    navigate("settings");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Download and install (about 51.8 MB)" }),
+    );
+    expect(
+      await screen.findByRole("progressbar", { name: "Downloading AI upscaling" }),
+    ).toHaveAttribute("aria-valuenow", "50");
+    expect(screen.getByText("25.0 MB of 50.0 MB")).toBeInTheDocument();
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({ ...status(), aiModels: ready.models });
+    finish(ready);
+    expect(await screen.findByText("Installed")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Models: Photos · Photos, most detail (slow) · Drawings and anime · Anime, quick",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Works on Apple M5.")).toBeInTheDocument();
+    expect(await screen.findByText("AI upscaling is ready on Apple M5")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Download/ })).not.toBeInTheDocument();
+    await waitFor(() => expect(state.ffmpeg?.aiModels).toEqual(ready.models));
+
+    vi.mocked(api.checkUpscalerGpu).mockResolvedValue({
+      ...ready,
+      gpu: { status: "blackOutput", gpu: "Old GPU" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Test again/ }));
+    expect(
+      await screen.findByText(
+        "The graphics driver makes black pictures. Update it, then test again.",
+      ),
+    ).toBeInTheDocument();
+    // A driver that makes black pictures takes the models off the menu.
+    expect(aiModels()).toEqual([]);
+
+    vi.mocked(api.removeUpscaler).mockResolvedValue(missing);
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({ ...status(), aiModels: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    expect(await screen.findByText("Not installed")).toBeInTheDocument();
+    expect(api.removeUpscaler).toHaveBeenCalledOnce();
+  });
+
+  it("installs AI upscaling from files where it can't download", async () => {
+    vi.mocked(api.upscalerStatus).mockResolvedValue({
+      dir: "/data/upscaler",
+      binary: null,
+      origin: null,
+      models: [],
+      missing: ["upscaler", "models", "generalModel"],
+      outdated: false,
+      canDownload: false,
+      downloadBytes: 51_816_585,
+      gpu: null,
+      busy: false,
+    });
+    vi.mocked(api.pickUpscalerFiles).mockResolvedValue(["/dl/catconvert-upscaler.zip"]);
+    vi.mocked(api.installUpscalerFiles).mockResolvedValue({
+      dir: "/data/upscaler",
+      binary: "/data/upscaler/catconvert-upscaler",
+      origin: "installed",
+      models: ["photo", "anime", "anime-fast"],
+      missing: ["generalModel"],
+      outdated: false,
+      canDownload: false,
+      downloadBytes: 4_885_111,
+      gpu: { status: "noGpu" },
+      busy: false,
+    });
+    render(() => <App />);
+    navigate("settings");
+    expect(await screen.findByText("Not installed")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Download and install/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/realesr-general-x4v3\.pth/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Install from file…" }));
+    expect(await screen.findByText("Installed")).toBeInTheDocument();
+    expect(api.installUpscalerFiles).toHaveBeenCalledWith(["/dl/catconvert-upscaler.zip"]);
+    expect(screen.getByText(/no graphics card AI upscaling can use/)).toBeInTheDocument();
+    expect(screen.getByText("Some files are still missing (about 4.9 MB).")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Installed. A file is still missing: see Settings → AI upscaling"),
+    ).toBeInTheDocument();
   });
 
   it("says when CatConvert is up to date, and why a check failed", async () => {
@@ -2419,6 +2549,75 @@ describe("upscaling", () => {
       expect.objectContaining({ upscale: { factor: 2 }, maxSize: null, scaler: "spline" }),
       USUAL,
     );
+  });
+
+  it("offers AI upscaling for pictures once it is installed", async () => {
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({ ...status(), aiModels: ["general", "anime"] });
+    await open({ ...PHOTO, width: 640, height: 480 });
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), { target: { value: "x2" } });
+    const scaler = () => screen.getByRole("combobox", { name: "Scaler" });
+    expect(
+      within(scaler())
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([
+      "Lanczos (sharp)",
+      "Spline",
+      "Bicubic (softer)",
+      "AI: photos",
+      "AI: drawings and anime",
+    ]);
+    expect(screen.queryByRole("button", { name: /AI upscaling/ })).not.toBeInTheDocument();
+
+    fireEvent.change(scaler(), { target: { value: "ai:general" } });
+    expect(scaler()).toHaveDisplayValue("AI: photos");
+    expect(
+      await screen.findByText(/Takes about 2 s to 9 s on a graphics card/),
+    ).toBeInTheDocument();
+    expect(api.aiEstimate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ path: PHOTO.path }),
+      expect.objectContaining({ ai: "general", upscale: { factor: 2 } }),
+    );
+    // A classic scaler turns AI off again.
+    fireEvent.change(scaler(), { target: { value: "spline" } });
+    expect(scaler()).toHaveDisplayValue("Spline");
+    expect(screen.getByText("Upscaling makes it bigger, not sharper.")).toBeInTheDocument();
+
+    fireEvent.change(scaler(), { target: { value: "ai:anime" } });
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      PHOTO.path,
+      expect.objectContaining({ upscale: { factor: 2 }, ai: "anime" }),
+      USUAL,
+    );
+  });
+
+  it("points to Settings while AI upscaling isn't installed", async () => {
+    await open({ ...PHOTO, width: 640, height: 480 });
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), { target: { value: "x2" } });
+    expect(
+      within(screen.getByRole("combobox", { name: "Scaler" }))
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["Lanczos (sharp)", "Spline", "Bicubic (softer)"]);
+    fireEvent.click(screen.getByRole("button", { name: "Add detail with AI upscaling" }));
+    expect(await screen.findByRole("heading", { name: "AI upscaling" })).toBeInTheDocument();
+    expect(screen.getByText("Not installed")).toBeInTheDocument();
+  });
+
+  it("keeps videos to classic upscaling", async () => {
+    vi.mocked(api.ffmpegStatus).mockResolvedValue({ ...status(), aiModels: ["general"] });
+    await open({ ...VIDEO, width: 1280, height: 720 });
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), {
+      target: { value: "s1080" },
+    });
+    expect(
+      within(screen.getByRole("combobox", { name: "Scaler" }))
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["Lanczos (sharp)", "Spline", "Bicubic (softer)"]);
+    expect(screen.queryByRole("button", { name: /AI upscaling/ })).not.toBeInTheDocument();
   });
 
   it("turns a 720p video into 1080p", async () => {

@@ -1,0 +1,27 @@
+# Pinned sources of the optional AI upscaler (catconvert-upscaler), our build of
+# realesrgan-ncnn-vulkan. Read by build.sh. Everything here is under permissive
+# licenses. The Real-ESRGAN model files are not part of the build or the pack:
+# the app downloads them itself from xinntao's official releases.
+#
+# Columns: name  version  license  url  sha256  license-files  kind
+#   license is an SPDX id; several are joined with commas (all apply).
+#   url "git+<repo>@<commit>" is fetched with git and checked by commit id
+#   (sha256 "-"); everything else is an archive checked by its SHA-256.
+#   license-files are comma-separated paths inside the unpacked tree; build.sh
+#   copies them into THIRD-PARTY-LICENSES.txt.
+#   kind is "source" (built for every target and packed into the source
+#   archive) or "macos-binary" (a prebuilt library linked on macOS only).
+#
+# ncnn's full-source zip carries its submodules, among them glslang, which
+# ncnn links to compile its shaders at runtime and which build.sh also builds
+# as a host tool (glslangValidator) for realesrgan-ncnn-vulkan's own shaders.
+# libwebp is the same release the media tools use.
+#
+# To update a component, change its version, url and sha256 together, check
+# that the patches in patches/ still apply, then run
+# `scripts/upscaler/build.sh <target>` once to confirm it still builds.
+
+realesrgan-ncnn-vulkan  0.2.0-37026f4  MIT                                         git+https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan.git@37026f49824c5cf84062e7c6a5dd71445dcf610f   -                                                                 LICENSE                   source
+ncnn                    20261020       BSD-3-Clause,Zlib,BSD-2-Clause,MIT,Apache-2.0  https://github.com/Tencent/ncnn/releases/download/20261020/ncnn-20261020-full-source.zip                 699d9acc67489eee0993a551ca1ebc247bbf0f4e33babe1dec810e6a9a52b988  LICENSE.txt,glslang/LICENSE.txt  source
+libwebp                 1.6.0          BSD-3-Clause                                https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz          e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564  COPYING,PATENTS           source
+moltenvk                1.4.2          Apache-2.0                                  https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar                 f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e  LICENSE                   macos-binary

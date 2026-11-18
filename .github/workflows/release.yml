@@ -44,9 +44,131 @@ jobs:
     name: Media tools
     uses: ./.github/workflows/media-tools.yml
 
+  # The optional AI upscaler, which the app downloads on request (cached
+  # between releases like the media tools).
+  upscaler:
+    name: Upscaler
+    uses: ./.github/workflows/upscaler.yml
+
+  # Signs and notarizes the macOS upscaler, zips the pack for every target and
+  # attaches the packs, their checksums and the source archive to the release.
+  # The app and the CLI compile in each pack's SHA-256 (CATCONVERT_UPSCALER_SHA256)
+  # and download catconvert-upscaler-<target>.zip from the release of their own
+  # version, so the files hashed here are exactly the files uploaded.
+  upscaler-pack:
+    name: Upscaler packs
+    needs: [create-release, upscaler]
+    # The macOS binary is signed and notarized with the same secrets as the app.
+    environment: release
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    outputs:
+      universal-apple-darwin: ${{ steps.package.outputs.universal-apple-darwin }}
+      x86_64-pc-windows-msvc: ${{ steps.package.outputs.x86_64-pc-windows-msvc }}
+      x86_64-unknown-linux-gnu: ${{ steps.package.outputs.x86_64-unknown-linux-gnu }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download upscaler builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: upscaler-*
+          path: dist-upscaler
+
+      # Artifacts don't keep file modes.
+      - name: Make the binaries executable
+        run: chmod +x dist-upscaler/upscaler-*/catconvert-upscaler*
+
+      # Like the CLI: without a Developer ID signature with the hardened runtime
+      # and notarization, Gatekeeper refuses a quarantined copy. Optional too.
+      - name: Sign and notarize the macOS upscaler (optional)
+        env:
+          BIN: dist-upscaler/upscaler-universal-apple-darwin/catconvert-upscaler
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::notice::Apple signing secrets not set: shipping an ad-hoc signed upscaler."
+            exit 0
+          fi
+
+          keychain="$RUNNER_TEMP/upscaler-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          p12="$RUNNER_TEMP/upscaler-signing.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$p12"
+          security import "$p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          # shellcheck disable=SC2046 # keep the existing keychains in the search list
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+          codesign --force --timestamp --options runtime \
+            --identifier dev.jotrorox.catconvert.upscaler \
+            --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict -vv "$BIN"
+
+          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            echo "::notice::APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID not set: upscaler signed but not notarized."
+            exit 0
+          fi
+
+          # A bare Mach-O cannot be stapled; Gatekeeper fetches the ticket online.
+          zip="$RUNNER_TEMP/upscaler-notarize.zip"
+          ditto -c -k --keepParent "$BIN" "$zip"
+          echo "Submitting the upscaler for notarization..."
+          result="$(xcrun notarytool submit "$zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 2h --output-format json)"
+          echo "$result"
+          status="$(jq -r '.status' <<< "$result")"
+          if [ "$status" != "Accepted" ]; then
+            id="$(jq -r '.id' <<< "$result")"
+            xcrun notarytool log "$id" \
+              --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            echo "::error::Notarization of the upscaler finished with status: $status"
+            exit 1
+          fi
+          rm -f "$zip"
+
+      # One output per target, named like the target, holding the pack's SHA-256.
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist-packs
+          for target in universal-apple-darwin x86_64-pc-windows-msvc x86_64-unknown-linux-gnu; do
+            archive="dist-packs/catconvert-upscaler-${target}.zip"
+            scripts/upscaler/build.sh pack "dist-upscaler/upscaler-${target}" "$archive"
+            (cd dist-packs && shasum -a 256 "$(basename "$archive")" > "$(basename "$archive").sha256")
+            echo "${target}=$(cut -d' ' -f1 < "${archive}.sha256")" >> "$GITHUB_OUTPUT"
+          done
+          cat dist-packs/*.sha256
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          source="dist-packs/catconvert-${TAG}-upscaler-source.tar.xz"
+          mv dist-upscaler/upscaler-source/catconvert-upscaler-source.tar.xz "$source"
+          gh release upload "$TAG" dist-packs/*.zip dist-packs/*.sha256 "$source" --clobber
+
   desktop:
     name: Desktop (${{ matrix.name }})
-    needs: [create-release, media-tools]
+    needs: [create-release, media-tools, upscaler-pack]
     # Signing secrets live in the `release` environment, which only `v*` tags may use.
     environment: release
     permissions:
@@ -193,10 +315,13 @@ jobs:
           echo "TAURI_UPDATER_ARGS=--config $config" >> "$GITHUB_ENV"
           echo "Updater signing enabled."
 
+      # The upscaler pack for this platform's target (matrix.media-tools)
+      # is pinned by its SHA-256, compiled into the app.
       - name: Build and upload bundles
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CATCONVERT_UPSCALER_SHA256: ${{ needs.upscaler-pack.outputs[matrix.media-tools] }}
         with:
           projectPath: apps/desktop
           tauriScript: pnpm tauri
@@ -278,7 +403,7 @@ jobs:
 
   cli:
     name: CLI (${{ matrix.target }})
-    needs: create-release
+    needs: [create-release, upscaler-pack]
     # The macOS binary is signed and notarized with the same secrets as the app.
     environment: release
     permissions:
@@ -290,12 +415,15 @@ jobs:
           - target: macos-universal
             os: macos-latest
             rust-targets: aarch64-apple-darwin x86_64-apple-darwin
+            upscaler: universal-apple-darwin
           - target: windows-x86_64
             os: windows-latest
             rust-targets: ""
+            upscaler: x86_64-pc-windows-msvc
           - target: linux-x86_64
             os: ubuntu-22.04
             rust-targets: ""
+            upscaler: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -314,6 +442,8 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
           TARGET: ${{ matrix.target }}
+          # SHA-256 of the upscaler pack for this platform, compiled into the CLI.
+          CATCONVERT_UPSCALER_SHA256: ${{ needs.upscaler-pack.outputs[matrix.upscaler] }}
         run: |
           set -euo pipefail
           name="catconvert-${TAG}-${TARGET}"

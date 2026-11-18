@@ -215,6 +215,10 @@ type State = {
   lastFolder: string | null;
   /** The Finder Quick Action, once Settings has looked. */
   quickAction: QuickActionStatus | null;
+  /** AI upscaling (an optional download), once something has looked. */
+  upscaler: api.UpscalerInfo | null;
+  /** How far the AI upscaling download has got, while it runs. */
+  upscalerDownload: api.UpscalerDownload | null;
   /** A finished file being compared with its original. */
   comparison: Comparison | null;
   toasts: Toast[];
@@ -375,6 +379,8 @@ const [state, setState] = createStore<State>({
   batch: null,
   lastFolder: null,
   quickAction: null,
+  upscaler: null,
+  upscalerDownload: null,
   comparison: null,
   toasts: [],
 });
@@ -425,9 +431,146 @@ export async function refreshFfmpeg(relocate = false) {
       readsAv1: false,
       libjxl: null,
       jxl: api.NO_JXL,
+      aiModels: [],
     };
     setState("ffmpeg", status);
     return status;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AI upscaling
+// ---------------------------------------------------------------------------
+
+/**
+ * The AI models conversions can use: installed, and not known to fail on this
+ * computer (no usable graphics card, a driver that makes black pictures, or
+ * an upscaler that won't start, e.g. on macOS 11).
+ */
+export function aiModels(): api.AiModel[] {
+  const gpu = state.upscaler?.gpu?.status;
+  if (gpu === "noGpu" || gpu === "blackOutput" || gpu === "failed") return [];
+  return state.ffmpeg?.aiModels ?? [];
+}
+
+/** Look at what is installed for AI upscaling. */
+export async function loadUpscaler() {
+  try {
+    setState({ upscaler: await api.upscalerStatus() });
+  } catch {
+    // Settings shows it as not installed.
+  }
+}
+
+let upscalerCheck: Promise<void> | null = null;
+
+/**
+ * Try AI upscaling on the graphics card once per run, the first time the
+ * editor offers it, so a computer without a usable card stops offering it.
+ */
+export function ensureUpscalerChecked(): Promise<void> {
+  if (!api.inTauri || (state.ffmpeg?.aiModels ?? []).length === 0) return Promise.resolve();
+  upscalerCheck ??= (async () => {
+    try {
+      const info = state.upscaler ?? (await api.upscalerStatus());
+      setState({ upscaler: info?.gpu ? info : await api.checkUpscalerGpu() });
+    } catch {
+      // Conversions report what went wrong.
+    }
+  })();
+  return upscalerCheck;
+}
+
+/** After the upscaler changed: the editor's models and the backend's view of them. */
+async function upscalerChanged(info: api.UpscalerInfo) {
+  setState({ upscaler: info });
+  upscalerCheck = info.gpu ? Promise.resolve() : null;
+  await refreshFfmpeg();
+}
+
+function gpuToast(info: api.UpscalerInfo) {
+  switch (info.gpu?.status) {
+    case "ready":
+      toast(info.gpu.gpu ? `AI upscaling is ready on ${info.gpu.gpu}` : "AI upscaling is ready");
+      break;
+    case "noGpu":
+      toast("Installed, but this computer has no graphics card AI upscaling can use", {
+        tone: "error",
+      });
+      break;
+    case "blackOutput":
+      toast("Installed, but the graphics driver makes black pictures: update it", {
+        tone: "error",
+      });
+      break;
+    case "failed":
+      toast(`Installed, but the test didn't work: ${info.gpu.message}`, { tone: "error" });
+      break;
+    default:
+      break;
+  }
+}
+
+/** Download and install AI upscaling, then try it out. */
+export async function downloadUpscaler() {
+  if (state.upscalerDownload) return;
+  setState({ upscalerDownload: { received: 0, total: state.upscaler?.downloadBytes || null } });
+  try {
+    const info = await api.downloadUpscaler((progress) => setState({ upscalerDownload: progress }));
+    await upscalerChanged(info);
+    gpuToast(info);
+  } catch (error) {
+    toast(errorText(error), { tone: "error" });
+    await loadUpscaler();
+  } finally {
+    setState({ upscalerDownload: null });
+  }
+}
+
+/** Stop the running AI upscaling download. */
+export async function cancelUpscalerDownload() {
+  try {
+    await api.cancelUpscalerDownload();
+  } catch {
+    // It ends on its own anyway.
+  }
+}
+
+/** Install AI upscaling from files the user downloaded. */
+export async function installUpscalerFromFiles() {
+  const paths = await api.pickUpscalerFiles();
+  if (paths.length === 0) return;
+  try {
+    const info = await api.installUpscalerFiles(paths);
+    await upscalerChanged(info);
+    if (info.missing.length > 0) {
+      toast("Installed. A file is still missing: see Settings → AI upscaling");
+    } else {
+      gpuToast(info);
+    }
+  } catch (error) {
+    toast(errorText(error), { tone: "error" });
+  }
+}
+
+/** Remove AI upscaling. Pictures set to use it go back to classic upscaling. */
+export async function removeUpscaler() {
+  try {
+    await upscalerChanged(await api.removeUpscaler());
+    toast("AI upscaling removed");
+  } catch (error) {
+    toast(errorText(error), { tone: "error" });
+  }
+}
+
+/** Try AI upscaling on the graphics card again, e.g. after a driver update. */
+export async function checkUpscalerGpu() {
+  try {
+    const info = await api.checkUpscalerGpu();
+    setState({ upscaler: info });
+    gpuToast(info);
+  } catch (error) {
+    toast(errorText(error), { tone: "error" });
   }
 }
 
@@ -1891,7 +2034,10 @@ export function resetStore() {
     batch: null,
     lastFolder: null,
     quickAction: null,
+    upscaler: null,
+    upscalerDownload: null,
     comparison: null,
     toasts: [],
   });
+  upscalerCheck = null;
 }

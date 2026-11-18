@@ -42,6 +42,11 @@ description = "Build the ffmpeg/libjxl tools the app bundles (slow; default targ
 usage = 'arg "[target]" help="Rust target triple, e.g. universal-apple-darwin"'
 run = 'scripts/media-tools/build.sh "${usage_target:-$(rustc -vV | sed -n "s/^host: //p")}"'
 
+[tasks.upscaler]
+description = "Build the optional AI upscaler into target/upscaler/dist/<target> (slow; default target: this machine)"
+usage = 'arg "[target]" help="Rust target triple, e.g. universal-apple-darwin"'
+run = 'scripts/upscaler/build.sh "${usage_target:-$(rustc -vV | sed -n "s/^host: //p")}"'
+
 [tasks.build-bundled]
 description = "Build the desktop bundle with the tools from `mise run media-tools` inside"
 depends = ["setup"]

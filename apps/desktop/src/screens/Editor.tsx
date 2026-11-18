@@ -24,6 +24,7 @@ import { type SizePick, SizeSelect, UpscaleSettings } from "../components/SizeFi
 import { TrimBar } from "../components/TrimBar";
 import {
   type Aspect,
+  aiEstimate,
   type ConvertOptions,
   checkCommand,
   compareSample,
@@ -68,6 +69,7 @@ import {
   parseClock,
 } from "../lib/format";
 import {
+  aiApplies,
   autoLimits,
   CODEC_LABELS,
   changesPlayback,
@@ -120,6 +122,7 @@ import {
 } from "../lib/player";
 import { createFilmstrip, createFrame, createWaveform } from "../lib/preview";
 import {
+  aiModels,
   canEncodeHevcInHardware,
   canRead,
   closeEditor,
@@ -127,9 +130,11 @@ import {
   convertDraft,
   convertEach,
   type Draft,
+  ensureUpscalerChecked,
   isAvailable,
   isCodecAvailable,
   makeAnimation,
+  navigate,
   saveFrame,
   saveRecipe,
   setCompare,
@@ -659,6 +664,36 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
     upscaling() !== null && !fitsLimits(info(), options())
       ? { limit: maxLongSide(options().format), format: label(options().format) }
       : null;
+  // AI upscaling, for still pictures, once it is installed (Settings).
+  const aiFits = () => aiApplies(info(), options().format);
+  // The first time it is on offer, see whether the graphics card can run it.
+  createEffect(() => {
+    if (upscaling() !== null && aiFits()) void ensureUpscalerChecked();
+  });
+  // A model that went away (removed, or no usable graphics card) can't be used.
+  createEffect(() => {
+    const model = options().ai;
+    if (model && state.ffmpeg && !aiModels().includes(model)) updateOptions({ ai: null });
+  });
+  const [aiSecs, setAiSecs] = createSignal<[number, number] | null>(null);
+  let aiAsked = 0;
+  createEffect(
+    on(
+      () => [info(), JSON.stringify(options())] as const,
+      () => {
+        const asked = ++aiAsked;
+        if (!options().ai || upscaling() === null || !aiFits()) {
+          setAiSecs(null);
+          return;
+        }
+        const snapshot = { ...options() };
+        aiEstimate(info(), snapshot).then(
+          (secs) => asked === aiAsked && setAiSecs(secs),
+          () => asked === aiAsked && setAiSecs(null),
+        );
+      },
+    ),
+  );
   const pickSize = (pick: SizePick) => {
     if (pick !== "custom") {
       setCustomUpscale(false);
@@ -1482,6 +1517,11 @@ const DraftEditor: Component<{ draft: Draft; compact: boolean }> = (props) => {
                 scaler={options().scaler ?? "auto"}
                 huge={isHuge(info(), options())}
                 tooBig={tooBig()}
+                aiApplies={aiFits()}
+                aiModels={aiModels()}
+                ai={options().ai ?? null}
+                aiEstimate={aiSecs()}
+                onSetUpAi={() => navigate("settings")}
                 onChange={updateOptions}
               />
             </Show>

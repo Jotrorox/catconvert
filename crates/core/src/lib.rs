@@ -43,13 +43,14 @@ mod output;
 mod sample;
 mod scrub;
 mod sequence;
+mod upscale;
 
 pub use convert::{
     AudioRate, ConvertOptions, Crop, CropArea, Direction, HARDWARE_QUALITY_RANGE,
     HEVC_HARDWARE_ENCODER, JxlOptions, JxlSupport, MAX_SIDE, MAX_UPSCALE_FACTOR, MAX_VIDEO_SIDE,
     Metadata, OutputFormat, Plan, QualitySummary, Scaler, SoundOptions, Step, Support, Tool,
-    Upscale, VIDEO_KBPS, VideoCodec, VideoRate, crf_range, frame_output_path, frame_plan,
-    output_path, plan, quality_summary, upscale_warning,
+    Upscale, VIDEO_KBPS, VideoCodec, VideoRate, ai_estimate, crf_range, frame_output_path,
+    frame_plan, output_path, plan, quality_summary, upscale_warning,
 };
 pub use custom::{
     INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER, command_template, custom_plan, fill_command,
@@ -69,4 +70,11 @@ pub use sample::{
 pub use scrub::scrub_file;
 pub use sequence::{
     Fit, MAX_PICTURES, SequenceOptions, plan_sequence, sequence_naming, sequence_output_path,
+};
+pub use upscale::{
+    AiModel, AiModels, Download, DownloadKind, GpuCheck, MAX_AI_PIXELS, MAX_AI_SCALE, UPSCALER_ENV,
+    Upscaler, UpscalerOrigin, UpscalerStatus, can_download as can_download_upscaler,
+    default_dir as upscaler_dir, downloads as upscaler_downloads,
+    estimate_secs as ai_estimate_secs, install_files as install_upscaler,
+    licenses as upscaler_licenses, status as upscaler_status, uninstall as uninstall_upscaler,
 };

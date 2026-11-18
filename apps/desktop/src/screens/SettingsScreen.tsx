@@ -2,9 +2,10 @@ import { type Component, createSignal, For, Match, onMount, Show, Switch } from 
 import { CatPeek } from "../components/Cat";
 import { Icon } from "../components/Icon";
 import { ReplaceConfirm } from "../components/ReplaceConfirm";
-import { type OutputFormat, thirdPartyLicenses } from "../lib/api";
+import { type GpuCheck, type OutputFormat, thirdPartyLicenses } from "../lib/api";
 import { formatBytes } from "../lib/format";
 import {
+  AI_MODELS,
   FORMAT_GROUPS,
   type FormatGroup,
   label,
@@ -16,13 +17,19 @@ import {
 import { os } from "../lib/platform";
 import {
   activeCount,
+  cancelUpscalerDownload,
   checkForUpdates,
+  checkUpscalerGpu,
   chooseOutputFolder,
   confirmReplace,
+  downloadUpscaler,
   installUpdate,
+  installUpscalerFromFiles,
   isAvailable,
   loadQuickAction,
+  loadUpscaler,
   refreshFfmpeg,
+  removeUpscaler,
   restartApp,
   setOutput,
   setOutputByKind,
@@ -440,6 +447,8 @@ export const SettingsScreen: Component = () => {
         </section>
       </Show>
 
+      <AiUpscaling />
+
       <OutputSettings />
 
       <OtherApps />
@@ -454,6 +463,11 @@ export const SettingsScreen: Component = () => {
           CatConvert comes with ffmpeg (GPL-2.0-or-later, built with x264 and x265) and libjxl's
           tools, which it runs as separate programs. Every release on GitHub includes their complete
           source code.
+        </p>
+        <p class="item-meta">
+          AI upscaling, when installed, runs realesrgan-ncnn-vulkan (MIT) with ncnn (BSD-3-Clause)
+          and the Real-ESRGAN models (BSD-3-Clause, © 2021 Xintao Wang). Their licenses are listed
+          below once installed.
         </p>
         <p class="item-meta">
           H.264 and H.265 (HEVC) are covered by patents licensed through patent pools. CatConvert
@@ -482,6 +496,167 @@ export const SettingsScreen: Component = () => {
         </Show>
       </section>
     </div>
+  );
+};
+
+/** What the test on the graphics card found, in a sentence. */
+function gpuText(check: GpuCheck | null): string {
+  switch (check?.status) {
+    case "ready":
+      return check.gpu ? `Works on ${check.gpu}.` : "Works on this computer.";
+    case "noGpu":
+      return "This computer has no graphics card AI upscaling can use (it needs Vulkan), so pictures are enlarged the classic way.";
+    case "blackOutput":
+      return "The graphics driver makes black pictures. Update it, then test again.";
+    case "failed":
+      return `The test didn't work: ${check.message}`;
+    default:
+      return "Not tested on this computer yet.";
+  }
+}
+
+/** Settings → AI upscaling: download, install from files, test, remove. */
+const AiUpscaling: Component = () => {
+  onMount(() => void loadUpscaler());
+  const info = () => state.upscaler;
+  const progress = () => state.upscalerDownload;
+  const installed = () => (info()?.models.length ?? 0) > 0 && info()?.binary;
+  const complete = () => installed() && info()?.missing.length === 0;
+  const busy = () => progress() !== null || info()?.busy === true;
+  const pct = () => {
+    const p = progress();
+    return p?.total ? Math.min(100, Math.round((p.received / p.total) * 100)) : null;
+  };
+  const models = () =>
+    AI_MODELS.filter((m) => info()?.models.includes(m.model))
+      .map((m) => m.label.replace(/^AI: (.)/, (_, first: string) => first.toUpperCase()))
+      .join(" · ");
+  const size = () => {
+    const bytes = info()?.downloadBytes ?? 0;
+    return bytes > 0 ? ` (about ${formatBytes(bytes)})` : "";
+  };
+
+  return (
+    <section class="card update-card" aria-labelledby="ai-title">
+      <h2 class="section-title" id="ai-title">
+        AI upscaling
+      </h2>
+      <p class="item-meta">
+        Enlarges photos and drawings with Real-ESRGAN, which adds detail instead of just making them
+        bigger. It runs on the graphics card and is an optional download: CatConvert's upscaler from
+        this release, and the models straight from the official Real-ESRGAN release. Downloading
+        only fetches files; nothing is sent.
+      </p>
+      <div class="update-body">
+        <Show
+          when={progress()}
+          fallback={
+            <>
+              <Show when={installed()} fallback={<p class="label-strong">Not installed</p>}>
+                <p class="label-strong">Installed</p>
+                <p class="item-meta">Models: {models()}</p>
+                <p class="item-meta" role="status">
+                  {gpuText(info()?.gpu ?? null)}
+                </p>
+                <Show when={info()?.origin !== "installed" && info()?.binary}>
+                  {(binary) => <p class="item-meta mono path">Using {binary()}</p>}
+                </Show>
+              </Show>
+              <Show when={installed() && !complete()}>
+                <p class="item-meta">Some files are still missing{size()}.</p>
+              </Show>
+              <Show when={info()?.outdated}>
+                <p class="item-meta">This version of CatConvert comes with a newer upscaler.</p>
+              </Show>
+              <div class="settings-actions">
+                <Show when={info()?.canDownload && (!complete() || info()?.outdated)}>
+                  <button
+                    type="button"
+                    class="btn btn-primary"
+                    disabled={busy()}
+                    onClick={() => void downloadUpscaler()}
+                  >
+                    <Icon name="sparkle" size={16} />
+                    {installed() ? "Download the rest" : `Download and install${size()}`}
+                  </button>
+                </Show>
+                <Show when={!complete() || !info()?.canDownload}>
+                  <button
+                    type="button"
+                    class="btn btn-outline"
+                    disabled={busy()}
+                    onClick={() => void installUpscalerFromFiles()}
+                  >
+                    Install from file…
+                  </button>
+                </Show>
+                <Show when={installed()}>
+                  <button
+                    type="button"
+                    class="btn btn-outline"
+                    disabled={busy()}
+                    onClick={() => void checkUpscalerGpu()}
+                  >
+                    <Icon name="refresh" size={16} />
+                    Test again
+                  </button>
+                </Show>
+                <Show when={info()?.origin === "installed" || (info()?.missing.length ?? 3) < 3}>
+                  <button
+                    type="button"
+                    class="btn btn-outline"
+                    disabled={busy() || activeCount() > 0}
+                    onClick={() => void removeUpscaler()}
+                  >
+                    Remove
+                  </button>
+                </Show>
+              </div>
+              <Show when={!info()?.canDownload && !complete()}>
+                <p class="item-meta">
+                  To install without this app downloading, fetch{" "}
+                  <code class="mono">catconvert-upscaler-…zip</code> from this version's release,{" "}
+                  <code class="mono">realesrgan-ncnn-vulkan-20220424-ubuntu.zip</code> and{" "}
+                  <code class="mono">realesr-general-x4v3.pth</code> from the Real-ESRGAN v0.2.5.0
+                  release, then pick them with “Install from file…”.
+                </p>
+              </Show>
+            </>
+          }
+        >
+          {(p) => (
+            <>
+              <p class="label-strong">Downloading AI upscaling…</p>
+              <div
+                class="progress update-progress"
+                role="progressbar"
+                aria-label="Downloading AI upscaling"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={pct() ?? undefined}
+              >
+                <div class="progress-fill" style={{ width: `${Math.max(pct() ?? 100, 4)}%` }} />
+              </div>
+              <p class="item-meta">
+                {formatBytes(p().received)}
+                {p().total ? ` of ${formatBytes(p().total ?? 0)}` : ""}
+              </p>
+              <button
+                type="button"
+                class="btn btn-outline"
+                onClick={() => void cancelUpscalerDownload()}
+              >
+                Cancel
+              </button>
+            </>
+          )}
+        </Show>
+      </div>
+      <p class="item-meta settings-note">
+        Real-ESRGAN models © 2021 Xintao Wang, BSD-3-Clause, as published with xinntao/Real-ESRGAN.
+        AI-enlarged pictures leave out photo metadata.
+      </p>
+    </section>
   );
 };
 

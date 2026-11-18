@@ -29,6 +29,10 @@ tauri-plugin-single-instance = "=2.5.5"
 uniffi = "=0.32.2"
 
 # Everything else is locked by Cargo.lock.
+# The desktop app downloads the optional AI upscaler with the same HTTP client
+# and TLS setup as tauri-plugin-updater (rustls with ring), so no new crates.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -41,6 +45,12 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 kamadak-exif = "0.6.2"
 miniz_oxide = "0.9.1"
 brotli-decompressor = "6.3.2"
+# AI upscaling (see crates/core/src/upscale): checking downloads against the
+# SHA-256s compiled into the app, and unpacking the upscaler and model zips.
+# Deflate only: zip's flate2 needs a backend picked, miniz_oxide (pure Rust).
+flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
+sha2 = "0.11.1"
+zip = { version = "9.6.1", default-features = false, features = ["deflate-flate2"] }
 # "Replace the original" moves it to the Trash / Recycle Bin. No chrono/jiff:
 # only `delete` is used.
 trash = { version = "5.4.0", default-features = false, features = ["freedesktop", "coinit_apartmentthreaded"] }

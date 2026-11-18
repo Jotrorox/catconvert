@@ -69,10 +69,15 @@ pub fn custom_plan(
         .collect();
     let last = calls.len() - 1;
     for (index, call) in calls.iter().enumerate() {
+        if call.tool == Tool::Upscale && support.ai.is_empty() {
+            return Err(invalid(
+                "AI upscaling isn't installed, so this command can't run",
+            ));
+        }
         let missing = match call.tool {
             Tool::Cjxl => !support.jxl.cjxl,
             Tool::Djxl => !support.jxl.djxl,
-            Tool::Ffmpeg | Tool::Scrub => false,
+            Tool::Ffmpeg | Tool::Scrub | Tool::Upscale => false,
         };
         if missing {
             return Err(invalid(format!(
@@ -325,7 +330,7 @@ fn parse(text: &str) -> Result<Vec<Call>> {
     Ok(calls)
 }
 
-const TOOLS: &str = "ffmpeg, cjxl, djxl and catconvert scrub";
+const TOOLS: &str = "ffmpeg, cjxl, djxl, realesrgan-ncnn-vulkan and catconvert scrub";
 
 fn call(words: Vec<String>) -> Result<Call> {
     let mut words = words.into_iter();
@@ -334,6 +339,7 @@ fn call(words: Vec<String>) -> Result<Call> {
         "ffmpeg" => Tool::Ffmpeg,
         "cjxl" => Tool::Cjxl,
         "djxl" => Tool::Djxl,
+        "realesrgan-ncnn-vulkan" => Tool::Upscale,
         "catconvert" => match words.next().as_deref() {
             Some("scrub") => Tool::Scrub,
             Some(other) => {
@@ -533,6 +539,34 @@ fn outputs(call: &Call) -> Result<Vec<String>> {
                 }
             }
         }
+        Tool::Upscale => {
+            let mut args = call.args.iter();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "-m" => {
+                        return Err(invalid(
+                            "-m isn't allowed: CatConvert points the upscaler at its installed models",
+                        ));
+                    }
+                    "-o" => outputs.push(
+                        args.next()
+                            .ok_or_else(|| {
+                                invalid("realesrgan-ncnn-vulkan's -o needs a file after it")
+                            })?
+                            .clone(),
+                    ),
+                    "-i" | "-n" | "-s" | "-t" | "-g" | "-j" | "-f" => {
+                        args.next();
+                    }
+                    _ => {}
+                }
+            }
+            if outputs.is_empty() {
+                return Err(invalid(
+                    "realesrgan-ncnn-vulkan needs -o and the file it writes",
+                ));
+            }
+        }
         Tool::Scrub => match call.args.as_slice() {
             [_, output, flag, what]
                 if flag == "--drop" && matches!(what.as_str(), "location" | "all") =>
@@ -662,6 +696,7 @@ fn default_weight(tool: Tool) -> f32 {
         Tool::Cjxl => 0.6,
         Tool::Djxl => 0.2,
         Tool::Scrub => 0.05,
+        Tool::Upscale => 0.85,
     }
 }
 
@@ -1275,5 +1310,48 @@ mod tests {
             filled,
             theirs.command_line().replace("-b:v 4000k", "-b:v 2500k")
         );
+    }
+
+    #[test]
+    fn ai_upscaling_steps_can_be_edited() {
+        let input = photo("/pics/small.png");
+        let options = ConvertOptions {
+            format: OutputFormat::Png,
+            upscale: Some(crate::Upscale::Factor(2.0)),
+            ai: Some(crate::AiModel::General),
+            metadata: Metadata::Keep,
+            ..ConvertOptions::default()
+        };
+        let support = Support {
+            ai: [crate::AiModel::General].into_iter().collect(),
+            ..Support::from(all_tools())
+        };
+        let out = Path::new("/pics/big.png");
+        let generated = plan(&input, &options, out, support).expect("plan");
+        let line = generated.command_line();
+        let same = custom_plan(&input, &generated, &line, support).expect("unchanged");
+        assert_eq!(same.steps, generated.steps);
+
+        // A smaller tile size is fine; the model folder is CatConvert's.
+        let tiles = line.replace("-s 4 -f png", "-s 4 -t 64 -f png");
+        let edited = custom_plan(&input, &generated, &tiles, support).expect("edited");
+        assert_eq!(edited.steps[1].tool, Tool::Upscale);
+        assert_eq!(edited.steps[1].weight, 0.85);
+        let err = custom_plan(
+            &input,
+            &generated,
+            &line.replace("-s 4 -f png", "-s 4 -m /tmp/models -f png"),
+            support,
+        )
+        .expect_err("-m");
+        assert!(err.to_string().contains("-m isn't allowed"), "{err}");
+        let err = custom_plan(&input, &generated, &line, Support::from(all_tools()))
+            .expect_err("not installed");
+        assert!(err.to_string().contains("isn't installed"), "{err}");
+        // It may only write the plan's own files.
+        let elsewhere = line.replace("-o /pics/.big.png.ai-out.png", "-o /tmp/x.png");
+        assert_ne!(elsewhere, line);
+        let err = custom_plan(&input, &generated, &elsewhere, support).expect_err("elsewhere");
+        assert!(err.to_string().contains("/tmp/x.png"), "{err}");
     }
 }

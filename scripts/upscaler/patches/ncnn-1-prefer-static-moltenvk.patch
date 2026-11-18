@@ -1,0 +1,25 @@
+On macOS, use the statically linked MoltenVK first.
+
+simplevk otherwise probes libvulkan.dylib, libvulkan.1.dylib, libMoltenVK.dylib
+and libvulkan_kosmickrisp.dylib with dlopen before falling back to the MoltenVK
+linked into the binary, printing a "dlopen failed" line to stderr for each miss.
+The hardened runtime would refuse most such libraries anyway. A driver named
+through VK_ICD_FILENAMES or NCNN_VULKAN_DRIVER still takes precedence.
+
+--- a/src/simplevk.cpp
++++ b/src/simplevk.cpp
+@@ -494,6 +494,14 @@
+             }
+         }
+     }
++
++#if __APPLE__
++    // catconvert: with MoltenVK linked in, use it unless a driver was asked
++    // for, rather than probing (and logging) for dylibs that hardened runtime
++    // would refuse to load anyway
++    if (driver_path == 0 && ::vkGetInstanceProcAddr != NULL)
++        return load_vulkan_apple_moltenvk();
++#endif // __APPLE__
+ 
+     // first try, load from driver_path
+ #if defined _WIN32

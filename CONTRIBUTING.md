@@ -58,6 +58,46 @@ because it only runs these tools as separate processes. Don't link ffmpeg's
 libraries into the app. Every release must carry the matching source archive,
 which the release workflow attaches automatically.
 
+### Optional AI upscaler
+
+AI upscaling runs `catconvert-upscaler`, our build of
+[realesrgan-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan). It
+isn't in the installers: the app downloads it on request from the release of its
+own version, as `catconvert-upscaler-<target>.zip`, and checks it against a
+SHA-256 compiled into the app and the CLI (`CATCONVERT_UPSCALER_SHA256`, set by
+the release workflow).
+
+- `scripts/upscaler/build.sh` builds it from the sources pinned in
+  `scripts/upscaler/sources.lock` (realesrgan-ncnn-vulkan, ncnn with its
+  glslang, libwebp, and MoltenVK on macOS), with the small patches in
+  `scripts/upscaler/patches/`; each patch says why it exists. Upstream's
+  command line and messages stay unchanged.
+- ncnn's built-in Vulkan loader opens the GPU driver at runtime, so the binary
+  links only OS libraries: no Vulkan loader, no OpenMP and no C++ runtime
+  (static CRT on Windows, static libstdc++ on Linux, MoltenVK linked in on
+  macOS). No Vulkan SDK is needed to build it. Because of MoltenVK, the macOS
+  build needs macOS 12.
+- `mise run upscaler` builds it for this machine into
+  `target/upscaler/dist/<target>`. It needs cmake and ninja
+  (`brew install cmake ninja`); on Windows, run it in Git Bash with Visual
+  Studio's C++ tools instead of ninja. `build.sh pack <dir> <file.zip>` makes
+  the zip the app installs.
+- To update a component, change its version, URL and SHA-256 in `sources.lock`
+  together and check that the patches still apply. `.github/workflows/upscaler.yml`
+  builds all three platforms when anything in `scripts/upscaler` changes. It
+  fails if the binary links a non-system library or outgrows its size budget,
+  and on Linux it upscales a test image with Mesa's software Vulkan driver.
+- Releases sign and notarize the macOS binary, then attach the three zips,
+  their `.sha256` files and `catconvert-<version>-upscaler-source.tar.xz`.
+
+Licensing: realesrgan-ncnn-vulkan is MIT (its license also covers the
+realsr-ncnn-vulkan code it is based on), ncnn is BSD-3-Clause with a few
+permissively licensed parts, glslang is BSD-3-Clause and other permissive
+licenses, libwebp is BSD-3-Clause, and MoltenVK is Apache-2.0. Each pack carries
+these texts in `THIRD-PARTY-LICENSES.txt`. The Real-ESRGAN model weights are
+never in our pack or anywhere in our releases: the app fetches them from
+xinntao's official releases.
+
 ## Opening files from other apps
 
 Files reach a running or starting app in two ways. macOS sends

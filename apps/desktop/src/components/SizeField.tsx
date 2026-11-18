@@ -1,7 +1,8 @@
 import { type Component, createEffect, createMemo, createSignal, For, on, Show } from "solid-js";
-import type { ConvertOptions, Scaler, Upscale } from "../lib/api";
+import type { AiModel, ConvertOptions, Scaler, Upscale } from "../lib/api";
 import type { Size } from "../lib/crop";
-import { SCALERS, sameUpscale } from "../lib/formats";
+import { formatDuration } from "../lib/format";
+import { AI_MODELS, SCALERS, sameUpscale } from "../lib/formats";
 import { Icon } from "./Icon";
 
 /** What the Size select can pick: a shrink cap, an upscale preset or a custom upscale. */
@@ -107,10 +108,23 @@ type SettingsProps = {
   huge: boolean;
   /** The result is more than the format can hold: its long-side limit and name. */
   tooBig: { limit: number; format: string } | null;
+  /** AI upscaling can apply to this output (a still picture). */
+  aiApplies?: boolean;
+  /** The AI models that are installed and work on this computer. */
+  aiModels?: readonly AiModel[];
+  /** The chosen AI model, if any. */
+  ai?: AiModel | null;
+  /** Seconds the AI pass roughly takes, on a fast and a slow graphics card. */
+  aiEstimate?: [number, number] | null;
+  /** Open Settings → AI upscaling, offered when no model is installed. */
+  onSetUpAi?: () => void;
   onChange: (patch: Partial<ConvertOptions>) => void;
 };
 
 const sizeText = (size: Size) => `${size.width}×${size.height}`;
+
+/** Select value of an AI model, next to the scalers. */
+const AI_PREFIX = "ai:";
 
 /**
  * What goes with an upscale: the custom target, the scaler, and a word when
@@ -141,6 +155,21 @@ export const UpscaleSettings: Component<SettingsProps> = (props) => {
     else setNote(null);
     input.value = String(size);
     props.onChange({ upscale: { size }, maxSize: null });
+  };
+
+  const aiChoices = () =>
+    props.aiApplies ? AI_MODELS.filter((m) => props.aiModels?.includes(m.model)) : [];
+  /** The AI model in use: chosen, installed and fit for this output. */
+  const ai = () => {
+    const model = props.ai;
+    return model && aiChoices().some((m) => m.model === model) ? model : null;
+  };
+  const pickScaler = (value: string) => {
+    if (value.startsWith(AI_PREFIX)) {
+      props.onChange({ ai: value.slice(AI_PREFIX.length) as AiModel });
+    } else {
+      props.onChange({ scaler: value as Scaler, ai: null });
+    }
   };
 
   return (
@@ -178,23 +207,32 @@ export const UpscaleSettings: Component<SettingsProps> = (props) => {
           <Show when={props.enlarged}>
             <label class="field">
               <span class="field-label">Scaler</span>
-              <select
-                class="select"
-                onChange={(e) => props.onChange({ scaler: e.currentTarget.value as Scaler })}
-              >
+              <select class="select" onChange={(e) => pickScaler(e.currentTarget.value)}>
                 <For each={SCALERS}>
                   {(choice) => (
                     <option
                       value={choice.scaler}
                       selected={
-                        props.scaler === choice.scaler ||
-                        (props.scaler === "lanczos" && choice.scaler === "auto")
+                        ai() === null &&
+                        (props.scaler === choice.scaler ||
+                          (props.scaler === "lanczos" && choice.scaler === "auto"))
                       }
                     >
                       {choice.label}
                     </option>
                   )}
                 </For>
+                <Show when={aiChoices().length > 0}>
+                  <optgroup label="AI (Real-ESRGAN)">
+                    <For each={aiChoices()}>
+                      {(choice) => (
+                        <option value={AI_PREFIX + choice.model} selected={ai() === choice.model}>
+                          {choice.label}
+                        </option>
+                      )}
+                    </For>
+                  </optgroup>
+                </Show>
               </select>
             </label>
           </Show>
@@ -212,7 +250,36 @@ export const UpscaleSettings: Component<SettingsProps> = (props) => {
             <Show when={props.enlarged}>
               <Show
                 when={props.huge && props.result}
-                fallback={<span class="item-meta">Upscaling makes it bigger, not sharper.</span>}
+                fallback={
+                  <Show
+                    when={ai()}
+                    fallback={
+                      <>
+                        <span class="item-meta">Upscaling makes it bigger, not sharper.</span>
+                        <Show when={props.aiApplies && aiChoices().length === 0 && props.onSetUpAi}>
+                          {(setUp) => (
+                            <button type="button" class="link-btn" onClick={() => setUp()()}>
+                              Add detail with AI upscaling
+                            </button>
+                          )}
+                        </Show>
+                      </>
+                    }
+                  >
+                    <span class="item-meta" role="status">
+                      AI makes up fine detail, so check faces and text.
+                      <Show when={props.aiEstimate}>
+                        {(secs) => (
+                          <>
+                            {" "}
+                            Takes about {formatDuration(secs()[0])} to {formatDuration(secs()[1])}{" "}
+                            on a graphics card.
+                          </>
+                        )}
+                      </Show>
+                    </span>
+                  </Show>
+                }
               >
                 {(size) => (
                   <p class="lossless-note warning-note" role="status">

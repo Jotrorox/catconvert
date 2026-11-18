@@ -6,6 +6,10 @@ November 2026. Sizes come from the release assets themselves (downloaded and
 listed); licenses come from each repository's `LICENSE`. Follow-up work is
 tracked in [#35](https://github.com/Jotrorox/catconvert/issues/35).
 
+> **Status (November 2026):** step 1 of the recommendation (photos) is
+> implemented, see [What shipped](#what-shipped). Video ML upscaling and a
+> macOS `VTSuperResolutionScaler` backend are still open.
+
 ## Summary
 
 **Recommendation:** Real-ESRGAN models run by an ncnn + Vulkan helper, shipped as
@@ -22,7 +26,8 @@ an **optional download**, not inside the installer.
    frames off disk: a small helper of our own (ncnn, raw RGB frames on
    stdin/stdout) sits between two ffmpeg processes. Progress then comes from the
    encoding ffmpeg's `-progress` output, which the core already parses.
-3. ### Weights license
+
+### Weights license
 
 Checked against the primary sources in November 2026.
 
@@ -354,16 +359,59 @@ memory. Cap at, say, 8K on the long side and warn above it (ties in with step
 - **Why not bundle:** the installer would grow by 45 MB per platform, about
   70 MB on universal macOS. Most users never upscale, and GPU-less users can't.
 
+## What shipped
+
+[#35](https://github.com/Jotrorox/catconvert/issues/35) implemented the photo
+path:
+
+- **Upscaler:** `catconvert-upscaler`, built from realesrgan-ncnn-vulkan
+  `37026f4` with ncnn 20261020 (simplevk, no OpenMP), libwebp and static
+  MoltenVK by `scripts/upscaler/build.sh` and `.github/workflows/upscaler.yml`.
+  Small patches fix undefined behaviour in path handling and make a missing
+  model exit with an error; the command line and messages are upstream's.
+  Releases attach `catconvert-upscaler-<target>.zip` per platform; the app and
+  the CLI pin its SHA-256 at build time (`CATCONVERT_UPSCALER_SHA256`). The
+  macOS build needs macOS 12 (MoltenVK); on macOS 11 the test run fails and the
+  option stays hidden.
+- **Models:** all four, ~45 MB on disk. x4plus, x4plus-anime and animevideov3
+  are taken from `models/` of the official
+  `realesrgan-ncnn-vulkan-20220424-ubuntu.zip`; `realesr-general-x4v3.pth` is
+  converted to ncnn on the user's machine by a small Rust converter
+  (`crates/core/src/upscale/pth.rs`, which reproduces upstream's
+  animevideov3 conversion byte for byte). Every file is checked against a
+  SHA-256 compiled into the app, including the converted result. The models'
+  BSD-3 text and citation are written next to them and shown under Settings →
+  Open-source licenses.
+- **Core:** `ConvertOptions::ai` picks the model. Stills only: ffmpeg turns and
+  crops into an 8-bit PNG (RGBA unless the source is a JPEG), the upscaler
+  enlarges 4×, Lanczos takes it to the exact size. Upstream's 2× and 3×
+  animevideov3 files are the 4× network plus a bicubic shrink, so every model
+  runs one 4× pass. Results above 67 MP (8192²) are refused; when the 4× pass
+  alone would pass that, the picture is shrunk first so the pass lands on the
+  target. Progress comes from the `NN.NN%` lines, black results are reported
+  as a driver problem, and AI-enlarged pictures carry no photo metadata.
+  Videos and animations keep the classic scaler, with a warning.
+- **Desktop:** Settings → AI upscaling downloads (with progress and cancel),
+  installs from files, tests the GPU and removes it. The editor lists the
+  installed models in the Scaler menu for still pictures, with a time estimate.
+- **CLI:** `--upscale 4x --ai[=general|photo|anime|anime-fast]`, and
+  `catconvert upscaler status|install|check|remove`.
+- **Measured on an Apple M5** (0.8 MP in, 4×): general-x4v3 2.1 s,
+  animevideov3 1.7 s, x4plus-anime 5.2 s, x4plus 13 s, including about 0.3 s of
+  start-up. The estimates in the UI assume a fast desktop card is about twice
+  as fast and integrated graphics several times slower; numbers from an
+  RTX 3060-class PC and an Intel iGPU Linux box are still to be measured. The
+  tile size stays on upstream's automatic choice (by GPU memory).
+
 ## Open questions
 
 1. ~~**Network.**~~ Decided: an in-app download is fine (it sends nothing; it
    only fetches). Keep "Install from file…" for offline machines.
-2. **Model set.** Do we ship x4plus, x4plus-anime, animevideov3 and
-   general-x4v3 (~45 MB), or start with x4plus plus general-x4v3 only (~35 MB)?
+2. ~~**Model set.**~~ Decided: all four (~45 MB on disk).
 3. **Video.** Should video ML upscaling be in v1 at all? If yes, accept the
    disk-chunk approach first, or build the pipe helper straight away?
-4. **CPU fallback.** Expose `-g -1` (minutes per photo) or hide ML without a
-   GPU?
+4. ~~**CPU fallback.**~~ Decided: no CPU mode; without a usable GPU the AI
+   option is hidden and Lanczos is used.
 5. **Mac path.** Is a macOS 26 `VTSuperResolutionScaler` helper worth a second
    backend? Its quality has not been tested here, and it downloads OS models
    on first use.

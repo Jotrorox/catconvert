@@ -22,9 +22,21 @@ Tauri mobile or native Swift/Kotlin apps over the UniFFI bindings.
 - **Upscaling:** make photos and videos bigger than the original, 2×, 3×, 4×
   or to 720p, 1080p, 1440p or 4K, with Lanczos (or spline or bicubic). Video
   keeps its shape and even sides; the size estimate covers it, and very large
-  results get a warning first. Shrinking stays the default. It's classic
-  scaling, so it adds pixels, not detail (see
-  [docs/upscaling-ml-spike.md](docs/upscaling-ml-spike.md) for AI upscaling).
+  results get a warning first. Shrinking stays the default. Classic scaling
+  adds pixels, not detail; for that there is AI upscaling.
+- **AI upscaling** (optional download): enlarge photos and drawings with
+  [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN), which adds detail
+  instead of just making them bigger. Pick "AI: photos" (or "most detail",
+  "drawings and anime", "anime, quick") as the scaler. It runs on the
+  graphics card through Vulkan (Metal via MoltenVK on Macs, macOS 12 or later)
+  and takes seconds to a minute per photo. Settings → AI upscaling downloads
+  our build of the upscaler from the release and the models straight from the
+  official Real-ESRGAN release, checking each against a SHA-256 built into the
+  app; "Install from file…" does the same offline. Nothing is sent. Without a
+  usable graphics card the option stays hidden and Lanczos does the job. Still
+  pictures only for now; AI-enlarged pictures leave out photo metadata. See
+  [docs/upscaling-ml-spike.md](docs/upscaling-ml-spike.md) for the background
+  and the models' license.
 - **H.265 / HEVC video:** write MP4, MOV and MKV files with H.265, 30–50%
   smaller than H.264 at the same look, with hardware playback on Apple devices,
   recent PCs, TVs and phones. Files are tagged `hvc1` so QuickTime, Safari and
@@ -167,6 +179,10 @@ mise run cli -- convert clip.mov --to mp4 --rotate 90 --mute --dry-run  # print 
 mise run cli -- convert clip.mov --to mp4 --bitrate 4M          # exact video bitrate, two passes
 mise run cli -- convert photo.jpg --to png --upscale 2x         # 640×480 → 1280×960, Lanczos
 mise run cli -- convert clip.mov --to mp4 --upscale 1080p --scaler spline  # 720p → 1080p
+mise run cli -- convert photo.jpg --to png --upscale 4x --ai    # AI upscaling (Real-ESRGAN)
+mise run cli -- convert art.png --to webp --upscale 2x --ai=anime  # models: general, photo, anime, anime-fast
+mise run cli -- upscaler install                     # what to download for --ai; then pass the files
+mise run cli -- upscaler check                       # can this graphics card run it?
 mise run cli -- convert clip.mov --to mp4 --out-dir ~/Movies --name "{name}_{height}p"  # elsewhere, renamed
 mise run cli -- animate cat*.jpg --to gif --frame 0.25 --direction boomerang  # pictures → animation
 ```
@@ -182,7 +198,10 @@ mise run cli -- animate cat*.jpg --to gif --frame 0.25 --direction boomerang  # 
   GitHub Release. The desktop bundles include ffmpeg and libjxl's tools, built
   by `.github/workflows/media-tools.yml`, and the release gets their complete
   source as `catconvert-<tag>-media-tools-source.tar.xz`. The CLI uses an
-  installed ffmpeg.
+  installed ffmpeg. The optional AI upscaler is built by
+  `.github/workflows/upscaler.yml` and attached as
+  `catconvert-upscaler-<target>.zip` with its source; the app and CLI of the
+  same release download it on request (see CONTRIBUTING.md).
 
 ```sh
 mise run release 0.2.0

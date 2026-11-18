@@ -3996,6 +3996,12 @@ button.format-chip:not(:disabled):active {
   color: var(--accent);
 }
 
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .defaults {
   display: flex;
   flex-direction: column;

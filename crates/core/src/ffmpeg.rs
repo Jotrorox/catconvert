@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -19,6 +19,7 @@ use crate::jxl::{self, JxlTools};
 use crate::media::{self, MediaInfo, MediaKind};
 use crate::sample::Pick;
 use crate::scrub;
+use crate::upscale::{self, AiModel, GpuCheck, Upscaler};
 use crate::{Error, Result};
 
 /// Environment variable pointing at an ffmpeg binary, checked before `PATH`.
@@ -50,6 +51,8 @@ pub struct Ffmpeg {
     decoded: Arc<Mutex<DecodeCache>>,
     /// Sound decoded to WAV for playback, when the webview can't play a file.
     listenable: Arc<Mutex<DecodeCache>>,
+    /// The AI upscaler, shared by every clone so installing it reaches them all.
+    upscaler: Arc<RwLock<Option<Arc<Upscaler>>>>,
 }
 
 /// One progress sample while a conversion runs.
@@ -180,7 +183,29 @@ impl Ffmpeg {
             decoded: Arc::new(Mutex::new(DecodeCache::new(4))),
             // WAV files are large; keep just the current file and the last one.
             listenable: Arc::new(Mutex::new(DecodeCache::new(2))),
+            upscaler: Arc::new(RwLock::new(
+                Upscaler::locate(upscale::default_dir().as_deref()).map(Arc::new),
+            )),
         })
+    }
+
+    /// The AI upscaler in use. [`Ffmpeg::locate`] looks for one installed in
+    /// [`crate::upscaler_dir`] (see [`Upscaler::locate`]).
+    #[must_use]
+    pub fn upscaler(&self) -> Option<Arc<Upscaler>> {
+        self.upscaler
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Use `upscaler` for AI upscaling from now on, in this and every clone,
+    /// e.g. after installing or removing it.
+    pub fn set_upscaler(&self, upscaler: Option<Upscaler>) {
+        *self
+            .upscaler
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = upscaler.map(Arc::new);
     }
 
     /// The libjxl tools found.
@@ -209,6 +234,7 @@ impl Ffmpeg {
             jxl: self.jxl_support(),
             tone_map: self.tone_map,
             hevc_hardware: self.encodes_hevc_in_hardware(),
+            ai: self.upscaler().map(|u| u.models()).unwrap_or_default(),
         }
     }
 
@@ -749,6 +775,12 @@ impl Ffmpeg {
                 }),
                 Tool::Scrub if cancel.load(Ordering::Relaxed) => Ok(false),
                 Tool::Scrub => scrub::run_step(&step.args).map(|()| true),
+                Tool::Upscale => self.run_upscaler(step, cancel, |f| {
+                    on_progress(RunProgress {
+                        fraction: Some(base + f * share),
+                        speed: None,
+                    });
+                }),
                 tool => self.run_tool(tool, step, cancel),
             };
             if !matches!(outcome, Ok(true)) {
@@ -785,6 +817,7 @@ impl Ffmpeg {
             Tool::Cjxl => self.jxl.cjxl.as_deref(),
             Tool::Djxl => self.jxl.djxl.as_deref(),
             Tool::Scrub => return Err(Error::unsupported("metadata cleaning runs in-process")),
+            Tool::Upscale => return Err(Error::unsupported(upscale::NOT_INSTALLED)),
         };
         path.ok_or_else(|| {
             Error::unsupported(format!("{} from libjxl is not installed", tool.name()))
@@ -884,6 +917,205 @@ impl Ffmpeg {
         check_status(tool, status, &stderr)?;
         Ok(true)
     }
+}
+
+impl Ffmpeg {
+    /// One AI upscaler step: its `NN.NN%` lines give the progress. Then the
+    /// result is checked for the all-black pictures some old graphics drivers
+    /// make. `Ok(false)` means it was cancelled.
+    fn run_upscaler(
+        &self,
+        step: &Step,
+        cancel: &AtomicBool,
+        mut on_progress: impl FnMut(f32),
+    ) -> Result<bool> {
+        let upscaler = self
+            .upscaler()
+            .ok_or_else(|| Error::unsupported(upscale::NOT_INSTALLED))?;
+        let mut cmd = upscaler_command(&upscaler);
+        cmd.args(&step.args);
+        let (status, log) = match run_watched(&mut cmd, cancel, None, &mut on_progress)? {
+            Some(done) => done,
+            None => return Ok(false),
+        };
+        let value = |flag: &str| {
+            step.args
+                .windows(2)
+                .find(|pair| pair[0] == flag)
+                .map(|pair| PathBuf::from(&pair[1]))
+        };
+        let written = value("-o").filter(|out| out.is_file());
+        let Some(written) = written.filter(|_| status.success()) else {
+            return Err(Error::Ffmpeg {
+                message: upscale::friendly_error(&log)
+                    .unwrap_or_else(|| format!("the AI upscaler stopped unexpectedly ({status})")),
+            });
+        };
+        let source_black = || value("-i").is_none_or(|input| self.is_black(&input).unwrap_or(true));
+        if self.is_black(&written)? && !source_black() {
+            return Err(Error::Ffmpeg {
+                message: upscale::BLACK_OUTPUT.to_owned(),
+            });
+        }
+        Ok(true)
+    }
+
+    /// Whether a picture is (nearly) all black, judged on a 16×16 grey copy.
+    fn is_black(&self, path: &Path) -> Result<bool> {
+        let gray = capture(
+            base_command(&self.ffmpeg)
+                .args(["-hide_banner", "-nostdin", "-v", "error", "-i"])
+                .arg(path)
+                .args(["-vf", "scale=16:16:flags=area,format=gray"])
+                .args(["-frames:v", "1", "-f", "rawvideo", "-"]),
+            &self.ffmpeg,
+        )?;
+        Ok(!gray.is_empty() && gray.iter().all(|&v| v <= 8))
+    }
+
+    /// Try the AI upscaler on a small picture, to tell whether this computer
+    /// has a graphics card it can use. Takes a second or two.
+    #[must_use]
+    pub fn check_upscaler(&self) -> GpuCheck {
+        let failed = |message: String| GpuCheck::Failed { message };
+        let Some(upscaler) = self.upscaler() else {
+            return failed(upscale::NOT_INSTALLED.to_owned());
+        };
+        // The quickest model there is.
+        let Some(model) = [
+            AiModel::AnimeFast,
+            AiModel::General,
+            AiModel::Anime,
+            AiModel::Photo,
+        ]
+        .into_iter()
+        .find(|&m| upscaler.models().contains(m)) else {
+            return failed(upscale::NOT_INSTALLED.to_owned());
+        };
+        let dir = match tempfile::Builder::new()
+            .prefix("catconvert-gpu-check-")
+            .tempdir()
+        {
+            Ok(dir) => dir,
+            Err(err) => return failed(err.to_string()),
+        };
+        let input = dir.path().join("in.png");
+        let output = dir.path().join("out.png");
+        if let Err(err) = std::fs::write(&input, upscale::PROBE_PNG) {
+            return failed(err.to_string());
+        }
+        let mut cmd = upscaler_command(&upscaler);
+        cmd.arg("-i")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .args(["-n", model.upstream_name(), "-s"])
+            .arg(upscale::MAX_AI_SCALE.to_string())
+            .args(["-f", "png"]);
+        let never = AtomicBool::new(false);
+        let (status, log) = match run_watched(
+            &mut cmd,
+            &never,
+            Some(Duration::from_secs(120)),
+            &mut |_| {},
+        ) {
+            Ok(Some(done)) => done,
+            Ok(None) => return failed("the AI upscaler didn't finish in time".to_owned()),
+            Err(err) => return failed(err.to_string()),
+        };
+        let gpu = upscale::gpu_names(&log).into_iter().next();
+        if !status.success() || !output.is_file() {
+            let message = upscale::friendly_error(&log)
+                .unwrap_or_else(|| format!("the AI upscaler stopped unexpectedly ({status})"));
+            return if gpu.is_none() || message == upscale::no_gpu_message() {
+                GpuCheck::NoGpu
+            } else {
+                failed(message)
+            };
+        }
+        match self.is_black(&output) {
+            Ok(true) => GpuCheck::BlackOutput { gpu },
+            Ok(false) => GpuCheck::Ready { gpu },
+            Err(err) => failed(err.to_string()),
+        }
+    }
+}
+
+/// The upscaler, pointed at its models. MoltenVK (on macOS) would otherwise
+/// log every device it sets up to stderr.
+fn upscaler_command(upscaler: &Upscaler) -> Command {
+    let mut cmd = base_command(upscaler.binary());
+    cmd.env("MVK_CONFIG_LOG_LEVEL", "1")
+        .arg("-m")
+        .arg(upscaler.models_dir());
+    cmd
+}
+
+/// Run `cmd`, passing the progress in its stderr's `NN.NN%` lines to
+/// `on_progress`, until it exits (its status and stderr), `cancel` is raised
+/// or `timeout` passes (`None`; it is killed then).
+fn run_watched(
+    cmd: &mut Command,
+    cancel: &AtomicBool,
+    timeout: Option<Duration>,
+    on_progress: &mut dyn FnMut(f32),
+) -> Result<Option<(ExitStatus, String)>> {
+    let program = PathBuf::from(cmd.get_program());
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| Error::Spawn {
+            program: program.clone(),
+            source,
+        })?;
+    let (lines, received) = std::sync::mpsc::channel::<String>();
+    let reader = child.stderr.take().map(|pipe| {
+        std::thread::spawn(move || {
+            let mut log = String::new();
+            let mut pipe = BufReader::new(pipe);
+            let mut line = Vec::new();
+            // Lines may end in \r on Windows; progress lines are short.
+            while pipe.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                let text = String::from_utf8_lossy(&line).into_owned();
+                log.push_str(&text);
+                let _ = lines.send(text);
+                line.clear();
+            }
+            log
+        })
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        let stop = cancel.load(Ordering::Relaxed)
+            || timeout.is_some_and(|limit| started.elapsed() > limit);
+        if stop {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        match received.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                if let Some(fraction) = upscale::parse_progress(&line) {
+                    on_progress(fraction);
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(source) => return Err(Error::Spawn { program, source }),
+        }
+    };
+    let log = reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    Ok(Some((status, log)))
 }
 
 /// Read a child's stderr on its own thread so a chatty program never blocks
