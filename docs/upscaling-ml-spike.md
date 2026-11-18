@@ -15,17 +15,88 @@ an **optional download**, not inside the installer.
    in our own CI next to the media tools, with an up-to-date ncnn (BSD-3-Clause).
    Run it as a new `Tool::Upscale` step, the same way `cjxl` runs. Models:
    `realesrgan-x4plus` (photos, 32 MB) and `realesrgan-x4plus-anime` (art,
-   8.5 MB). Both weights are BSD-3-Clause.
+   8.5 MB). The weights are most likely BSD-3-Clause; see
+   [Weights license](#weights-license).
 2. **Video second.** Use the fast `realesr-animevideov3` model (1.2 MB per
    scale) and the compact `realesr-general-x4v3` for real footage. Keep video
    frames off disk: a small helper of our own (ncnn, raw RGB frames on
    stdin/stdout) sits between two ffmpeg processes. Progress then comes from the
    encoding ffmpeg's `-progress` output, which the core already parses.
-3. **Optional download.** The pack is about 45 MB per platform zipped (binary
-   plus four models). Install it from _Settings → Upscaling_, with an
-   "install from file" path for offline machines. Verify it against a SHA-256
-   compiled into the app. This keeps the installers at their current size and
-   the default app fully offline.
+3. ### Weights license
+
+Checked against the primary sources in November 2026.
+
+**Findings**
+
+- **No explicit grant.** No file, README, model zoo page or release note says
+  what license the weights are under. The repo has one license file, BSD-3-Clause,
+  "Copyright (c) 2021, Xintao Wang", and every model is a release asset of that
+  repo. The ncnn `.param`/`.bin` conversions also ship inside the MIT-licensed
+  ncnn port's release zips.
+- **Timing:**
+  - The first commit (2021-07-19) had an MIT license. It was removed on
+    2021-07-22.
+  - `RealESRGAN_x4plus.pth` was published in v0.1.0 on 2021-07-22, with no
+    license in the repo.
+  - BSD-3-Clause was added on 2021-07-25. Someone asked for a license file
+    ([#4](https://github.com/xinntao/Real-ESRGAN/issues/4)) and xinntao
+    answered "I have added the BSD-3-Clause License".
+  - `x4plus_anime_6B` (2021-08) and `realesr-animevideov3` and
+    `realesr-general-x4v3` (2022-04) were all released while BSD-3 was in
+    place.
+- **The author's only statement is #4,** and it is about the repository as a
+  whole. Questions that ask specifically about the weights are still
+  unanswered. The project has been dormant since v0.3.0 (2022-09).
+  - [#677](https://github.com/xinntao/Real-ESRGAN/issues/677) has been open
+    since 2023-08, with follow-ups through 2026-11.
+  - [#1016](https://github.com/xinntao/Real-ESRGAN/issues/1016) and
+    [#1018](https://github.com/xinntao/Real-ESRGAN/issues/1018) are also
+    open.
+- **Minor inconsistency:** `setup.py` declares `license='BSD-3-Clause License'`
+  but carries the classifier `License :: OSI Approved :: Apache Software License`.
+- **"OpenMMLab AI Model License":** one issue
+  ([#1004](https://github.com/xinntao/Real-ESRGAN/issues/1004)) says the anime
+  video model is under it. No source backs that up: nothing in the repo or the
+  releases mentions it, and OpenModelDB lists the model as BSD-3-Clause. It
+  looks mistaken.
+- **Training data:** the models were trained on DF2K (DIV2K + Flickr2K) and
+  OST. DIV2K is "made available for academic research purpose only" and its
+  images belong to their owners. Whether dataset terms carry over to trained
+  weights is legally unsettled. The usual reading is that they don't, but it is
+  a residual risk that no license file can remove.
+- **Practice:** the weights are redistributed widely as BSD-3-Clause, with no
+  known objection from the author. Examples are OpenModelDB, AMD's Hugging Face
+  re-host, chaiNNer, Video2X and the official ncnn zips themselves.
+
+**Conclusion.** BSD-3-Clause is the only license the author ever attached to
+anything they published with these weights, so it is the most defensible
+reading. It is not certain. For an open-source, non-commercial, optional
+feature the risk is low.
+
+**How to keep the risk small**
+
+1. **Don't redistribute the weights.** Since an in-app download is fine, the
+   pack can hold only our build of the binary (MIT + BSD-3 code). The app then
+   fetches the model files straight from xinntao's official GitHub release
+   assets, checked against SHA-256 hashes compiled into the app. Only the
+   official ncnn zips hold `.param`/`.bin`, so either extract just `models/`
+   from the official `realesrgan-ncnn-vulkan-20220424-*.zip`, or convert the
+   `.pth` locally. That way CatConvert never hosts or ships the weights itself.
+2. **Attribute anyway.** List the weights in the third-party notices as
+   "Real-ESRGAN models © 2021 Xintao Wang, BSD-3-Clause (as published with
+   xinntao/Real-ESRGAN)", with the full BSD-3 text and the paper citation.
+3. **Pick the models with the cleanest history.** Prefer models released while
+   the BSD-3 file was in place (`realesr-general-x4v3`,
+   `realesr-animevideov3`, `x4plus_anime_6B`) over `x4plus`, which was
+   published three days before the file appeared. That difference is cosmetic,
+   since the author attached the license to the same repository right after.
+4. Optionally add our own comment to #677. It is unlikely to be answered.
+
+**Optional download.** The pack is about 45 MB per platform zipped (binary
+plus four models). Install it from _Settings → Upscaling_, with an
+"install from file" path for offline machines. Verify it against a SHA-256
+compiled into the app. This keeps the installers at their current size and
+the default app fully offline.
 
 **Rejected for now:** ffmpeg's `dnn_processing`/`sr` filters (heavy runtimes, no
 GPU on macOS, no tiling, dated models). waifu2x and Real-CUGAN (anime only,
@@ -82,12 +153,11 @@ hardware or the image size.
 - **Licenses:** The PyTorch repo `xinntao/Real-ESRGAN` is BSD-3-Clause. The ncnn
   port `xinntao/Real-ESRGAN-ncnn-vulkan` is **MIT**, not BSD-3, and its LICENSE
   also carries realsr-ncnn-vulkan's MIT text. ncnn is BSD-3-Clause with zlib and
-  other permissive third-party parts. The weights are GitHub release assets of
-  the BSD-3 repo with no separate license. The community (OpenModelDB, Hugging
-  Face mirrors) treats them as BSD-3-Clause, so the attribution goes into
-  `THIRD-PARTY-LICENSES.txt`. All of this is compatible with CatConvert's
-  BSD-3-Clause and with the GPL ffmpeg sidecar, since each tool runs as a
-  separate process.
+  other permissive third-party parts. All of this is compatible with
+  CatConvert's BSD-3-Clause and with the GPL ffmpeg sidecar, since each tool
+  runs as a separate process. For the weights, see
+  [Weights license](#weights-license) below: most likely BSD-3-Clause, but
+  nothing from the author says so explicitly.
 - **Models:** `realesrgan-x4plus` is the general photo model, 4× only. Its
   docs warn that `-s 2` with x4 weights gives poor results, so we upscale 4×
   and then Lanczos down to the target. `realesrgan-x4plus-anime` is for art and
@@ -286,9 +356,8 @@ memory. Cap at, say, 8K on the long side and warn above it (ties in with step
 
 ## Open questions
 
-1. **Network.** Is an in-app download acceptable under "Nothing leaves your
-   device" (it sends nothing, but it fetches), or should v1 offer only a
-   download link plus "Install from file…"?
+1. ~~**Network.**~~ Decided: an in-app download is fine (it sends nothing; it
+   only fetches). Keep "Install from file…" for offline machines.
 2. **Model set.** Do we ship x4plus, x4plus-anime, animevideov3 and
    general-x4v3 (~45 MB), or start with x4plus plus general-x4v3 only (~35 MB)?
 3. **Video.** Should video ML upscaling be in v1 at all? If yes, accept the
@@ -300,8 +369,9 @@ memory. Cap at, say, 8K on the long side and warn above it (ties in with step
    on first use.
 6. **Measure.** Real numbers on an M-series Mac, an RTX 3060-class PC and an
    Intel iGPU laptop under Linux decide the UI copy and the default tile size.
-7. **Licensing.** Is the BSD-3 attribution for weights without a separate
-   license enough? Ask xinntao in an issue if we want certainty.
+7. ~~**Licensing.**~~ Researched: most likely BSD-3-Clause, with no explicit
+   grant. See [Weights license](#weights-license): fetch the models from the
+   official releases rather than redistributing them, and attribute anyway.
 
 ## Sources
 
@@ -324,6 +394,17 @@ memory. Cap at, say, 8K on the long side and warn above it (ties in with step
 - upscayl-ncnn (AGPL-3.0): https://github.com/upscayl/upscayl-ncnn,
   upscayl (AGPL-3.0): https://github.com/upscayl/upscayl,
   4x-UltraSharp (CC BY-NC-SA 4.0): https://openmodeldb.info/models/4x-UltraSharp
+- Weights license history: https://github.com/xinntao/Real-ESRGAN/commits/master/LICENSE,
+  https://github.com/xinntao/Real-ESRGAN/issues/4,
+  https://github.com/xinntao/Real-ESRGAN/issues/677,
+  https://github.com/xinntao/Real-ESRGAN/issues/1004,
+  https://github.com/xinntao/Real-ESRGAN/issues/1016,
+  https://github.com/xinntao/Real-ESRGAN/issues/1018,
+  https://github.com/xinntao/Real-ESRGAN/blob/master/setup.py,
+  https://github.com/xinntao/Real-ESRGAN/releases,
+  DIV2K terms: https://data.vision.ee.ethz.ch/cvl/DIV2K/,
+  https://openmodeldb.info/models/4x-realesr-animevideo-v3,
+  https://huggingface.co/amd/realesrgan-x4plus
 - Weights treated as BSD-3: https://openmodeldb.info/models/2x-realesrgan-x2plus,
   https://huggingface.co/wkrettek/real-esrgan-models
 - Video2X (AGPL-3.0): https://github.com/k4yt3x/video2x
