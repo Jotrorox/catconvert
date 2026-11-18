@@ -3043,6 +3043,18 @@ button.format-chip:not(:disabled):active {
   font-variant-numeric: tabular-nums;
 }
 
+/* Upscaling */
+
+.upscale-settings {
+  display: grid;
+  gap: 10px;
+  margin-top: -10px;
+}
+
+.upscale-settings .bitrate-row {
+  margin: 0 0 4px;
+}
+
 /* Playback (animations) */
 
 .playback .format-group {

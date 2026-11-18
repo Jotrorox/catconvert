@@ -11,11 +11,13 @@ import type {
   MediaKind,
   MetadataMode,
   OutputFormat,
+  Scaler,
   SequenceOptions,
+  Upscale,
   VideoCodec,
 } from "./api";
 import type { CompareLayout } from "./compare";
-import { aspectText, cropBox, cropForOtherFile, pictureSize, turnedSize } from "./crop";
+import { aspectText, cropBox, cropForOtherFile, pictureSize, type Size, turnedSize } from "./crop";
 import { formatBitrate } from "./format";
 
 export type Tone = "pink" | "green" | "yellow" | "lavender";
@@ -239,6 +241,7 @@ export function isUntouched(info: MediaInfo, options: ConvertOptions): boolean {
     options.rotate === 0 &&
     !options.flip &&
     !hasCrop(info, options) &&
+    !enlarges(info, options) &&
     (options.maxSize === null || !sizeChoices(info, options).includes(options.maxSize)) &&
     (options.fps === null || !fpsChoices(info).includes(options.fps))
   );
@@ -288,6 +291,8 @@ export function defaultOptions(format: OutputFormat): ConvertOptions {
     trimStart: null,
     trimEnd: null,
     maxSize: null,
+    upscale: null,
+    scaler: "auto",
     fps: null,
     rotate: 0,
     flip: false,
@@ -484,6 +489,228 @@ export function sizeLabel(size: number, kind: MediaKind): string {
   return size === 2160 ? "4K" : `${size}p`;
 }
 
+// ---------------------------------------------------------------------------
+// Upscaling
+// ---------------------------------------------------------------------------
+
+/** Factor presets for upscaling. */
+export const UPSCALE_FACTORS = [2, 3, 4] as const;
+
+/** Short sides to upscale to: 720p, 1080p, 1440p and 4K. */
+export const UPSCALE_SIZES = [720, 1080, 1440, 2160] as const;
+
+/** Bounds of a custom factor and target, as the core checks them. */
+export const MAX_UPSCALE_FACTOR = 8;
+export const MAX_UPSCALE_SIZE = 16384;
+
+export const SCALERS: readonly { scaler: Scaler; label: string }[] = [
+  // Lanczos is what "auto" picks for any enlargement, so it stands for both.
+  { scaler: "auto", label: "Lanczos (sharp)" },
+  { scaler: "spline", label: "Spline" },
+  { scaler: "bicubic", label: "Bicubic (softer)" },
+];
+
+/**
+ * Longest side the core writes in `format`: video encoders stop at 8192,
+ * WebP at 16383, everything else at 16384. Bigger results are refused.
+ */
+export function maxLongSide(format: OutputFormat): number {
+  if (videoCodecs(format).length > 0) return 8192;
+  return format === "webp" ? 16383 : 16384;
+}
+
+/**
+ * Area above which a result counts as huge and is worth a warning: 50
+ * megapixels for a still, 4K for a video file, 1080p for an animation frame.
+ */
+export function hugePixels(format: OutputFormat, animated: boolean): number {
+  if (videoCodecs(format).length > 0) return 3840 * 2160;
+  return animated ? 1920 * 1080 : 50_000_000;
+}
+
+/** The short side `upscale` enlarges `short` to, or `null` when it doesn't enlarge it. */
+export function upscaleTarget(short: number, upscale: Upscale | null | undefined): number | null {
+  if (!upscale) return null;
+  const target = "factor" in upscale ? Math.round(short * upscale.factor) : upscale.size;
+  return target > short ? target : null;
+}
+
+/**
+ * `size` after the upscale, then the cap on the short side (shrink only).
+ * Video and animations keep even sides. Mirrors `output_dims` in convert.rs.
+ */
+export function scaledSize(
+  size: Size,
+  upscale: Upscale | null | undefined,
+  cap: number | null,
+  even: boolean,
+): Size {
+  const short = Math.min(size.width, size.height);
+  const long = Math.max(size.width, size.height);
+  const evened = (n: number) => (even ? Math.max(2, n & ~1) : n);
+  let target = short;
+  const up = upscaleTarget(short, upscale);
+  if (up !== null) target = evened(up);
+  if (cap !== null) target = Math.min(target, Math.max(2, cap) & ~1);
+  if (target === short) {
+    return even ? { width: evened(size.width), height: evened(size.height) } : size;
+  }
+  const scaledLong = Math.round((long * target) / short);
+  const [width, height] = size.width >= size.height ? [scaledLong, target] : [target, scaledLong];
+  return { width: evened(width), height: evened(height) };
+}
+
+/**
+ * The size of what gets written, after the turn, crop, upscale and size cap.
+ * An animation's default cap only applies when the picture isn't enlarged.
+ */
+export function outputSize(
+  info: MediaInfo,
+  options: Pick<ConvertOptions, "format" | "rotate" | "crop" | "maxSize" | "upscale">,
+): Size | null {
+  const size = pictureSize(info, options);
+  if (!size) return null;
+  const auto = enlarges(info, options)
+    ? null
+    : (autoLimits(options.format, info.kind)?.size ?? null);
+  const even = formatKind(options.format, info.kind) === "video";
+  return scaledSize(size, options.upscale, options.maxSize ?? auto, even);
+}
+
+/** Whether the options make the picture bigger than it is. */
+export function enlarges(
+  info: MediaInfo,
+  options: Pick<ConvertOptions, "rotate" | "crop" | "upscale">,
+): boolean {
+  const short = shortSide(info, options);
+  return short !== null && upscaleTarget(short, options.upscale) !== null;
+}
+
+/** Whether the result stays within what the core can write. Unknown sizes pass. */
+export function fitsLimits(
+  info: MediaInfo,
+  options: Pick<ConvertOptions, "format" | "rotate" | "crop" | "maxSize" | "upscale">,
+): boolean {
+  const size = outputSize(info, options);
+  return size === null || Math.max(size.width, size.height) <= maxLongSide(options.format);
+}
+
+/** Whether an enlarged result is big enough to warn about. */
+export function isHuge(info: MediaInfo, options: ConvertOptions): boolean {
+  if (!enlarges(info, options)) return false;
+  const size = outputSize(info, options);
+  const huge = hugePixels(options.format, isAnimatedImage(options.format, info.kind));
+  return size !== null && size.width * size.height > huge;
+}
+
+/** Whether two upscale settings ask for the same thing. */
+export function sameUpscale(a: Upscale | null | undefined, b: Upscale | null | undefined): boolean {
+  if (!a || !b) return !a && !b;
+  if ("factor" in a) return "factor" in b && a.factor === b.factor;
+  return "size" in b && a.size === b.size;
+}
+
+/** "2×", or the target like a size choice: "1080p", "1080 px". */
+export function upscaleLabel(upscale: Upscale, kind: MediaKind): string {
+  return "factor" in upscale ? `${upscale.factor}×` : sizeLabel(upscale.size, kind);
+}
+
+/** What an upscale makes of a picture, and how big the format lets it get. */
+type UpscaleBounds = {
+  /** Short side before upscaling, if known. */
+  short: number | null;
+  /** The size written with `upscale` and no size cap. */
+  resultFor: (upscale: Upscale) => Size | null;
+  limit: number;
+};
+
+const fits = (bounds: UpscaleBounds, upscale: Upscale) => {
+  const size = bounds.resultFor(upscale);
+  return size === null || Math.max(size.width, size.height) <= bounds.limit;
+};
+
+/** Presets that enlarge the picture and fit the format: 2×, 3×, 4×, then bigger targets. */
+function presetsWithin(bounds: UpscaleBounds): Upscale[] {
+  const choices: Upscale[] = [
+    ...UPSCALE_FACTORS.map((factor) => ({ factor })),
+    ...UPSCALE_SIZES.map((size) => ({ size })),
+  ];
+  const { short } = bounds;
+  if (short === null) return [];
+  return choices.filter((u) => upscaleTarget(short, u) !== null && fits(bounds, u));
+}
+
+/** The biggest short side a custom upscale can reach, or `null` when the size is unknown. */
+function biggestWithin(bounds: UpscaleBounds): number | null {
+  const size = bounds.resultFor({ factor: 1 });
+  if (!size || bounds.short === null) return null;
+  const long = Math.max(size.width, size.height);
+  let best = Math.min(MAX_UPSCALE_SIZE, Math.floor((bounds.limit * bounds.short) / long));
+  // Rounding can push the long side one over; step back until it fits.
+  while (best > bounds.short && !fits(bounds, { size: best })) best--;
+  return best;
+}
+
+function fileBounds(info: MediaInfo, options: ConvertOptions): UpscaleBounds {
+  return {
+    short: shortSide(info, options),
+    resultFor: (upscale) => outputSize(info, { ...options, upscale, maxSize: null }),
+    limit: maxLongSide(options.format),
+  };
+}
+
+function sequenceBounds(first: MediaInfo, options: ConvertOptions): UpscaleBounds {
+  return {
+    short: shortSide(first),
+    resultFor: (upscale) => sequenceFrame(first, { ...options, upscale, maxSize: null }),
+    limit: maxLongSide(options.format),
+  };
+}
+
+/**
+ * The upscale presets that enlarge this file without going past what the
+ * core can write: 2×, 3×, 4×, then the targets above its short side.
+ */
+export const upscaleChoices = (info: MediaInfo, options: ConvertOptions) =>
+  presetsWithin(fileBounds(info, options));
+
+/** The biggest short side a custom upscale can reach on this file. */
+export const maxUpscaleSize = (info: MediaInfo, options: ConvertOptions) =>
+  biggestWithin(fileBounds(info, options));
+
+/** {@link upscaleChoices} for an animation made from pictures, `first` setting the frame. */
+export const sequenceUpscaleChoices = (first: MediaInfo, options: ConvertOptions) =>
+  presetsWithin(sequenceBounds(first, options));
+
+/** {@link maxUpscaleSize} for an animation made from pictures. */
+export const maxSequenceUpscale = (first: MediaInfo, options: ConvertOptions) =>
+  biggestWithin(sequenceBounds(first, options));
+
+/** Whether an animation's frame stays within what the core can write. */
+export function sequenceFits(first: MediaInfo, options: ConvertOptions): boolean {
+  const frame = sequenceFrame(first, options);
+  return frame === null || Math.max(frame.width, frame.height) <= maxLongSide(options.format);
+}
+
+/**
+ * A stored upscale setting if it looks right, otherwise `null`. Settings
+ * saved before upscaling existed have none.
+ */
+export function upscaleFrom(stored: unknown): Upscale | null {
+  if (!stored || typeof stored !== "object") return null;
+  const { factor, size } = stored as { factor?: unknown; size?: unknown };
+  if (typeof factor === "number" && factor >= 1 && factor <= MAX_UPSCALE_FACTOR) return { factor };
+  if (typeof size === "number" && Number.isInteger(size) && size >= 2 && size <= MAX_UPSCALE_SIZE) {
+    return { size };
+  }
+  return null;
+}
+
+/** A stored scaler if it is one, otherwise `"auto"`. */
+export function scalerFrom(stored: unknown): Scaler {
+  return stored === "lanczos" || stored === "spline" || stored === "bicubic" ? stored : "auto";
+}
+
 const FRAME_RATES = [60, 30, 24, 15, 10] as const;
 
 /** Frame-rate choices lower than the source. */
@@ -578,6 +805,13 @@ export function fitOptions(
     fitted.maxSize = null;
   }
   if (fitted.fps !== null && !fpsChoices(info).includes(fitted.fps)) fitted.fps = null;
+  // An upscale applies to any file (a target it already reaches does
+  // nothing), unless it would be too big to write. One that does nothing
+  // would still lift an animation's default size cap, so it goes too.
+  const upscale = upscaleFrom(fitted.upscale);
+  const lifts = !enlarges(info, { ...fitted, upscale }) && autoLimits(fitted.format, info.kind);
+  fitted.upscale = upscale && !lifts && fitsLimits(info, { ...fitted, upscale }) ? upscale : null;
+  fitted.scaler = scalerFrom(fitted.scaler);
   return fitted;
 }
 
@@ -627,6 +861,13 @@ export function recipeDetail(info: MediaInfo, options: ConvertOptions): string {
   const parts: string[] = [];
   if (out !== "audio" && options.crop?.aspect)
     parts.push(`${aspectText(options.crop.aspect)} crop`);
+  if (out !== "audio" && options.upscale) {
+    parts.push(
+      "factor" in options.upscale
+        ? `${options.upscale.factor}× upscale`
+        : `upscaled to ${sizeLabel(options.upscale.size, out)}`,
+    );
+  }
   if (out !== "audio" && options.maxSize !== null) parts.push(sizeLabel(options.maxSize, out));
   if (out === "video" && options.fps !== null) parts.push(`${options.fps} fps`);
   if (isAnimatedImage(options.format, info.kind)) {
@@ -731,22 +972,22 @@ export function sequenceAutoSize(format: OutputFormat): number | null {
   return null;
 }
 
-/** The animation's frame: the first picture's size, capped, with even sides. */
+/**
+ * The animation's frame: the first picture's size, upscaled and capped, with
+ * even sides. The default cap only applies when nothing asks to upscale.
+ */
 export function sequenceFrame(
   first: MediaInfo,
   options: ConvertOptions,
 ): { width: number; height: number } | null {
   if (!first.width || !first.height) return null;
-  const [w, h] = [first.width, first.height];
-  const cap = options.maxSize ?? sequenceAutoSize(options.format);
-  const target = cap === null ? null : Math.max(2, cap) & ~1;
-  let [width, height] = [w, h];
-  if (target !== null && target < Math.min(w, h)) {
-    const long = Math.round((Math.max(w, h) * target) / Math.min(w, h));
-    [width, height] = w >= h ? [long, target] : [target, long];
-  }
-  const even = (n: number) => Math.max(2, n & ~1);
-  [width, height] = [even(width), even(height)];
+  const cap = options.maxSize ?? (options.upscale ? null : sequenceAutoSize(options.format));
+  const { width, height } = scaledSize(
+    { width: first.width, height: first.height },
+    options.upscale,
+    cap,
+    true,
+  );
   return options.rotate % 180 === 90 ? { width: height, height: width } : { width, height };
 }
 

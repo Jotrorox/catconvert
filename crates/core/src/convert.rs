@@ -316,6 +316,94 @@ struct CropBox {
     y: u32,
 }
 
+/// How much to enlarge a picture past its own size (see
+/// [`ConvertOptions::upscale`]). Never shrinks: a target the picture already
+/// reaches leaves it as it is.
+///
+/// In JSON: `{"factor": 2}` or `{"size": 1080}`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Upscale {
+    /// Multiply both sides, e.g. `2.0` for 2×. From 1 to [`MAX_UPSCALE_FACTOR`].
+    Factor(f64),
+    /// Enlarge so the short side is this many pixels, e.g. `1080` for 1080p.
+    /// From 2 to [`MAX_SIDE`].
+    Size(u32),
+}
+
+/// Largest [`Upscale::Factor`].
+pub const MAX_UPSCALE_FACTOR: f64 = 8.0;
+/// Longest side CatConvert writes. WebP stops one pixel short of it, and
+/// video files at [`MAX_VIDEO_SIDE`].
+pub const MAX_SIDE: u32 = 16_384;
+/// Longest side of MP4, MOV, MKV and WebM video: 8K, past which encoders get
+/// picky and players give up.
+pub const MAX_VIDEO_SIDE: u32 = 8192;
+/// Longest side of WebP, set by the format.
+const MAX_WEBP_SIDE: u32 = 16_383;
+
+impl Upscale {
+    /// The short side asked for when the picture's short side is `short`.
+    #[must_use]
+    pub fn target(self, short: u32) -> u32 {
+        match self {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            Self::Factor(factor) => {
+                (f64::from(short) * factor).round().min(f64::from(u32::MAX)) as u32
+            }
+            Self::Size(size) => size,
+        }
+    }
+
+    pub(crate) fn validate(self) -> Result<()> {
+        match self {
+            Self::Factor(f) if !(f.is_finite() && (1.0..=MAX_UPSCALE_FACTOR).contains(&f)) => {
+                Err(Error::unsupported(format!(
+                    "the upscale factor must be between 1× and {MAX_UPSCALE_FACTOR}×"
+                )))
+            }
+            Self::Size(s) if !(2..=MAX_SIDE).contains(&s) => Err(Error::unsupported(format!(
+                "the upscale size must be between 2 and {MAX_SIDE} pixels"
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The filter that resizes the picture (ffmpeg's `scale` flags).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scaler {
+    /// Lanczos for pictures, GIFs and anything enlarged; ffmpeg's usual
+    /// bicubic for shrinking video.
+    #[default]
+    Auto,
+    /// Sharp, with the least blur. A slight halo along hard edges.
+    Lanczos,
+    /// Natural spline: nearly as sharp as Lanczos, with softer halos.
+    Spline,
+    /// Smooth and soft.
+    Bicubic,
+}
+
+impl Scaler {
+    /// The `flags` to give `scale`, or `None` for ffmpeg's default.
+    fn flags(self, lanczos: bool) -> Option<&'static str> {
+        match self {
+            Self::Auto if lanczos => Some("lanczos"),
+            Self::Auto => None,
+            Self::Lanczos => Some("lanczos"),
+            Self::Spline => Some("spline"),
+            Self::Bicubic => Some("bicubic"),
+        }
+    }
+
+    /// The `flags` for a scale that the default would do with Lanczos.
+    pub(crate) fn sharp_flags(self) -> &'static str {
+        self.flags(true).unwrap_or("lanczos")
+    }
+}
+
 /// The edits and encoding choices for one conversion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -326,8 +414,14 @@ pub struct ConvertOptions {
     /// End of the kept range in seconds (video and audio).
     pub trim_end: Option<f64>,
     /// Shrink so the short side is at most this many pixels, e.g. `720` for
-    /// 720p. Never upscales.
+    /// 720p. Never enlarges; see `upscale` for that.
     pub max_size: Option<u32>,
+    /// Enlarge the picture past its own size. Applied before `max_size`,
+    /// which still caps the result; animations skip their usual size cap
+    /// when this enlarges them. `None` (the default) never enlarges.
+    pub upscale: Option<Upscale>,
+    /// Filter that resizes the picture, when it is resized at all.
+    pub scaler: Scaler,
     /// Output frame rate (video and GIF). Never raises the source rate.
     pub fps: Option<f64>,
     /// Clockwise rotation in degrees: 0, 90, 180 or 270.
@@ -396,6 +490,8 @@ impl Default for ConvertOptions {
             trim_start: None,
             trim_end: None,
             max_size: None,
+            upscale: None,
+            scaler: Scaler::Auto,
             fps: None,
             rotate: 0,
             flip: false,
@@ -653,6 +749,17 @@ pub fn plan(
     if let Some(crop) = &options.crop {
         validate_crop(crop)?;
     }
+    if let Some(upscale) = options.upscale {
+        upscale.validate()?;
+    }
+    if format.kind() != MediaKind::Audio {
+        let video = is_video_file(input, options);
+        if let Some(dims) =
+            cropped_dims(input, options).and_then(|dims| enlarged_dims(dims, options, video))
+        {
+            check_side(dims, options, video)?;
+        }
+    }
     if output == input.path {
         return Err(Error::unsupported(
             "the output would overwrite the original",
@@ -820,6 +927,7 @@ pub fn plan(
                 trim_start: None,
                 trim_end: None,
                 max_size: None,
+                upscale: None,
                 fps: None,
                 rotate: 0,
                 flip: false,
@@ -1883,20 +1991,18 @@ fn animation_bytes(
     Some(f64::from(w) * f64::from(h) * 4.0 * fps * length.max(0.0))
 }
 
-/// Picture size after rotation, cropping and downscaling, if the source size
-/// is known.
+/// Picture size after rotation, cropping, enlarging and downscaling, if the
+/// source size is known.
 fn output_dims(
     input: &MediaInfo,
     options: &ConvertOptions,
     default_max: Option<u32>,
 ) -> Option<(u32, u32)> {
-    let (w, h) = turned_dims(input, options)?;
-    let (w, h) = options
-        .crop
-        .and_then(|crop| crop_box(w, h, &crop, false))
-        .map_or((w, h), |b| (b.width, b.height));
-    let target = options.max_size.or(default_max).map(|t| t.max(2) & !1);
-    Some(match target {
+    let (w, h) = cropped_dims(input, options)?;
+    if let Some(dims) = enlarged_dims((w, h), options, is_video_file(input, options)) {
+        return Some(dims);
+    }
+    Some(match size_cap(options, default_max) {
         Some(t) if t < w.min(h) => {
             let scale = f64::from(t) / f64::from(w.min(h));
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1905,6 +2011,134 @@ fn output_dims(
         }
         _ => (w, h),
     })
+}
+
+/// Picture size after rotation and cropping, if the source size is known.
+fn cropped_dims(input: &MediaInfo, options: &ConvertOptions) -> Option<(u32, u32)> {
+    let (w, h) = turned_dims(input, options)?;
+    Some(
+        options
+            .crop
+            .and_then(|crop| crop_box(w, h, &crop, false))
+            .map_or((w, h), |b| (b.width, b.height)),
+    )
+}
+
+/// Whether the output is an MP4, MOV, MKV or WebM video, which needs even
+/// sides, rather than a picture or an animation.
+fn is_video_file(input: &MediaInfo, options: &ConvertOptions) -> bool {
+    input.kind == MediaKind::Video && options.codec().is_some()
+}
+
+/// The cap on the short side when the picture isn't enlarged: the chosen one
+/// or `default_max`. Even, and at least 2.
+fn size_cap(options: &ConvertOptions, default_max: Option<u32>) -> Option<u32> {
+    options.max_size.or(default_max).map(|t| t.max(2) & !1)
+}
+
+/// The size [`ConvertOptions::upscale`] enlarges a `w`×`h` picture to, after
+/// the chosen size cap, or `None` if it doesn't get bigger. An animation's
+/// default cap doesn't apply to an enlarged picture. `even` evens both sides,
+/// which yuv420p encoders need.
+pub(crate) fn enlarged_dims(
+    (w, h): (u32, u32),
+    options: &ConvertOptions,
+    even: bool,
+) -> Option<(u32, u32)> {
+    let short = w.min(h);
+    if short == 0 {
+        return None;
+    }
+    let mut target = options.upscale?.target(short);
+    if let Some(cap) = size_cap(options, None) {
+        target = target.min(cap);
+    }
+    if even {
+        target = (target & !1).max(2);
+    }
+    if target <= short {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let mut long = (f64::from(w.max(h)) * f64::from(target) / f64::from(short))
+        .round()
+        .min(f64::from(u32::MAX)) as u32;
+    if even {
+        long = (long & !1).max(2);
+    }
+    Some(if w >= h {
+        (long, target)
+    } else {
+        (target, long)
+    })
+}
+
+/// Longest side the output format takes.
+pub(crate) fn max_side(options: &ConvertOptions, video: bool) -> u32 {
+    if video {
+        MAX_VIDEO_SIDE
+    } else if options.format == OutputFormat::Webp {
+        MAX_WEBP_SIDE
+    } else {
+        MAX_SIDE
+    }
+}
+
+/// Fails if upscaling makes the picture bigger than the format takes.
+pub(crate) fn check_side((w, h): (u32, u32), options: &ConvertOptions, video: bool) -> Result<()> {
+    let limit = max_side(options, video);
+    if w.max(h) > limit {
+        return Err(Error::unsupported(format!(
+            "upscaled, this would be {w}×{h}, but {} files can be at most {limit} pixels \
+             on a side: pick a smaller upscale",
+            options.format.extension().to_uppercase()
+        )));
+    }
+    Ok(())
+}
+
+/// Area above which an enlarged still picture counts as huge: 50 megapixels.
+const HUGE_PICTURE: u64 = 50_000_000;
+/// Area above which an enlarged video counts as huge: 4K UHD.
+const HUGE_VIDEO: u64 = 3840 * 2160;
+/// Area above which enlarged animation frames count as huge: 1080p.
+const HUGE_ANIMATION: u64 = 1920 * 1080;
+
+/// A warning for an upscale that makes the result huge: slow to make, and a
+/// big file. `None` when the options don't enlarge, or not by that much.
+///
+/// The thresholds are 50 megapixels for still pictures, 4K UHD for video
+/// files and 1080p for GIFs and other animations.
+#[must_use]
+pub fn upscale_warning(input: &MediaInfo, options: &ConvertOptions) -> Option<String> {
+    if options.format.kind() == MediaKind::Audio {
+        return None;
+    }
+    let video = is_video_file(input, options);
+    let (w, h) = enlarged_dims(cropped_dims(input, options)?, options, video)?;
+    huge_warning((w, h), options.format.animates(input.kind), video)
+}
+
+/// The warning for a `w`×`h` result that has been enlarged.
+pub(crate) fn huge_warning((w, h): (u32, u32), animated: bool, video: bool) -> Option<String> {
+    let area = u64::from(w) * u64::from(h);
+    if video {
+        (area > HUGE_VIDEO).then(|| {
+            format!("upscaled to {w}×{h}, past 4K: encoding will be slow and the file big")
+        })
+    } else if animated {
+        (area > HUGE_ANIMATION).then(|| {
+            format!("upscaled to {w}×{h}, past 1080p: the animation will be slow to make and heavy")
+        })
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let megapixels = area as f64 / 1e6;
+        (area > HUGE_PICTURE).then(|| {
+            format!(
+                "upscaled to {w}×{h} ({megapixels:.0} megapixels): a big file that some apps are slow to open"
+            )
+        })
+    }
 }
 
 /// A hidden intermediate next to `output`, e.g. `.cat.jxl.frames.png`.
@@ -2173,7 +2407,7 @@ fn fps_filter(target: Option<f64>, source: Option<f64>) -> Option<String> {
         .map(|fps| format!("fps={}", format_secs(fps)))
 }
 
-/// Rotate, flip, crop and downscale filters, in that order.
+/// Rotate, flip, crop and resize filters, in that order.
 fn picture_filters(
     input: &MediaInfo,
     options: &ConvertOptions,
@@ -2195,29 +2429,69 @@ fn picture_filters(
             None => filters.extend(crop_expression(crop)),
         }
     }
-    let target = options.max_size.or(default_max).map(|t| t.max(2) & !1);
-    let scale = match (target, dims) {
-        (Some(t), Some((w, h))) if t < w.min(h) => Some(if w >= h {
-            format!("scale=-2:{t}")
-        } else {
-            format!("scale={t}:-2")
-        }),
-        (Some(_), Some(_)) => None,
-        (Some(t), None) => Some(format!(
-            "scale='if(gte(iw,ih),-2,min(iw,{t}))':'if(gte(iw,ih),min(ih,{t}),-2)'"
-        )),
-        (None, _) => None,
-    };
     let lanczos = options.format.kind() == MediaKind::Image || options.format == OutputFormat::Gif;
-    match scale {
-        Some(scale) if lanczos => filters.push(format!("{scale}:flags=lanczos")),
-        Some(scale) => filters.push(scale),
-        None if even && dims.is_none_or(|(w, h)| w % 2 == 1 || h % 2 == 1) => {
+    let (scale, flags) = match dims {
+        Some(wh) => match enlarged_dims(wh, options, even) {
+            Some((w, h)) => (Some(format!("scale={w}:{h}")), options.scaler.flags(true)),
+            None => (
+                shrink_filter(size_cap(options, default_max), wh),
+                options.scaler.flags(lanczos),
+            ),
+        },
+        None => match options.upscale {
+            Some(upscale) => (
+                Some(upscale_expression(upscale, options.max_size, even)),
+                options.scaler.flags(true),
+            ),
+            None => (
+                size_cap(options, default_max).map(|t| {
+                    format!("scale='if(gte(iw,ih),-2,min(iw,{t}))':'if(gte(iw,ih),min(ih,{t}),-2)'")
+                }),
+                options.scaler.flags(lanczos),
+            ),
+        },
+    };
+    match (scale, flags) {
+        (Some(scale), Some(flags)) => filters.push(format!("{scale}:flags={flags}")),
+        (Some(scale), None) => filters.push(scale),
+        (None, _) if even && dims.is_none_or(|(w, h)| w % 2 == 1 || h % 2 == 1) => {
             filters.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".to_owned());
         }
-        None => {}
+        (None, _) => {}
     }
     filters
+}
+
+/// The `scale` filter that shrinks a `w`×`h` picture to the short side
+/// `cap`, or `None` if it is no bigger than that.
+fn shrink_filter(cap: Option<u32>, (w, h): (u32, u32)) -> Option<String> {
+    let t = cap.filter(|&t| t < w.min(h))?;
+    Some(if w >= h {
+        format!("scale=-2:{t}")
+    } else {
+        format!("scale={t}:-2")
+    })
+}
+
+/// The `scale` filter for an upscale of a picture of unknown size. A size
+/// target is capped by `max_size`; a factor isn't, as its result can't be
+/// known here.
+fn upscale_expression(upscale: Upscale, max_size: Option<u32>, even: bool) -> String {
+    match upscale {
+        Upscale::Factor(factor) => {
+            let f = format_secs(factor);
+            if even {
+                format!("scale='trunc(iw*{f}/2)*2':'trunc(ih*{f}/2)*2'")
+            } else {
+                format!("scale='round(iw*{f})':'round(ih*{f})'")
+            }
+        }
+        Upscale::Size(size) => {
+            let t = max_size.map_or(size, |cap| size.min(cap.max(2) & !1));
+            let t = if even { (t & !1).max(2) } else { t };
+            format!("scale='if(gte(iw,ih),-2,max(iw,{t}))':'if(gte(iw,ih),max(ih,{t}),-2)'")
+        }
+    }
 }
 
 /// The user's quarter turns and mirroring, in that order.
@@ -4628,5 +4902,250 @@ mod tests {
         let options: ConvertOptions =
             serde_json::from_value(serde_json::json!({"videoBitrate": 4000})).expect("options");
         assert_eq!(options.video_bitrate, Some(4000));
+    }
+
+    fn upscaled(format: OutputFormat, upscale: Upscale) -> ConvertOptions {
+        ConvertOptions {
+            format,
+            upscale: Some(upscale),
+            ..ConvertOptions::default()
+        }
+    }
+
+    #[test]
+    fn photo_doubles_with_lanczos() {
+        let photo = image("photo.jpg", 640, 480);
+        let options = upscaled(OutputFormat::Png, Upscale::Factor(2.0));
+        let cmd = command(&photo, &options, "/clips/photo.png");
+        assert!(cmd.contains("-vf scale=1280:960:flags=lanczos"), "{cmd}");
+        assert_eq!(result_dims(&photo, &options), Some((1280, 960)));
+    }
+
+    #[test]
+    fn video_720p_becomes_1080p() {
+        let mut clip = video("clip.mov");
+        (clip.width, clip.height) = (Some(1280), Some(720));
+        let options = upscaled(OutputFormat::Mp4, Upscale::Size(1080));
+        let cmd = command(&clip, &options, "/clips/clip.mp4");
+        assert!(cmd.contains("-vf scale=1920:1080:flags=lanczos"), "{cmd}");
+        assert_eq!(result_dims(&clip, &options), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn upscaling_never_shrinks_and_shrinking_stays_the_default() {
+        // A target the picture already reaches changes nothing.
+        let options = upscaled(OutputFormat::Mp4, Upscale::Size(720));
+        let cmd = command(&video("big.mov"), &options, "/clips/big.mp4");
+        assert!(!cmd.contains("-vf"), "{cmd}");
+        // Without an upscale, a size bigger than the source does nothing.
+        let mut small = video("small.mov");
+        (small.width, small.height) = (Some(1280), Some(720));
+        let shrink = ConvertOptions {
+            max_size: Some(1080),
+            ..ConvertOptions::default()
+        };
+        assert!(!command(&small, &shrink, "/clips/small.mp4").contains("-vf"));
+        // Shrinking video keeps ffmpeg's usual scaler.
+        let shrink = ConvertOptions {
+            max_size: Some(480),
+            ..ConvertOptions::default()
+        };
+        assert!(command(&small, &shrink, "/clips/small.mp4").contains("-vf scale=-2:480 "));
+    }
+
+    #[test]
+    fn upscale_keeps_aspect_and_even_sides_for_video() {
+        let mut clip = video("odd.mov");
+        (clip.width, clip.height) = (Some(641), Some(361));
+        let options = upscaled(OutputFormat::Mp4, Upscale::Factor(1.5));
+        // 361 × 1.5 = 541.5 → 542; 641 × 542 / 361 = 962.4 → 962.
+        let cmd = command(&clip, &options, "/clips/odd.mp4");
+        assert!(cmd.contains("-vf scale=962:542:flags=lanczos"), "{cmd}");
+        // Pictures keep odd sides.
+        let photo = image("odd.png", 641, 361);
+        let options = upscaled(OutputFormat::Png, Upscale::Factor(3.0));
+        let cmd = command(&photo, &options, "/clips/odd3.png");
+        assert!(cmd.contains("scale=1923:1083:flags=lanczos"), "{cmd}");
+    }
+
+    #[test]
+    fn upscale_follows_turn_and_crop() {
+        let photo = image("wide.jpg", 640, 480);
+        let options = ConvertOptions {
+            rotate: 90,
+            crop: cropped(Some([1, 1]), None),
+            ..upscaled(OutputFormat::Png, Upscale::Factor(2.0))
+        };
+        let cmd = command(&photo, &options, "/clips/square.png");
+        assert!(
+            cmd.contains("transpose=clock,crop=480:480:0:80,scale=960:960:flags=lanczos"),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn max_size_caps_an_upscale() {
+        let photo = image("photo.jpg", 640, 480);
+        let options = ConvertOptions {
+            max_size: Some(720),
+            ..upscaled(OutputFormat::Jpg, Upscale::Factor(4.0))
+        };
+        assert_eq!(result_dims(&photo, &options), Some((960, 720)));
+        // Both at 1080: exactly 1080p, whatever the source.
+        let exact = ConvertOptions {
+            max_size: Some(1080),
+            ..upscaled(OutputFormat::Mp4, Upscale::Size(1080))
+        };
+        let mut small = video("small.mov");
+        (small.width, small.height) = (Some(1280), Some(720));
+        assert_eq!(result_dims(&small, &exact), Some((1920, 1080)));
+        let big = video("big.mov");
+        let mut huge = big.clone();
+        (huge.width, huge.height) = (Some(3840), Some(2160));
+        assert_eq!(result_dims(&huge, &exact), Some((1920, 1080)));
+        assert_eq!(result_dims(&big, &exact), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn upscaled_gif_skips_its_usual_cap() {
+        let mut clip = video("small.mov");
+        (clip.width, clip.height) = (Some(320), Some(240));
+        let options = upscaled(OutputFormat::Gif, Upscale::Factor(3.0));
+        let cmd = command(&clip, &options, "/clips/small.gif");
+        assert!(cmd.contains("fps=15,scale=960:720:flags=lanczos"), "{cmd}");
+        // A target the clip already passes keeps the usual cap.
+        let options = upscaled(OutputFormat::Gif, Upscale::Size(720));
+        let cmd = command(&video("big.mov"), &options, "/clips/big.gif");
+        assert!(cmd.contains("fps=15,scale=-2:480:flags=lanczos"), "{cmd}");
+    }
+
+    #[test]
+    fn scaler_choice_sets_the_flags() {
+        let photo = image("photo.jpg", 640, 480);
+        for (scaler, flags) in [
+            (Scaler::Auto, "lanczos"),
+            (Scaler::Lanczos, "lanczos"),
+            (Scaler::Spline, "spline"),
+            (Scaler::Bicubic, "bicubic"),
+        ] {
+            let options = ConvertOptions {
+                scaler,
+                ..upscaled(OutputFormat::Png, Upscale::Factor(2.0))
+            };
+            let cmd = command(&photo, &options, "/clips/photo.png");
+            assert!(
+                cmd.contains(&format!("scale=1280:960:flags={flags}")),
+                "{cmd}"
+            );
+        }
+        // A chosen scaler applies to shrinking video too.
+        let options = ConvertOptions {
+            max_size: Some(720),
+            scaler: Scaler::Spline,
+            ..ConvertOptions::default()
+        };
+        let cmd = command(&video("big.mov"), &options, "/clips/big.mp4");
+        assert!(cmd.contains("scale=-2:720:flags=spline"), "{cmd}");
+    }
+
+    #[test]
+    fn upscale_of_unknown_size_uses_expressions() {
+        let mut clip = video("mystery.mov");
+        (clip.width, clip.height) = (None, None);
+        let vf = |upscale| {
+            let options = upscaled(OutputFormat::Mp4, upscale);
+            let plan =
+                plan(&clip, &options, Path::new("/clips/mystery.mp4"), LIBJXL).expect("plan");
+            let args = &plan.steps[0].args;
+            let at = args.iter().position(|a| a == "-vf").expect("-vf");
+            args[at + 1].to_string_lossy().into_owned()
+        };
+        assert_eq!(
+            vf(Upscale::Factor(2.0)),
+            "scale='trunc(iw*2/2)*2':'trunc(ih*2/2)*2':flags=lanczos"
+        );
+        assert_eq!(
+            vf(Upscale::Size(1080)),
+            "scale='if(gte(iw,ih),-2,max(iw,1080))':'if(gte(iw,ih),max(ih,1080),-2)':flags=lanczos"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_upscales_and_results_too_big_for_the_format() {
+        let photo = image("photo.jpg", 640, 480);
+        let out = Path::new("/clips/out.png");
+        for upscale in [
+            Upscale::Factor(0.5),
+            Upscale::Factor(9.0),
+            Upscale::Factor(f64::NAN),
+            Upscale::Size(1),
+            Upscale::Size(20_000),
+        ] {
+            let options = upscaled(OutputFormat::Png, upscale);
+            plan(&photo, &options, out, LIBJXL).expect_err("bad upscale");
+        }
+        // 4K × 4 is 15360×8640: fine for PNG, too big for an MP4 or a WebP.
+        let mut clip = video("uhd.mov");
+        (clip.width, clip.height) = (Some(3840), Some(2160));
+        let options = upscaled(OutputFormat::Mp4, Upscale::Factor(4.0));
+        let err = plan(&clip, &options, Path::new("/clips/uhd.mp4"), LIBJXL).expect_err("8K");
+        assert!(err.to_string().contains("15360×8640"), "{err}");
+        let still = image("uhd.png", 3840, 2160);
+        let png = upscaled(OutputFormat::Png, Upscale::Factor(4.0));
+        plan(&still, &png, Path::new("/clips/big.png"), LIBJXL).expect("PNG takes it");
+        let webp = upscaled(OutputFormat::Webp, Upscale::Factor(4.4));
+        plan(&still, &webp, Path::new("/clips/big.webp"), LIBJXL).expect_err("WebP is smaller");
+        // Big sources aren't refused unless they are enlarged.
+        let giant = image("giant.png", 20_000, 10_000);
+        let options = ConvertOptions {
+            format: OutputFormat::Png,
+            ..ConvertOptions::default()
+        };
+        plan(&giant, &options, Path::new("/clips/giant2.png"), LIBJXL).expect("as big as it was");
+    }
+
+    #[test]
+    fn warns_about_huge_upscales() {
+        let photo = image("photo.jpg", 640, 480);
+        assert_eq!(
+            upscale_warning(&photo, &upscaled(OutputFormat::Png, Upscale::Factor(2.0))),
+            None
+        );
+        let big = image("big.jpg", 4000, 3000);
+        let warning = upscale_warning(&big, &upscaled(OutputFormat::Png, Upscale::Factor(4.0)));
+        assert!(warning.is_some_and(|w| w.contains("16000×12000")));
+        let clip = video("hd.mov");
+        let to_4k = upscaled(OutputFormat::Mp4, Upscale::Size(2160));
+        assert_eq!(upscale_warning(&clip, &to_4k), None, "4K itself is fine");
+        let past_4k = upscaled(OutputFormat::Mp4, Upscale::Factor(3.0));
+        assert!(upscale_warning(&clip, &past_4k).is_some_and(|w| w.contains("5760×3240")));
+        let gif = upscaled(OutputFormat::Gif, Upscale::Factor(2.0));
+        assert!(upscale_warning(&clip, &gif).is_some());
+        // Nothing to warn about when nothing gets bigger.
+        assert_eq!(upscale_warning(&clip, &ConvertOptions::default()), None);
+    }
+
+    #[test]
+    fn upscale_and_scaler_parse_from_json() {
+        let options: ConvertOptions = serde_json::from_value(serde_json::json!({
+            "format": "png",
+            "upscale": {"factor": 2},
+            "scaler": "spline",
+        }))
+        .expect("parse");
+        assert_eq!(options.upscale, Some(Upscale::Factor(2.0)));
+        assert_eq!(options.scaler, Scaler::Spline);
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"upscale": {"size": 1080}})).expect("parse");
+        assert_eq!(options.upscale, Some(Upscale::Size(1080)));
+        // Old saved options have neither.
+        let options: ConvertOptions =
+            serde_json::from_value(serde_json::json!({"format": "mp4", "maxSize": 720}))
+                .expect("parse");
+        assert_eq!((options.upscale, options.scaler), (None, Scaler::Auto));
+        assert_eq!(
+            serde_json::to_value(Upscale::Factor(1.5)).expect("json"),
+            serde_json::json!({"factor": 1.5})
+        );
     }
 }

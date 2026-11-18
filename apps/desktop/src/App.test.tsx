@@ -412,6 +412,8 @@ describe("CatConvert", () => {
         trimStart: 2,
         trimEnd: null,
         maxSize: 720,
+        upscale: null,
+        scaler: "auto",
         fps: null,
         rotate: 90,
         flip: false,
@@ -1597,6 +1599,26 @@ describe("CatConvert", () => {
       );
     });
 
+    it("upscales the frame, lifting the default size cap", async () => {
+      await openAnimation();
+      fireEvent.change(screen.getByRole("combobox", { name: "Size" }), {
+        target: { value: "x2" },
+      });
+      const animation = within(screen.getByRole("list", { name: "Animation" }));
+      expect(animation.getByText("8064×6048")).toBeInTheDocument();
+      expect(
+        screen.getByText("That's 8064×6048: encoding will be slow and the file big."),
+      ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /Make animation/ }));
+      await screen.findByRole("heading", { name: "Queue" });
+      expect(api.startSequence).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.objectContaining({ upscale: { factor: 2 }, maxSize: null, scaler: "auto" }),
+        expect.any(Object),
+        USUAL,
+      );
+    });
+
     it("makes one animation from dropped pictures", async () => {
       await openAnimation();
       // Natural filename order: 2 before 10.
@@ -2339,6 +2361,147 @@ describe("CatConvert", () => {
       const { inputs: _inputs, options: _options, ...shown } = broken;
       expect(state.history).toEqual([shown]);
     });
+  });
+});
+
+describe("upscaling", () => {
+  const changes = () =>
+    within(screen.getByRole("list", { name: "Changes" }))
+      .getAllByRole("listitem")
+      .map((li) => li.textContent);
+  const sizeOptions = () =>
+    within(screen.getByRole("combobox", { name: "Size" }))
+      .getAllByRole("option")
+      .map((option) => option.textContent);
+
+  async function open(info: MediaInfo) {
+    vi.mocked(api.probeFile).mockResolvedValue(info);
+    render(() => <App />);
+    await ffmpegFound();
+    openPaths([info.path]);
+    return screen.findByRole("heading", { name: info.fileName });
+  }
+
+  it("doubles a 640×480 photo with Lanczos", async () => {
+    await open({ ...PHOTO, width: 640, height: 480 });
+    expect(sizeOptions()).toEqual([
+      "Original (480 px)",
+      "360 px",
+      "240 px",
+      "2×",
+      "3×",
+      "4×",
+      "720 px",
+      "1080 px",
+      "1440 px",
+      "2160 px",
+      "Custom…",
+    ]);
+    expect(screen.queryByRole("combobox", { name: "Scaler" })).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), { target: { value: "x2" } });
+    expect(changes()).toContain("2× · 1280×960");
+    expect(screen.getByRole("combobox", { name: "Scaler" })).toHaveDisplayValue("Lanczos (sharp)");
+    expect(screen.getByText("Upscaling makes it bigger, not sharper.")).toBeInTheDocument();
+
+    // A shrink size clears the upscale, and back.
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), { target: { value: "360" } });
+    expect(screen.queryByRole("combobox", { name: "Scaler" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), { target: { value: "x2" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Scaler" }), {
+      target: { value: "spline" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      PHOTO.path,
+      expect.objectContaining({ upscale: { factor: 2 }, maxSize: null, scaler: "spline" }),
+      USUAL,
+    );
+  });
+
+  it("turns a 720p video into 1080p", async () => {
+    await open({ ...VIDEO, width: 1280, height: 720 });
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), {
+      target: { value: "s1080" },
+    });
+    expect(screen.getByRole("combobox", { name: "Size" })).toHaveDisplayValue("1080p");
+    expect(changes()).toContain("Upscaled to 1080p");
+    expect(screen.queryByRole("status")).not.toHaveTextContent(/encoding will be slow/);
+
+    fireEvent.click(screen.getByRole("button", { name: /Start converting/ }));
+    await screen.findByRole("heading", { name: "Queue" });
+    expect(api.startJob).toHaveBeenCalledWith(
+      VIDEO.path,
+      expect.objectContaining({ upscale: { size: 1080 }, maxSize: null, scaler: "auto" }),
+      USUAL,
+    );
+  });
+
+  it("warns about huge results and keeps within what the format can hold", async () => {
+    await open({ ...VIDEO, width: 3840, height: 2160 });
+    // MP4 stops at 8192 px on the long side, so 4K only doubles.
+    expect(sizeOptions().slice(-2)).toEqual(["2×", "Custom…"]);
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), { target: { value: "x2" } });
+    expect(
+      screen.getByText("That's 7680×4320: encoding will be slow and the file big."),
+    ).toBeInTheDocument();
+
+    // A custom short side is clamped to what fits, with a word why.
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), {
+      target: { value: "custom" },
+    });
+    const field = screen.getByRole("textbox", { name: "Short side" });
+    expect(field).toHaveValue("4320");
+    fireEvent.change(field, { target: { value: "9000" } });
+    expect(field).toHaveValue("4608");
+    expect(screen.getByText("4608 px is as big as this file can go.")).toBeInTheDocument();
+    expect(screen.getByText("Makes it 8192×4608")).toBeInTheDocument();
+    fireEvent.change(field, { target: { value: "100" } });
+    expect(field).toHaveValue("2162");
+
+    // GIFs can go further; back in MP4 it would be too big to write.
+    fireEvent.click(screen.getByRole("button", { name: "GIF" }));
+    expect(sizeOptions()).toContain("4×");
+    fireEvent.change(screen.getByRole("combobox", { name: "Size" }), { target: { value: "x4" } });
+    expect(screen.getByText(/That's 15360×8640: encoding will be slow/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "MP4" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "That's 15360×8640, too big for MP4, which stops at 8192 px on the long side.",
+    );
+    expect(screen.getByRole("button", { name: /Start converting/ })).toBeDisabled();
+  });
+
+  it("loads settings saved before upscaling with the defaults", () => {
+    const entry = {
+      id: "3-1",
+      name: "clip.mp4",
+      output: "/clips/clip.mp4",
+      format: "mp4",
+      kind: "video",
+      inputBytes: 1,
+      outputBytes: 1,
+      finishedAt: 1,
+      inputs: [VIDEO.path],
+      options: { format: "mp4", quality: 60, maxSize: 720 },
+    };
+    localStorage.setItem("catconvert.history.v2", JSON.stringify([entry]));
+    const recipe = {
+      id: "custom-2",
+      title: "Bigger",
+      options: { format: "png", upscale: { factor: "lots" }, scaler: "nearest" },
+    };
+    localStorage.setItem("catconvert.recipes.v1", JSON.stringify([recipe]));
+    resetStore();
+    expect(state.history[0]?.options).toEqual({
+      format: "mp4",
+      quality: 60,
+      maxSize: 720,
+      upscale: null,
+      scaler: "auto",
+    });
+    expect(state.recipes[0]?.options).toEqual({ format: "png", upscale: null, scaler: "auto" });
   });
 });
 

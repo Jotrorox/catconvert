@@ -6,8 +6,8 @@ use std::sync::atomic::AtomicBool;
 
 use catconvert_core::{
     AudioRate, ConvertOptions, Crop, Direction, Ffmpeg, Fit, JxlOptions, Metadata, Naming,
-    OutputFormat, OutputTarget, Plan, QualitySummary, RunOutcome, SequenceOptions, SoundOptions,
-    VIDEO_KBPS, VideoCodec,
+    OutputFormat, OutputTarget, Plan, QualitySummary, RunOutcome, Scaler, SequenceOptions,
+    SoundOptions, Upscale, VIDEO_KBPS, VideoCodec,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -48,8 +48,11 @@ enum Command {
         #[arg(long)]
         end: Option<f64>,
         /// Shrink so the short side is at most this many pixels (e.g. 720).
+        /// Never enlarges; see `--upscale`.
         #[arg(long)]
         size: Option<u32>,
+        #[command(flatten)]
+        resize: ResizeArgs,
         /// Output frame rate.
         #[arg(long)]
         fps: Option<f64>,
@@ -143,8 +146,11 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Playback::Forward)]
         direction: Playback,
         /// Shrink so the short side is at most this many pixels (e.g. 480).
+        /// Never enlarges; see `--upscale`.
         #[arg(long)]
         size: Option<u32>,
+        #[command(flatten)]
+        resize: ResizeArgs,
         /// Clockwise rotation in degrees (0, 90, 180, 270).
         #[arg(long, default_value_t = 0)]
         rotate: u16,
@@ -181,6 +187,80 @@ enum Command {
         #[arg(long, value_enum)]
         drop: Strip,
     },
+}
+
+/// Making the picture bigger than the original.
+#[derive(Debug, clap::Args)]
+struct ResizeArgs {
+    /// Enlarge past the original size: a factor (2x, 1.5x, up to 8x), a
+    /// standard height (720p, 1080p, 1440p, 4k) or a short side in pixels
+    /// (e.g. 1200). Never shrinks; with `--size` as well, that caps the
+    /// result, so `--upscale 1080p --size 1080` always gives 1080p.
+    #[arg(long, value_name = "AMOUNT", value_parser = parse_upscale)]
+    upscale: Option<Upscale>,
+    /// Filter for resizing. Lanczos is the sharpest; spline is a little
+    /// softer with fewer halos; bicubic is smooth. Defaults to Lanczos for
+    /// pictures, GIFs and anything enlarged.
+    #[arg(long, value_enum, default_value_t = Resampler::Auto)]
+    scaler: Resampler,
+}
+
+/// CLI mirror of [`Scaler`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Resampler {
+    /// Lanczos for pictures, GIFs and enlarging; ffmpeg's usual bicubic for
+    /// shrinking video.
+    Auto,
+    Lanczos,
+    Spline,
+    Bicubic,
+}
+
+impl From<Resampler> for Scaler {
+    fn from(scaler: Resampler) -> Self {
+        match scaler {
+            Resampler::Auto => Self::Auto,
+            Resampler::Lanczos => Self::Lanczos,
+            Resampler::Spline => Self::Spline,
+            Resampler::Bicubic => Self::Bicubic,
+        }
+    }
+}
+
+/// `2x` → a factor, `1080p` or `4k` → a short side, `1200` → a short side.
+fn parse_upscale(text: &str) -> Result<Upscale, String> {
+    let lower = text.trim().to_ascii_lowercase();
+    let bad = || format!("expected an upscale like 2x, 1080p, 4k or 1200, got `{text}`");
+    if let Some(factor) = lower
+        .strip_suffix('x')
+        .or_else(|| lower.strip_suffix('×'))
+        .or_else(|| lower.strip_prefix('x'))
+    {
+        let factor = factor.trim().parse::<f64>().map_err(|_| bad())?;
+        return Ok(Upscale::Factor(factor));
+    }
+    let size = match lower.as_str() {
+        "4k" | "uhd" => 2160,
+        "8k" => 4320,
+        "2k" | "qhd" => 1440,
+        "hd" => 720,
+        "fullhd" | "fhd" => 1080,
+        other => {
+            let size = other
+                .strip_suffix('p')
+                .unwrap_or(other)
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| bad())?;
+            if size <= 8 {
+                return Err(format!(
+                    "`{text}` would be {size} pixels: did you mean {size}x?"
+                ));
+            }
+            size
+        }
+    };
+    Ok(Upscale::Size(size))
 }
 
 /// Where the result goes (see [`OutputTarget`]).
@@ -345,6 +425,9 @@ fn convert(
         .map_err(|e| e.to_string())?;
     let plan = catconvert_core::plan(&info, options, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
+    if let Some(warning) = catconvert_core::upscale_warning(&info, options) {
+        eprintln!("warning: {warning}");
+    }
     let summary = catconvert_core::quality_summary(&info, options, ffmpeg.support());
     if let Some(line) = describe_quality(summary) {
         eprintln!("{line}");
@@ -435,6 +518,13 @@ fn animate(
         .map_err(|e| e.to_string())?;
     let plan = catconvert_core::plan_sequence(&infos, options, sequence, &output, ffmpeg.support())
         .map_err(|e| e.to_string())?;
+    // The frame takes the first picture's size.
+    if let Some(warning) = infos
+        .first()
+        .and_then(|first| catconvert_core::upscale_warning(first, options))
+    {
+        eprintln!("warning: {warning}");
+    }
     run(&ffmpeg, &plan, dry_run)
 }
 
@@ -496,6 +586,7 @@ fn main() -> ExitCode {
             start,
             end,
             size,
+            resize,
             fps,
             rotate,
             flip,
@@ -523,6 +614,8 @@ fn main() -> ExitCode {
                 trim_start: start,
                 trim_end: end,
                 max_size: size,
+                upscale: resize.upscale,
+                scaler: resize.scaler.into(),
                 fps,
                 rotate,
                 flip,
@@ -564,6 +657,7 @@ fn main() -> ExitCode {
             crop,
             direction,
             size,
+            resize,
             rotate,
             flip,
             quality,
@@ -576,6 +670,8 @@ fn main() -> ExitCode {
             let options = ConvertOptions {
                 format: to.into(),
                 max_size: size,
+                upscale: resize.upscale,
+                scaler: resize.scaler.into(),
                 rotate,
                 flip,
                 quality,
@@ -921,5 +1017,60 @@ mod tests {
             panic!("expected scrub");
         };
         assert_eq!(drop, Strip::Location);
+    }
+
+    #[test]
+    fn parses_upscales() {
+        assert_eq!(parse_upscale("2x"), Ok(Upscale::Factor(2.0)));
+        assert_eq!(parse_upscale("1.5X"), Ok(Upscale::Factor(1.5)));
+        assert_eq!(parse_upscale("3×"), Ok(Upscale::Factor(3.0)));
+        assert_eq!(parse_upscale("1080p"), Ok(Upscale::Size(1080)));
+        assert_eq!(parse_upscale("4K"), Ok(Upscale::Size(2160)));
+        assert_eq!(parse_upscale("1200"), Ok(Upscale::Size(1200)));
+        assert!(parse_upscale("2").is_err_and(|e| e.contains("2x")));
+        assert!(parse_upscale("big").is_err());
+        assert!(parse_upscale("x").is_err());
+
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "convert",
+            "photo.jpg",
+            "--to",
+            "png",
+            "--upscale",
+            "2x",
+            "--scaler",
+            "spline",
+        ])
+        .expect("parse");
+        let Command::Convert { size, resize, .. } = cli.command else {
+            panic!("expected convert");
+        };
+        assert_eq!(size, None);
+        assert_eq!(resize.upscale, Some(Upscale::Factor(2.0)));
+        assert_eq!(Scaler::from(resize.scaler), Scaler::Spline);
+        // Shrinking only stays the default.
+        let cli =
+            Cli::try_parse_from(["catconvert", "convert", "a", "--to", "mp4"]).expect("parse");
+        let Command::Convert { resize, .. } = cli.command else {
+            panic!("expected convert");
+        };
+        assert_eq!(resize.upscale, None);
+        assert_eq!(Scaler::from(resize.scaler), Scaler::Auto);
+        let cli = Cli::try_parse_from([
+            "catconvert",
+            "animate",
+            "a.png",
+            "b.png",
+            "--to",
+            "gif",
+            "--upscale",
+            "720p",
+        ])
+        .expect("parse");
+        let Command::Animate { resize, .. } = cli.command else {
+            panic!("expected animate");
+        };
+        assert_eq!(resize.upscale, Some(Upscale::Size(720)));
     }
 }
